@@ -1,4 +1,6 @@
 use std::ffi::c_void;
+use std::fmt;
+use std::mem;
 
 use icrate::objc2::{Encoding, RefEncode};
 pub use icrate::Foundation::CGRect;
@@ -11,6 +13,16 @@ pub type CGImageRef = *mut CGImage;
 // Required for use CGImageRef in `msg_send!` macro
 unsafe impl RefEncode for CGImage {
     const ENCODING_REF: Encoding = Encoding::Pointer(&Encoding::Struct("CGImage", &[]));
+}
+
+impl CGImage {
+    pub fn width(&self) -> usize {
+        unsafe { CGImageGetWidth(mem::transmute(self)) }
+    }
+
+    pub fn height(&self) -> usize {
+        unsafe { CGImageGetHeight(mem::transmute(self)) }
+    }
 }
 
 type CGWindowListOption = u32;
@@ -30,4 +42,9 @@ extern "C" {
         windowArray: CFArrayRef,
         imageOption: CGWindowImageOption,
     ) -> CGImageRef;
+    pub fn CGImageRetain(image: CGImageRef) -> CGImageRef;
+    pub fn CGImageRelease(image: CGImageRef);
+    pub fn CGImageIsMask(image: CGImageRef) -> bool;
+    pub fn CGImageGetWidth(image: CGImageRef) -> usize;
+    pub fn CGImageGetHeight(image: CGImageRef) -> usize;
 }
