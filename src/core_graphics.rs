@@ -3,8 +3,9 @@ use std::ffi::c_void;
 use icrate::objc2::{Encoding, RefEncode};
 pub use icrate::Foundation::CGRect;
 
+#[repr(C)]
 #[derive(Debug, Copy, Clone)]
-pub struct CGImage;
+pub struct CGImage([u8; 0]); // to make it FFI-safe
 pub type CGImageRef = *mut CGImage;
 
 // Required for use CGImageRef in `msg_send!` macro

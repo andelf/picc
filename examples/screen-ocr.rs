@@ -1,7 +1,6 @@
 use icrate::{
-    ns_string,
     AppKit::NSScreen,
-    Foundation::{NSArray, NSDictionary, NSString, NSURL},
+    Foundation::{NSArray, NSDictionary, NSString},
 };
 use picc::vision;
 
