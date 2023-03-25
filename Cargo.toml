@@ -1,0 +1,16 @@
+[package]
+name = "picc"
+version = "0.1.0"
+edition = "2021"
+authors = ["Andelf <andelf@gmail.com>"]
+repository = "https://github.com/andelf/picc"
+documentation = "https://docs.rs/picc"
+homepage = "https://github.com/andelf/picc"
+categories = []
+description = "PICCrop, simple OCR + Screenshot tool"
+keywords = []
+readme = "README.md"
+license = "MIT/Apache-2.0"
+
+[dependencies]
+icrate = { version = "0.0.2", features = ["AppKit", "Foundation", "Foundation_all", "AppKit_NSEvent", "block", "AppKit_NSScreen", "AppKit_NSImage", "AppKit_NSSpeechRecognizer", "Speech", "Speech_all", "Foundation_NSLocale", "AppKit_all", "AppKit_NSPanel"] }
