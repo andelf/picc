@@ -9,13 +9,14 @@ use icrate::objc2::{
 };
 use icrate::AppKit::{
     NSApplication, NSBackingStoreBuffered, NSBackingStoreType, NSBezierPath, NSColor, NSEvent,
-    NSNonactivatingPanelMask, NSPanel, NSResponder, NSScreen, NSView, NSWindow,
-    NSWindowCollectionBehaviorCanJoinAllSpaces, NSWindowCollectionBehaviorFullScreenAuxiliary,
-    NSWindowController, NSWindowLevel, NSWindowStyleMask,
+    NSFullSizeContentViewWindowMask, NSNonactivatingPanelMask, NSPanel, NSResponder, NSScreen,
+    NSView, NSWindow, NSWindowCollectionBehaviorCanJoinAllSpaces,
+    NSWindowCollectionBehaviorFullScreenAuxiliary, NSWindowController, NSWindowLevel,
+    NSWindowStyleMask, NSWindowCollectionBehaviorFullScreenPrimary, NSBorderlessWindowMask, NSWindowStyleMaskTitled,
 };
 use icrate::Foundation::{
     CGRect, NSArray, NSDate, NSDictionary, NSError, NSLocale, NSObject, NSPoint, NSRect, NSRunLoop,
-    NSSize, NSString,
+    NSSize, NSString, CGPoint,
 };
 use icrate::Speech::{self, SFSpeechAudioBufferRecognitionRequest, SFSpeechRecognizer};
 use picc::core_graphics::CGImageRef;
@@ -57,17 +58,13 @@ declare_class!(
         #[method(mouseDragged:)]
         unsafe fn mouseDragged(&self, _event: &NSEvent) {
             let loc = NSEvent::mouseLocation();
-            println!("mouseDragged: {:?}", loc);
-
             let start_loc = &self.start_pos;
-            println!("start_loc: {:?}", start_loc);
 
             let x = f64::min(start_loc.x, loc.x);
             let y = f64::min(start_loc.y, loc.y);
             let w = f64::abs(start_loc.x - loc.x);
             let h = f64::abs(start_loc.y - loc.y);
             let rect = NSRect::new(NSPoint::new(x, y), NSSize::new(w, h));
-            println!("rect: {:?}", rect);
 
             let subviews = self.contentView().unwrap().subviews();
             let overlay_view = subviews.first().unwrap();
@@ -77,12 +74,11 @@ declare_class!(
 
         #[method(mouseDown:)]
         unsafe fn mouseDown(&mut self, event: &NSEvent) {
+            let loc = NSEvent::mouseLocation();
             if event.clickCount() == 2 {
-                println!("double click");
+                println!("double click {:?}", loc);
                 // self.toggleFullScreen(None);
             } else {
-                let loc = NSEvent::mouseLocation();
-                println!("mouseDown: {:?}", loc);
                 Ivar::write(&mut self.start_pos, Box::new(loc));
             }
             self.contentView()
@@ -102,6 +98,7 @@ declare_class!(
             let start_loc = &self.start_pos;
             let end_loc = &self.end_pos;
 
+            // transfer pos to global
             let x = f64::min(start_loc.x, end_loc.x);
             let y = f64::min(start_loc.y, end_loc.y);
             let w = f64::abs(start_loc.x - end_loc.x);
@@ -110,10 +107,14 @@ declare_class!(
                 return;
             }
 
+            // TODO: fix pos
+            let y = 982.0 - y + 40.0; // 40 = menu bar
+
             let rect = NSRect::new(NSPoint::new(x, y), NSSize::new(w, h));
+            println!("Crop Rect: {:?}", rect);
             let crop_img = picc::screenshot(rect).unwrap();
             println!(
-                "=> crop_img {:?} {} {}",
+                "=> crop_img {:?} {}x{}",
                 crop_img,
                 (&*crop_img).width(),
                 (&*crop_img).height()
@@ -124,6 +125,7 @@ declare_class!(
 
         #[method(keyDown:)]
         unsafe fn keyDown(&self, event: &NSEvent) {
+            println!("FR => {:?}", self.frame());
             if event.keyCode() == 53 {
                 println!("ESC");
                 self.orderOut(None);
@@ -238,45 +240,53 @@ fn ocr(img: CGImageRef) {
 
 fn main() {
     let app = unsafe { NSApplication::sharedApplication() };
-    println!("app: {:?}", app);
 
     let window = {
         let this = SnapWindow::alloc();
         // let content_rect = NSRect::new(NSPoint::new(0., 0.), NSSize::new(1024., 768.));
 
         let screen = unsafe { NSScreen::mainScreen().unwrap() };
+        unsafe { println!("Screen size {:?}", screen.frame()) };
         let win = unsafe {
             let frame = screen.frame();
             println!("Screen: {:?}", frame);
             SnapWindow::initWithContentRect_styleMask_backing_defer_screen(
                 this,
+                //NSRect { origin: NSPoint::new(0.0, 0.0), size: frame.size },
                 frame,
                 NSNonactivatingPanelMask,
+                // NSBorderlessWindowMask, - not good
                 NSBackingStoreBuffered,
                 false,
                 Some(&screen),
             )
         };
         unsafe {
+            win.setAcceptsMouseMovedEvents(true);
             win.setFloatingPanel(true);
             win.setCollectionBehavior(
                 NSWindowCollectionBehaviorCanJoinAllSpaces
-                    | NSWindowCollectionBehaviorFullScreenAuxiliary,
+                   | NSWindowCollectionBehaviorFullScreenAuxiliary,
             );
             win.setMovableByWindowBackground(false);
             win.setExcludedFromWindowsMenu(true);
-            win.setAlphaValue(0.5);
+            win.setAlphaValue(0.3);
             win.setOpaque(false);
             win.setHasShadow(false);
             win.setHidesOnDeactivate(false);
+
             #[allow(non_upper_case_globals)]
             const kCGMaximumWindowLevelKey: NSWindowLevel = 14;
+            // win.setLevel(kCGMaximumWindowLevelKey);
+
             win.setRestorable(false);
             win.disableSnapshotRestoration();
-            win.setLevel(kCGMaximumWindowLevelKey);
+            win.setLevel(kCGMaximumWindowLevelKey + 1);
+
+   //         win.center();
+     //       win.makeKeyAndOrderFront(None);
 
             win.setMovable(false);
-            win.setAcceptsMouseMovedEvents(true); // not working
         }
         win
     };
