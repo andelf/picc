@@ -1,5 +1,6 @@
 pub mod core_graphics;
 pub mod vision;
+pub mod avfaudio;
 
 pub fn screenshot(rect: core_graphics::CGRect) -> Option<core_graphics::CGImageRef> {
     use self::core_graphics::*;

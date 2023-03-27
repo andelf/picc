@@ -1,5 +1,4 @@
 use std::ffi::c_void;
-use std::fmt;
 use std::mem;
 
 use icrate::objc2::{Encoding, RefEncode};
