@@ -4,7 +4,7 @@ use std::ptr::NonNull;
 
 use block2::RcBlock;
 use objc2::rc::Retained;
-use objc2::runtime::NSObject;
+use objc2::runtime::{AnyClass, NSObject};
 use objc2::{define_class, msg_send, DefinedClass, MainThreadMarker, MainThreadOnly};
 
 use objc2_app_kit::{
@@ -256,12 +256,62 @@ define_class!(
                 NSColor::clearColor().setFill();
                 NSBezierPath::fillRect(sel_rect);
 
-                // 恢复正常模式，画红色边框
+                // 恢复正常模式，画蓝色边框
                 ctx.setCompositingOperation(NSCompositingOperation::SourceOver);
                 NSColor::colorWithSRGBRed_green_blue_alpha(0.4, 0.6, 1.0, 0.8).setStroke();
                 let path = NSBezierPath::bezierPathWithRect(sel_rect);
                 path.setLineWidth(2.);
                 path.stroke();
+
+                // 在选框右下角显示分辨率大小
+                let scale = self
+                    .window()
+                    .map(|w| w.backingScaleFactor())
+                    .unwrap_or(2.0);
+                let pixel_w = (w * scale) as u32;
+                let pixel_h = (h * scale) as u32;
+                let label = NSString::from_str(&format!("{} × {}", pixel_w, pixel_h));
+
+                unsafe {
+                    let font_cls = AnyClass::get(c"NSFont").unwrap();
+                    let font: Retained<NSObject> =
+                        msg_send![font_cls, monospacedDigitSystemFontOfSize: 12.0_f64, weight: 0.0_f64];
+
+                    let dict_cls = AnyClass::get(c"NSMutableDictionary").unwrap();
+                    let dict: Retained<NSObject> = msg_send![dict_cls, new];
+                    let font_key = NSString::from_str("NSFont");
+                    let color_key = NSString::from_str("NSColor");
+                    let white = NSColor::whiteColor();
+                    let _: () = msg_send![&dict, setObject: &*font, forKey: &*font_key];
+                    let _: () = msg_send![&dict, setObject: &*white, forKey: &*color_key];
+
+                    let text_size: NSSize = msg_send![&*label, sizeWithAttributes: &*dict];
+
+                    let pad_x = 6.0_f64;
+                    let pad_y = 3.0_f64;
+                    let gap = 4.0_f64;
+                    let bg_w = text_size.width + pad_x * 2.0;
+                    let bg_h = text_size.height + pad_y * 2.0;
+
+                    // 默认放在选框右下角下方，如果太靠近屏幕底部则放到上方
+                    let bg_x = x + w - bg_w;
+                    let bg_y = if y > bg_h + gap {
+                        y - bg_h - gap
+                    } else {
+                        y + h + gap
+                    };
+
+                    let bg_rect =
+                        NSRect::new(NSPoint::new(bg_x, bg_y), NSSize::new(bg_w, bg_h));
+
+                    NSColor::colorWithSRGBRed_green_blue_alpha(0.0, 0.0, 0.0, 0.75).setFill();
+                    NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(bg_rect, 4.0, 4.0)
+                        .fill();
+
+                    let text_pt = NSPoint::new(bg_x + pad_x, bg_y + pad_y);
+                    let _: () =
+                        msg_send![&*label, drawAtPoint: text_pt, withAttributes: &*dict];
+                }
             }
         }
     }
