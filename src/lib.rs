@@ -1,18 +1,13 @@
+pub mod avfaudio;
 pub mod core_graphics;
 pub mod vision;
-pub mod avfaudio;
 
-pub fn screenshot(rect: core_graphics::CGRect) -> Option<core_graphics::CGImageRef> {
+use objc2_core_foundation::CFRetained;
+use objc2_core_graphics::CGImage;
+
+pub fn screenshot(rect: core_graphics::CGRect) -> Option<CFRetained<CGImage>> {
     use self::core_graphics::*;
 
-    // kCGWindowListOptionOnScreenOnly=2, kCGNullWindowID=0
-    let window_list = unsafe { CGWindowListCreate(2, 0) };
-    if window_list.is_null() {
-        return None;
-    }
-    let image = unsafe { CGWindowListCreateImageFromArray(rect, window_list, 0) };
-    if image.is_null() {
-        return None;
-    }
-    Some(image)
+    #[allow(deprecated)]
+    CGWindowListCreateImage(rect, CGWindowListOption(1), 0, CGWindowImageOption(0))
 }

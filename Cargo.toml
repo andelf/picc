@@ -13,4 +13,64 @@ readme = "README.md"
 license = "MIT/Apache-2.0"
 
 [dependencies]
-icrate = { version = "0.0.2", features = ["AppKit", "Foundation", "Foundation_all", "AppKit_NSEvent", "block", "AppKit_NSScreen", "AppKit_NSImage", "AppKit_NSSpeechRecognizer", "Speech", "Speech_all", "Foundation_NSLocale", "AppKit_all", "AppKit_NSPanel"] }
+objc2 = "0.6.3"
+block2 = "0.6.2"
+objc2-core-foundation = "0.3.2"
+objc2-foundation = { version = "0.3.2", features = [
+    "NSArray",
+    "NSDictionary",
+    "NSError",
+    "NSString",
+    "NSDate",
+    "NSRunLoop",
+    "NSURL",
+    "NSLocale",
+    "NSObject",
+    "NSValue",
+] }
+objc2-app-kit = { version = "0.3.2", features = [
+    "NSApplication",
+    "NSPanel",
+    "NSWindow",
+    "NSView",
+    "NSEvent",
+    "NSScreen",
+    "NSImage",
+    "NSBezierPath",
+    "NSColor",
+    "NSGraphicsContext",
+    "NSResponder",
+    "NSRunningApplication",
+] }
+objc2-core-graphics = { version = "0.3.2", features = [
+    "CGImage",
+    "CGGeometry",
+    "CGWindow",
+    "CGWindowLevel",
+] }
+objc2-vision = { version = "0.3.2", features = [
+    "VNRecognizeTextRequest",
+    "VNRequestHandler",
+    "VNRequest",
+    "VNObservation",
+    "objc2-core-graphics",
+] }
+objc2-avf-audio = { version = "0.3.2", features = [
+    "AVAudioEngine",
+    "AVAudioNode",
+    "AVAudioIONode",
+    "AVAudioFormat",
+    "AVAudioBuffer",
+    "AVAudioTime",
+    "AVAudioTypes",
+    "block2",
+] }
+objc2-speech = { version = "0.3.2", features = [
+    "SFSpeechRecognizer",
+    "SFSpeechRecognitionRequest",
+    "SFSpeechRecognitionResult",
+    "SFSpeechRecognitionTask",
+    "SFTranscription",
+    "SFTranscriptionSegment",
+    "block2",
+] }

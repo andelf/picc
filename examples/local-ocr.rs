@@ -1,36 +1,34 @@
-use icrate::{
-    ns_string,
-    Foundation::{NSArray, NSDictionary, NSString, NSURL},
-};
+use objc2_foundation::{ns_string, NSArray, NSString, NSURL};
 use picc::vision;
 
 fn main() {
     let req = vision::VNRecognizeTextRequest::new();
 
-    let supported_languages = req.supported_languages();
+    let supported_languages = unsafe { req.supportedRecognitionLanguagesAndReturnError() };
     println!("supported_languages: {:?}", supported_languages);
 
-    // NOTE: According to the docs: when using multiple languages, the order of the languages in the array is significant.
-    // The more complex language should be placed first in the array.
-    let lang = NSArray::from_vec(vec![
-        NSString::from_str("zh-Hans"),
-        NSString::from_str("en-US"),
-    ]);
-    req.set_languages(&lang);
-    let languages = req.languages();
+    let zh = NSString::from_str("zh-Hans");
+    let en = NSString::from_str("en-US");
+    let lang = NSArray::from_slice(&[&*zh, &*en]);
+    req.setRecognitionLanguages(&lang);
+    let languages = unsafe { req.recognitionLanguages() };
     println!("using languages: {:?}", languages);
 
-    let url = unsafe { NSURL::fileURLWithPath(ns_string!("./docker-sb.jpg")) };
+    let url = NSURL::fileURLWithPath(ns_string!("./docker-sb.jpg"));
 
-    let handler = vision::VNImageRequestHandler::new_with_url(&url, &NSDictionary::new());
+    let handler = vision::new_handler_with_url(&url);
 
-    let reqs = NSArray::from_slice(&[req.clone()]);
-    handler.perform(&reqs).unwrap();
+    let reqs = NSArray::from_retained_slice(&[req.clone()]);
+    let reqs: &NSArray<objc2_vision::VNRequest> =
+        unsafe { &*((&*reqs) as *const _ as *const _) };
+    vision::perform_requests(&handler, reqs).unwrap();
 
-    for item in req.results().iter() {
-        for candidate in item.top_candidates(1).iter() {
-            println!("candidate.string(): {:?}", candidate.string());
-            // println!("candidate.confidence(): {:?}", candidate.confidence());
+    if let Some(results) = req.results() {
+        for item in results.iter() {
+            let candidates = item.topCandidates(1);
+            for candidate in candidates.iter() {
+                println!("candidate.string(): {:?}", candidate.string());
+            }
         }
     }
 }
