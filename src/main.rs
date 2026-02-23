@@ -8,11 +8,13 @@ use icrate::objc2::{
     declare_class, extern_class, extern_methods, msg_send, msg_send_id, sel, ClassType,
 };
 use icrate::AppKit::{
-    NSApplication, NSBackingStoreBuffered, NSBackingStoreType, NSBezierPath, NSColor, NSEvent,
-    NSFullSizeContentViewWindowMask, NSNonactivatingPanelMask, NSPanel, NSResponder, NSScreen,
-    NSView, NSWindow, NSWindowCollectionBehaviorCanJoinAllSpaces,
-    NSWindowCollectionBehaviorFullScreenAuxiliary, NSWindowController, NSWindowLevel,
-    NSWindowStyleMask, NSWindowCollectionBehaviorFullScreenPrimary, NSBorderlessWindowMask, NSWindowStyleMaskTitled,
+    NSApplication, NSBackingStoreBuffered, NSBackingStoreType, NSBezierPath, NSColor,
+    NSCompositingOperationCopy, NSCompositingOperationSourceOver, NSEvent,
+    NSFullSizeContentViewWindowMask, NSGraphicsContext,
+    NSNonactivatingPanelMask, NSPanel, NSResponder, NSScreen, NSView, NSWindow,
+    NSWindowCollectionBehaviorCanJoinAllSpaces, NSWindowCollectionBehaviorFullScreenAuxiliary,
+    NSWindowController, NSWindowLevel, NSWindowStyleMask,
+    NSWindowCollectionBehaviorFullScreenPrimary, NSBorderlessWindowMask, NSWindowStyleMaskTitled,
 };
 use icrate::Foundation::{
     CGRect, NSArray, NSDate, NSDictionary, NSError, NSLocale, NSObject, NSPoint, NSRect, NSRunLoop,
@@ -21,6 +23,61 @@ use icrate::Foundation::{
 use icrate::Speech::{self, SFSpeechAudioBufferRecognitionRequest, SFSpeechRecognizer};
 use picc::core_graphics::CGImageRef;
 use picc::vision;
+
+use std::sync::Mutex;
+/// 选区坐标 (x, y, w, h)，AppKit 坐标系
+static SEL_RECT: Mutex<[f64; 4]> = Mutex::new([0.0, 0.0, 0.0, 0.0]);
+
+/// 保存 CGImage 到 PNG 文件
+fn save_cgimage(image: CGImageRef, path: &str) {
+    use std::ffi::c_void;
+
+    #[link(name = "ImageIO", kind = "framework")]
+    extern "C" {
+        fn CGImageDestinationCreateWithURL(
+            url: *const c_void,
+            ty: *const c_void,
+            count: usize,
+            options: *const c_void,
+        ) -> *mut c_void;
+        fn CGImageDestinationAddImage(
+            dest: *mut c_void,
+            image: CGImageRef,
+            properties: *const c_void,
+        );
+        fn CGImageDestinationFinalize(dest: *mut c_void) -> bool;
+    }
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    extern "C" {
+        fn CFURLCreateWithFileSystemPath(
+            allocator: *const c_void,
+            path: *const c_void,
+            style: i32,
+            is_dir: bool,
+        ) -> *const c_void;
+    }
+
+    unsafe {
+        let ns_path = NSString::from_str(path);
+        let url = CFURLCreateWithFileSystemPath(
+            std::ptr::null(),
+            std::mem::transmute::<&NSString, *const c_void>(&ns_path),
+            0, // kCFURLPOSIXPathStyle
+            false,
+        );
+        let png_type = NSString::from_str("public.png");
+        let dest = CGImageDestinationCreateWithURL(
+            url,
+            std::mem::transmute::<&NSString, *const c_void>(&png_type),
+            1,
+            std::ptr::null(),
+        );
+        CGImageDestinationAddImage(dest, image, std::ptr::null());
+        let ok = CGImageDestinationFinalize(dest);
+        println!("save_cgimage({}) => {}", path, ok);
+    }
+}
 
 declare_class!(
     #[derive(Debug, PartialEq)]
@@ -52,7 +109,7 @@ declare_class!(
 
         #[method(mouseMoved:)]
         unsafe fn mouseMoved(&self, event: &NSEvent) {
-            println!("mouseMoved: {:?}", event);
+            // println!("mouseMoved: {:?}", event);
         }
 
         #[method(mouseDragged:)]
@@ -64,12 +121,18 @@ declare_class!(
             let y = f64::min(start_loc.y, loc.y);
             let w = f64::abs(start_loc.x - loc.x);
             let h = f64::abs(start_loc.y - loc.y);
-            let rect = NSRect::new(NSPoint::new(x, y), NSSize::new(w, h));
+
+            *SEL_RECT.lock().unwrap() = [x, y, w, h];
 
             let subviews = self.contentView().unwrap().subviews();
             let overlay_view = subviews.first().unwrap();
-            overlay_view.setFrame(rect);
-            overlay_view.setHidden(false);
+            overlay_view.display();
+        }
+
+        #[method(acceptsFirstMouse:)]
+        unsafe fn acceptsFirstMouse(&self, _event: &NSEvent) -> bool {
+            println!("acceptsFirstMouse");
+            true
         }
 
         #[method(mouseDown:)]
@@ -77,16 +140,12 @@ declare_class!(
             let loc = NSEvent::mouseLocation();
             if event.clickCount() == 2 {
                 println!("double click {:?}", loc);
-                // self.toggleFullScreen(None);
             } else {
                 Ivar::write(&mut self.start_pos, Box::new(loc));
             }
-            self.contentView()
-                .unwrap()
-                .subviews()
-                .first()
-                .unwrap()
-                .setHidden(true);
+            // 重置选区
+            *SEL_RECT.lock().unwrap() = [0.0, 0.0, 0.0, 0.0];
+            self.contentView().unwrap().subviews().first().unwrap().display();
         }
 
         #[method(mouseUp:)]
@@ -107,12 +166,22 @@ declare_class!(
                 return;
             }
 
-            // TODO: fix pos
-            let y = 982.0 - y + 40.0; // 40 = menu bar
+            // AppKit 坐标系 (左下角原点, y向上) -> CoreGraphics 坐标系 (左上角原点, y向下)
+            let screen_height = NSScreen::mainScreen().unwrap().frame().size.height;
+            let cg_y = screen_height - (y + h);
 
-            let rect = NSRect::new(NSPoint::new(x, y), NSSize::new(w, h));
+            let rect = NSRect::new(NSPoint::new(x, cg_y), NSSize::new(w, h));
             println!("Crop Rect: {:?}", rect);
+
+            // 隐藏覆盖窗口，避免截图时把遮罩层也截进去
+            self.orderOut(None);
+            NSRunLoop::currentRunLoop().runUntilDate(&NSDate::dateWithTimeIntervalSinceNow(0.1));
+
             let crop_img = picc::screenshot(rect).unwrap();
+
+            // 截图完成，恢复窗口
+            self.makeKeyAndOrderFront(None);
+
             println!(
                 "=> crop_img {:?} {}x{}",
                 crop_img,
@@ -190,15 +259,32 @@ declare_class!(
 
     unsafe impl DrawPathView {
         #[method(drawRect:)]
-        unsafe fn drawRect(&self, dirty_rect: NSRect) {
-            // println!("drawRect: {:?}", dirty_rect);
-            let path = unsafe { NSBezierPath::bezierPathWithRect(dirty_rect) };
+        unsafe fn drawRect(&self, _dirty_rect: NSRect) {
+            let bounds = unsafe { self.bounds() };
+            let [x, y, w, h] = *SEL_RECT.lock().unwrap();
+
             unsafe {
-                path.addClip();
-                path.fill();
-                NSColor::redColor().setStroke();
-                path.setLineWidth(2.);
-                path.stroke()
+                // 整个屏幕画半透明黑色遮罩
+                NSColor::colorWithSRGBRed_green_blue_alpha(0.0, 0.0, 0.0, 0.3).setFill();
+                NSBezierPath::fillRect(bounds);
+
+                // 如果有选区，挖空选区并画红色边框
+                if w > 1.0 && h > 1.0 {
+                    let sel_rect = NSRect::new(NSPoint::new(x, y), NSSize::new(w, h));
+
+                    // 用 Copy 模式 + clearColor 擦除选区内的遮罩
+                    let ctx = NSGraphicsContext::currentContext().unwrap();
+                    ctx.setCompositingOperation(NSCompositingOperationCopy);
+                    NSColor::clearColor().setFill();
+                    NSBezierPath::fillRect(sel_rect);
+
+                    // 恢复正常模式，画红色边框
+                    ctx.setCompositingOperation(NSCompositingOperationSourceOver);
+                    NSColor::colorWithSRGBRed_green_blue_alpha(0.4, 0.6, 1.0, 0.8).setStroke();
+                    let path = NSBezierPath::bezierPathWithRect(sel_rect);
+                    path.setLineWidth(2.);
+                    path.stroke();
+                }
             }
         }
     }
@@ -270,18 +356,16 @@ fn main() {
             );
             win.setMovableByWindowBackground(false);
             win.setExcludedFromWindowsMenu(true);
-            win.setAlphaValue(0.3);
+            win.setAlphaValue(1.0);
             win.setOpaque(false);
+            win.setBackgroundColor(Some(&NSColor::clearColor()));
             win.setHasShadow(false);
             win.setHidesOnDeactivate(false);
 
-            #[allow(non_upper_case_globals)]
-            const kCGMaximumWindowLevelKey: NSWindowLevel = 14;
-            // win.setLevel(kCGMaximumWindowLevelKey);
-
             win.setRestorable(false);
             win.disableSnapshotRestoration();
-            win.setLevel(kCGMaximumWindowLevelKey + 1);
+            // kCGScreenSaverWindowLevel = 1000, 高于 Dock(~20) 和菜单栏(~24)
+            win.setLevel(1000);
 
    //         win.center();
      //       win.makeKeyAndOrderFront(None);
@@ -303,11 +387,11 @@ fn main() {
     }
 
     unsafe {
+        let frame = NSScreen::mainScreen().unwrap().frame();
         let path_view = DrawPathView::initWithFrame(
             DrawPathView::alloc(),
-            NSRect::new(NSPoint::new(0., 0.), NSSize::new(200., 200.)),
+            frame,
         );
-        path_view.setHidden(true);
         window.contentView().unwrap().addSubview(&path_view);
     }
 
