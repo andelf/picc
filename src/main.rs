@@ -1,14 +1,17 @@
 use std::cell::Cell;
 use std::ffi::c_void;
+use std::ptr::NonNull;
 
+use block2::RcBlock;
 use objc2::rc::Retained;
 use objc2::runtime::NSObject;
 use objc2::{define_class, msg_send, DefinedClass, MainThreadMarker, MainThreadOnly};
 
 use objc2_app_kit::{
-    NSApplication, NSBackingStoreType, NSBezierPath, NSColor, NSCompositingOperation, NSEvent,
-    NSGraphicsContext, NSPanel, NSResponder, NSScreen, NSView, NSWindow,
-    NSWindowCollectionBehavior, NSWindowStyleMask,
+    NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSBezierPath, NSColor,
+    NSCompositingOperation, NSEvent, NSEventMask, NSEventModifierFlags, NSGraphicsContext,
+    NSPanel, NSResponder, NSScreen, NSView, NSWindow, NSWindowCollectionBehavior,
+    NSWindowStyleMask,
 };
 use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use objc2_core_graphics::CGImage;
@@ -117,7 +120,6 @@ define_class!(
 
         #[unsafe(method(acceptsFirstMouse:))]
         fn acceptsFirstMouse(&self, _event: &NSEvent) -> bool {
-            println!("acceptsFirstMouse");
             true
         }
 
@@ -171,9 +173,6 @@ define_class!(
 
             let crop_img = picc::screenshot(rect).unwrap();
 
-            // 截图完成，恢复窗口
-            self.makeKeyAndOrderFront(None);
-
             println!(
                 "=> crop_img {}x{}",
                 CGImage::width(Some(&crop_img)),
@@ -181,27 +180,24 @@ define_class!(
             );
 
             ocr(&crop_img);
+
+            // OCR 完成后保持隐藏，重置选区，回到待命状态
+            *SEL_RECT.lock().unwrap() = [0.0, 0.0, 0.0, 0.0];
         }
 
         #[unsafe(method(keyDown:))]
         fn keyDown(&self, event: &NSEvent) {
-            println!("FR => {:?}", self.frame());
-            let mtm = MainThreadMarker::new().unwrap();
-            if event.keyCode() == 53 {
-                println!("ESC");
+            if event.keyCode() == 53 || event.keyCode() == 12 {
+                // ESC (53) 或 Q (12) — 隐藏窗口，回到待命状态
                 self.orderOut(None);
-                self.close();
-                NSApplication::sharedApplication(mtm).terminate(None);
-            } else if event.keyCode() == 36 {
-                println!("ENTER");
-                self.toggleFullScreen(None);
-            } else if event.keyCode() == 12 {
-                println!("quit");
-                self.orderOut(None);
-                self.close();
-                NSApplication::sharedApplication(mtm).terminate(None);
+                *SEL_RECT.lock().unwrap() = [0.0, 0.0, 0.0, 0.0];
+                if let Some(content) = self.contentView() {
+                    if let Some(overlay) = content.subviews().firstObject() {
+                        overlay.display();
+                    }
+                }
             } else if event.keyCode() == 49 {
-                println!("SPACE");
+                // SPACE — 隐藏遮罩层
                 self.contentView()
                     .unwrap()
                     .subviews()
@@ -209,7 +205,6 @@ define_class!(
                     .unwrap()
                     .setHidden(true);
             }
-            println!("keyDown: {:?}", event);
         }
     }
 );
@@ -303,13 +298,53 @@ fn ocr(img: &CGImage) {
     }
 }
 
+/// 检测是否为 Ctrl+Cmd+A 快捷键
+fn is_hotkey(event: &NSEvent) -> bool {
+    let flags = event.modifierFlags();
+    let has_ctrl = flags.contains(NSEventModifierFlags::Control);
+    let has_cmd = flags.contains(NSEventModifierFlags::Command);
+    // keyCode 0 = 'A' key
+    event.keyCode() == 0 && has_ctrl && has_cmd
+}
+
+/// 显示截图窗口
+fn show_snap_window(window: &SnapWindow) {
+    let mtm = MainThreadMarker::new().unwrap();
+
+    // 重置选区
+    *SEL_RECT.lock().unwrap() = [0.0, 0.0, 0.0, 0.0];
+
+    // 更新 frame 到当前屏幕尺寸
+    let frame = NSScreen::mainScreen(mtm).unwrap().frame();
+    window.setFrame_display_animate(frame, true, false);
+
+    // 刷新 overlay view
+    if let Some(content) = window.contentView() {
+        if let Some(overlay) = content.subviews().firstObject() {
+            overlay.setFrame(frame);
+            overlay.setHidden(false);
+            overlay.display();
+        }
+    }
+
+    // 显示窗口
+    window.makeKeyAndOrderFront(None);
+
+    // 激活应用，使其获得焦点
+    let app = NSApplication::sharedApplication(mtm);
+    #[allow(deprecated)]
+    app.activateIgnoringOtherApps(true);
+}
+
 fn main() {
     let mtm = MainThreadMarker::new().expect("must be on the main thread");
     let app = NSApplication::sharedApplication(mtm);
 
+    // Accessory 模式：不显示 Dock 图标
+    app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+
     let window = {
         let screen = NSScreen::mainScreen(mtm).unwrap();
-        println!("Screen size {:?}", screen.frame());
         let win = SnapWindow::new(&screen, mtm);
 
         win.setAcceptsMouseMovedEvents(true);
@@ -335,16 +370,46 @@ fn main() {
         win
     };
 
-    window.makeKeyAndOrderFront(None);
-
-    let frame = NSScreen::mainScreen(mtm).unwrap().frame();
-    window.setFrame_display_animate(frame, true, false);
-
+    // 添加 overlay view（但不显示窗口）
     let frame = NSScreen::mainScreen(mtm).unwrap().frame();
     let path_view = DrawPathView::new(frame, mtm);
     window.contentView().unwrap().addSubview(&path_view);
 
-    println!("=> subview {:?}", window.contentView());
+    // 注册全局快捷键监听（app 没有焦点时）
+    let win_clone = window.clone();
+    let global_block = RcBlock::new(move |event: NonNull<NSEvent>| {
+        let event = unsafe { event.as_ref() };
+        if is_hotkey(event) {
+            show_snap_window(&win_clone);
+        }
+    });
+    let _global_monitor = NSEvent::addGlobalMonitorForEventsMatchingMask_handler(
+        NSEventMask::KeyDown,
+        &global_block,
+    );
+
+    // 注册本地快捷键监听（app 有焦点时）
+    let win_clone = window.clone();
+    let local_block = RcBlock::new(move |event: NonNull<NSEvent>| -> *mut NSEvent {
+        let event_ref = unsafe { event.as_ref() };
+        if is_hotkey(event_ref) {
+            show_snap_window(&win_clone);
+            std::ptr::null_mut() // 消费掉该事件
+        } else {
+            event.as_ptr() // 传递事件
+        }
+    });
+    let _local_monitor = unsafe {
+        NSEvent::addLocalMonitorForEventsMatchingMask_handler(
+            NSEventMask::KeyDown,
+            &local_block,
+        )
+    };
+
+    println!("PICC running. Press Ctrl+Cmd+A to capture screenshot.");
+
+    // 保持 monitor token 存活
+    let _keep_alive = (_global_monitor, _local_monitor);
 
     app.run();
 }
