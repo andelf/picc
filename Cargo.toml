@@ -20,6 +20,10 @@ path = "src/main.rs"
 name = "standup"
 path = "src/bin/standup.rs"
 
+[[bin]]
+name = "confirm"
+path = "src/bin/confirm.rs"
+
 [dependencies]
 objc2 = "0.6.3"
 block2 = "0.6.2"
