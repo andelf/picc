@@ -112,8 +112,8 @@ define_class!(
 
             unsafe {
                 draw_centered_text(&time_str, cx, cy + 20.0, 72.0);
-                draw_centered_text("站起来走动一下", cx, cy - 50.0, 24.0);
-                draw_centered_text("按 ESC 跳过", cx, bounds.origin.y + 40.0, 14.0);
+                draw_centered_text("Time to stand up and stretch!", cx, cy - 50.0, 24.0);
+                draw_centered_text("Press ESC to skip", cx, bounds.origin.y + 40.0, 14.0);
             }
         }
     }
