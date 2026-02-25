@@ -24,6 +24,14 @@ path = "src/bin/standup.rs"
 name = "confirm"
 path = "src/bin/confirm.rs"
 
+[[bin]]
+name = "icon_test"
+path = "src/bin/icon_test.rs"
+
+[[bin]]
+name = "hidden"
+path = "src/bin/hidden.rs"
+
 [dependencies]
 objc2 = "0.6.3"
 block2 = "0.6.2"
@@ -54,6 +62,13 @@ objc2-app-kit = { version = "0.3.2", features = [
     "NSGraphicsContext",
     "NSResponder",
     "NSRunningApplication",
+    "NSStatusBar",
+    "NSStatusItem",
+    "NSStatusBarButton",
+    "NSMenu",
+    "NSMenuItem",
+    "NSButton",
+    "NSControl",
     "block2",
 ] }
 objc2-core-graphics = { version = "0.3.2", features = [
