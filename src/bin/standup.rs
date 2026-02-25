@@ -4,15 +4,16 @@ use std::sync::Mutex;
 
 use block2::RcBlock;
 use objc2::rc::Retained;
-use objc2::runtime::{AnyClass, NSObject};
+use objc2::runtime::{AnyClass, AnyObject, NSObject};
+use objc2::sel;
 use objc2::{define_class, msg_send, MainThreadMarker, MainThreadOnly};
 
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSBezierPath, NSColor,
-    NSEvent, NSPanel, NSResponder, NSScreen, NSView, NSWindow, NSWindowCollectionBehavior,
-    NSWindowStyleMask,
+    NSEvent, NSImage, NSMenu, NSMenuItem, NSPanel, NSResponder, NSScreen, NSStatusBar,
+    NSStatusItem, NSView, NSWindow, NSWindowCollectionBehavior, NSWindowStyleMask,
 };
-use objc2_foundation::{NSPoint, NSRect, NSSize, NSString, NSTimer};
+use objc2_foundation::{NSDate, NSPoint, NSRect, NSSize, NSString, NSTimer};
 
 // -- 全局状态 --
 
@@ -20,12 +21,18 @@ struct StandupState {
     remaining_secs: u32,
     work_secs: f64,
     break_secs: u32,
+    wake_secs: f64,
+    is_breaking: bool,
+    skip_next: bool,
 }
 
 static STATE: Mutex<StandupState> = Mutex::new(StandupState {
     remaining_secs: 0,
     work_secs: 25.0 * 60.0,
     break_secs: 5 * 60,
+    wake_secs: 10.0 * 60.0,
+    is_breaking: false,
+    skip_next: false,
 });
 
 // 定时器和窗口引用，仅在主线程访问
@@ -33,7 +40,43 @@ thread_local! {
     static COUNTDOWN_TIMER: RefCell<Option<Retained<NSTimer>>> = const { RefCell::new(None) };
     static WORK_TIMER: RefCell<Option<Retained<NSTimer>>> = const { RefCell::new(None) };
     static WINDOW: RefCell<Option<Retained<StandupWindow>>> = const { RefCell::new(None) };
+    static STATUS_ITEM: RefCell<Option<Retained<NSStatusItem>>> = const { RefCell::new(None) };
+    static MENUBAR_TIMER: RefCell<Option<Retained<NSTimer>>> = const { RefCell::new(None) };
 }
+
+// -- MenuDelegate: 菜单项 action 处理 --
+
+define_class!(
+    #[unsafe(super(NSObject))]
+    #[thread_kind = MainThreadOnly]
+    #[name = "MenuDelegate"]
+    #[derive(Debug, PartialEq)]
+    pub struct MenuDelegate;
+
+    #[allow(non_snake_case)]
+    impl MenuDelegate {
+        #[unsafe(method(breakNow:))]
+        fn break_now(&self, _sender: &AnyObject) {
+            show_countdown();
+        }
+
+        #[unsafe(method(skipNext:))]
+        fn skip_next(&self, _sender: &AnyObject) {
+            let new_skip = {
+                let mut state = STATE.lock().unwrap();
+                state.skip_next = !state.skip_next;
+                state.skip_next
+            };
+            // 更新菜单项标题
+            update_skip_menu_title(new_skip);
+        }
+
+        #[unsafe(method(quit:))]
+        fn quit(&self, _sender: &AnyObject) {
+            std::process::exit(0);
+        }
+    }
+);
 
 // -- StandupWindow: NSPanel 子类 --
 
@@ -145,6 +188,30 @@ unsafe fn draw_centered_text(text: &str, cx: f64, cy: f64, font_size: f64) {
     let _: () = msg_send![&*label, drawAtPoint: text_pt, withAttributes: &*dict];
 }
 
+// -- thread_local 访问辅助函数 --
+
+fn with_status_item(f: impl FnOnce(&NSStatusItem)) {
+    STATUS_ITEM.with(|s| {
+        if let Some(item) = s.borrow().as_ref() {
+            f(item);
+        }
+    });
+}
+
+fn with_window(f: impl FnOnce(&StandupWindow)) {
+    WINDOW.with(|w| {
+        if let Some(win) = w.borrow().as_ref() {
+            f(win);
+        }
+    });
+}
+
+fn invalidate_timer(cell: &RefCell<Option<Retained<NSTimer>>>) {
+    if let Some(timer) = cell.borrow_mut().take() {
+        timer.invalidate();
+    }
+}
+
 // -- 刷新窗口中的视图 --
 
 fn refresh_view(window: &StandupWindow) {
@@ -155,19 +222,213 @@ fn refresh_view(window: &StandupWindow) {
     }
 }
 
+/// 用等宽数字字体设置 button title，避免数字变化时宽度晃动
+unsafe fn set_button_monospaced_title(button: &NSObject, title: &str) {
+    let font_cls = AnyClass::get(c"NSFont").unwrap();
+    let font: *mut AnyObject =
+        msg_send![font_cls, monospacedDigitSystemFontOfSize: 0.0_f64, weight: 0.0_f64];
+
+    let dict_cls = AnyClass::get(c"NSMutableDictionary").unwrap();
+    let dict: *mut AnyObject = msg_send![dict_cls, new];
+    let font_key = NSString::from_str("NSFont");
+    let _: () = msg_send![dict, setObject: font, forKey: &*font_key];
+
+    let attr_cls = AnyClass::get(c"NSAttributedString").unwrap();
+    let ns_title = NSString::from_str(title);
+    let attr_str: *mut AnyObject = msg_send![attr_cls, alloc];
+    let attr_str: *mut AnyObject =
+        msg_send![attr_str, initWithString: &*ns_title, attributes: dict];
+    let _: () = msg_send![button, setAttributedTitle: attr_str];
+}
+
+// -- 菜单栏辅助函数 --
+
+fn new_menu_item(
+    mtm: MainThreadMarker,
+    title: &str,
+    action: Option<objc2::runtime::Sel>,
+    key: &str,
+) -> Retained<NSMenuItem> {
+    unsafe {
+        NSMenuItem::initWithTitle_action_keyEquivalent(
+            NSMenuItem::alloc(mtm),
+            &NSString::from_str(title),
+            action,
+            &NSString::from_str(key),
+        )
+    }
+}
+
+fn set_button_icon(button: &objc2_app_kit::NSStatusBarButton, name: &str) {
+    if let Some(image) = NSImage::imageWithSystemSymbolName_accessibilityDescription(
+        &NSString::from_str(name),
+        Some(&NSString::from_str("Standup Timer")),
+    ) {
+        image.setTemplate(true);
+        button.setImage(Some(&image));
+    }
+}
+
+// -- 菜单栏 --
+
+fn setup_menubar(mtm: MainThreadMarker) {
+    let status_bar = NSStatusBar::systemStatusBar();
+    let item = status_bar.statusItemWithLength(-1.0); // NSVariableStatusItemLength
+
+    if let Some(button) = item.button(mtm) {
+        set_button_icon(&button, "cup.and.saucer.fill");
+        unsafe { set_button_monospaced_title(&button, " --:--") };
+    }
+
+    // 创建 MenuDelegate
+    let delegate: Retained<MenuDelegate> =
+        unsafe { msg_send![MenuDelegate::alloc(mtm), init] };
+
+    // 创建菜单
+    let menu = NSMenu::new(mtm);
+
+    let info_item = new_menu_item(mtm, "Next break: --:--", None, "");
+    info_item.setEnabled(false);
+    menu.addItem(&info_item);
+
+    menu.addItem(&NSMenuItem::separatorItem(mtm));
+
+    let break_item = new_menu_item(mtm, "Break now", Some(sel!(breakNow:)), "");
+    unsafe { break_item.setTarget(Some(&delegate)) };
+    menu.addItem(&break_item);
+
+    let skip_item = new_menu_item(mtm, "Skip next break", Some(sel!(skipNext:)), "");
+    unsafe { skip_item.setTarget(Some(&delegate)) };
+    menu.addItem(&skip_item);
+
+    menu.addItem(&NSMenuItem::separatorItem(mtm));
+
+    let quit_item = new_menu_item(mtm, "Quit", Some(sel!(quit:)), "q");
+    unsafe { quit_item.setTarget(Some(&delegate)) };
+    menu.addItem(&quit_item);
+
+    item.setMenu(Some(&menu));
+
+    // 保持强引用
+    STATUS_ITEM.with(|s| {
+        *s.borrow_mut() = Some(item);
+    });
+    std::mem::forget(delegate);
+}
+
+fn update_menubar_title() {
+    // 先读取状态到局部变量，立即释放锁（避免死锁）
+    let (is_breaking, remaining_secs, skip_next) = {
+        let state = STATE.lock().unwrap();
+        (state.is_breaking, state.remaining_secs, state.skip_next)
+    };
+
+    let (time_str, info_title, icon_name) = if is_breaking {
+        let m = remaining_secs / 60;
+        let s = remaining_secs % 60;
+        let time = format!("{:02}:{:02}", m, s);
+        let info = format!("Break: {}", time);
+        (time, info, "figure.stand")
+    } else {
+        // 从 WORK_TIMER 的 fireDate 计算剩余秒数
+        let (remaining, timer_expired) = WORK_TIMER.with(|t| match t.borrow().as_ref() {
+            Some(timer) if timer.isValid() => {
+                let diff = timer.fireDate().timeIntervalSinceDate(&NSDate::now());
+                if diff > 0.0 { (diff as u32, false) } else { (0u32, true) }
+            }
+            _ => (0u32, true),
+        });
+
+        // 休眠恢复：定时器过期，用 wake_secs 重启工作定时器
+        if timer_expired {
+            let wake_secs = STATE.lock().unwrap().wake_secs;
+            start_work_timer_with(wake_secs);
+            println!("Wake from sleep, next break in {:.0}s", wake_secs);
+            // 继续走下面的渲染逻辑，用新 timer 显示倒计时
+            let m = (wake_secs as u32) / 60;
+            let s = (wake_secs as u32) % 60;
+            let time = format!("{:02}:{:02}", m, s);
+            let skip_suffix = if skip_next { " (will skip)" } else { "" };
+            let info = format!("Next break: {}{}", time, skip_suffix);
+            (time, info, "cup.and.saucer.fill")
+        } else {
+            let m = remaining / 60;
+            let s = remaining % 60;
+            let time = format!("{:02}:{:02}", m, s);
+            let skip_suffix = if skip_next { " (will skip)" } else { "" };
+            let info = format!("Next break: {}{}", time, skip_suffix);
+            (time, info, "cup.and.saucer.fill")
+        }
+    };
+
+    with_status_item(|item| {
+        let mtm = MainThreadMarker::new().unwrap();
+        if let Some(button) = item.button(mtm) {
+            unsafe { set_button_monospaced_title(&button, &format!(" {}", time_str)) };
+            set_button_icon(&button, icon_name);
+        }
+        if let Some(menu) = item.menu(mtm) {
+            if let Some(info_item) = menu.itemAtIndex(0) {
+                info_item.setTitle(&NSString::from_str(&info_title));
+            }
+        }
+    });
+}
+
+fn start_menubar_timer() {
+    let block = RcBlock::new(move |_timer: NonNull<NSTimer>| {
+        update_menubar_title();
+    });
+    let timer =
+        unsafe { NSTimer::scheduledTimerWithTimeInterval_repeats_block(1.0, true, &block) };
+    MENUBAR_TIMER.with(|t| {
+        *t.borrow_mut() = Some(timer);
+    });
+}
+
+fn update_skip_menu_title(skip: bool) {
+    with_status_item(|item| {
+        let mtm = MainThreadMarker::new().unwrap();
+        if let Some(menu) = item.menu(mtm) {
+            if let Some(skip_item) = menu.itemAtIndex(3) {
+                let title = if skip { "Enable next break" } else { "Skip next break" };
+                skip_item.setTitle(&NSString::from_str(title));
+            }
+        }
+    });
+}
+
 // -- 核心控制函数 --
 
 fn show_countdown() {
+    // 检查 skip 标志
+    let should_skip = {
+        let mut state = STATE.lock().unwrap();
+        if state.skip_next {
+            state.skip_next = false;
+            true
+        } else {
+            false
+        }
+    };
+    if should_skip {
+        update_skip_menu_title(false);
+        start_work_timer();
+        println!("Break skipped.");
+        return;
+    }
+
     let break_secs = {
         let mut state = STATE.lock().unwrap();
         state.remaining_secs = state.break_secs;
+        state.is_breaking = true;
         state.break_secs
     };
 
-    WINDOW.with(|w| {
-        let borrow = w.borrow();
-        let window = borrow.as_ref().unwrap();
+    // 停止工作定时器
+    WORK_TIMER.with(|t| invalidate_timer(t));
 
+    with_window(|window| {
         let mtm = MainThreadMarker::new().unwrap();
         let frame = NSScreen::mainScreen(mtm).unwrap().frame();
         window.setFrame_display_animate(frame, true, false);
@@ -195,6 +456,7 @@ fn show_countdown() {
         *t.borrow_mut() = Some(timer);
     });
 
+    update_menubar_title();
     println!("Break started: {} seconds", break_secs);
 }
 
@@ -207,12 +469,7 @@ fn tick_countdown() {
         state.remaining_secs
     };
 
-    WINDOW.with(|w| {
-        let borrow = w.borrow();
-        if let Some(window) = borrow.as_ref() {
-            refresh_view(window);
-        }
-    });
+    with_window(|window| refresh_view(window));
 
     if remaining == 0 {
         dismiss_countdown();
@@ -220,42 +477,38 @@ fn tick_countdown() {
 }
 
 fn dismiss_countdown() {
-    STATE.lock().unwrap().remaining_secs = 0;
+    {
+        let mut state = STATE.lock().unwrap();
+        state.remaining_secs = 0;
+        state.is_breaking = false;
+    }
 
     // 停止倒计时定时器
-    COUNTDOWN_TIMER.with(|t| {
-        if let Some(timer) = t.borrow_mut().take() {
-            timer.invalidate();
-        }
-    });
+    COUNTDOWN_TIMER.with(|t| invalidate_timer(t));
 
-    WINDOW.with(|w| {
-        let borrow = w.borrow();
-        if let Some(window) = borrow.as_ref() {
-            window.orderOut(None);
-        }
-    });
+    with_window(|window| window.orderOut(None));
 
     // 重启工作定时器
     start_work_timer();
 
+    update_menubar_title();
     println!("Break ended. Back to work!");
 }
 
 fn start_work_timer() {
-    // 停止旧的工作定时器
-    WORK_TIMER.with(|t| {
-        if let Some(timer) = t.borrow_mut().take() {
-            timer.invalidate();
-        }
-    });
-
     let work_secs = STATE.lock().unwrap().work_secs;
+    start_work_timer_with(work_secs);
+}
+
+fn start_work_timer_with(secs: f64) {
+    // 停止旧的工作定时器
+    WORK_TIMER.with(|t| invalidate_timer(t));
+
     let block = RcBlock::new(move |_timer: NonNull<NSTimer>| {
         show_countdown();
     });
     let timer = unsafe {
-        NSTimer::scheduledTimerWithTimeInterval_repeats_block(work_secs, false, &block)
+        NSTimer::scheduledTimerWithTimeInterval_repeats_block(secs, false, &block)
     };
     WORK_TIMER.with(|t| {
         *t.borrow_mut() = Some(timer);
@@ -264,10 +517,11 @@ fn start_work_timer() {
 
 // -- 命令行参数解析 --
 
-fn parse_args() -> (f64, f64) {
+fn parse_args() -> (f64, f64, f64) {
     let args: Vec<String> = std::env::args().collect();
     let mut work_mins = 25.0_f64;
     let mut break_mins = 5.0_f64;
+    let mut wake_mins = 10.0_f64;
 
     let mut i = 1;
     while i < args.len() {
@@ -288,16 +542,24 @@ fn parse_args() -> (f64, f64) {
                     i += 1;
                 }
             }
+            "--wake" => {
+                if i + 1 < args.len() {
+                    if let Ok(v) = args[i + 1].parse::<f64>() {
+                        wake_mins = v;
+                    }
+                    i += 1;
+                }
+            }
             _ => {}
         }
         i += 1;
     }
 
-    (work_mins, break_mins)
+    (work_mins, break_mins, wake_mins)
 }
 
 fn main() {
-    let (work_mins, break_mins) = parse_args();
+    let (work_mins, break_mins, wake_mins) = parse_args();
 
     let mtm = MainThreadMarker::new().expect("must be on the main thread");
     let app = NSApplication::sharedApplication(mtm);
@@ -308,6 +570,7 @@ fn main() {
         let mut state = STATE.lock().unwrap();
         state.work_secs = work_mins * 60.0;
         state.break_secs = (break_mins * 60.0) as u32;
+        state.wake_secs = wake_mins * 60.0;
     }
 
     let window = {
@@ -343,8 +606,15 @@ fn main() {
         *w.borrow_mut() = Some(window);
     });
 
+    // 设置菜单栏
+    setup_menubar(mtm);
+
     // 启动工作定时器
     start_work_timer();
+
+    // 启动菜单栏刷新定时器
+    start_menubar_timer();
+    update_menubar_title();
 
     println!(
         "Standup running. Break every {:.1} minutes for {:.1} minutes.",
