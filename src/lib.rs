@@ -1,3 +1,4 @@
+pub mod accessibility;
 pub mod avfaudio;
 pub mod core_graphics;
 pub mod vision;

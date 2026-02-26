@@ -32,6 +32,10 @@ path = "src/bin/icon_test.rs"
 name = "hidden"
 path = "src/bin/hidden.rs"
 
+[[bin]]
+name = "lark"
+path = "src/bin/lark.rs"
+
 [dependencies]
 objc2 = "0.6.3"
 block2 = "0.6.2"
@@ -76,6 +80,7 @@ objc2-core-graphics = { version = "0.3.2", features = [
     "CGGeometry",
     "CGWindow",
     "CGWindowLevel",
+    "CGEventTypes",
 ] }
 objc2-vision = { version = "0.3.2", features = [
     "VNRecognizeTextRequest",
@@ -103,3 +108,15 @@ objc2-speech = { version = "0.3.2", features = [
     "SFTranscriptionSegment",
     "block2",
 ] }
+objc2-application-services = { version = "0.3.2", features = [
+    "HIServices",
+    "AXError",
+    "AXUIElement",
+    "AXAttributeConstants",
+    "AXRoleConstants",
+    "AXActionConstants",
+    "AXValue",
+] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["local-time", "env-filter"] }
+time = { version = "0.3", features = ["local-offset", "formatting", "macros"] }
