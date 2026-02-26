@@ -99,6 +99,13 @@ pub fn perform_action(element: &AXUIElement, action: &str) -> bool {
     err == AXError(0)
 }
 
+/// Set an attribute value on an element. Returns true on success.
+pub fn set_attr_value(element: &AXUIElement, attribute: &str, value: &CFType) -> bool {
+    let attr = CFString::from_str(attribute);
+    let err = unsafe { element.set_attribute_value(&attr, value) };
+    err == AXError(0)
+}
+
 /// Get child elements.
 pub fn children(element: &AXUIElement) -> Vec<CFRetained<AXUIElement>> {
     let value = match attr_value(element, "AXChildren") {
@@ -491,6 +498,28 @@ impl AXNode {
             )
         };
         if ok { Some((size.width, size.height)) } else { None }
+    }
+
+    /// Set an attribute value on the underlying element.
+    pub fn set_attr_value(&self, attribute: &str, value: &CFType) -> bool {
+        set_attr_value(&self.0, attribute, value)
+    }
+
+    /// Set AXValue (text) on this element.
+    pub fn set_value(&self, text: &str) -> bool {
+        let cf_str = CFString::from_str(text);
+        let cf_type: &CFType = cf_str.as_ref();
+        set_attr_value(&self.0, "AXValue", cf_type)
+    }
+
+    /// Set AXFocused on this element.
+    pub fn set_focused(&self, focused: bool) -> bool {
+        let val: &CFType = if focused {
+            unsafe { objc2_core_foundation::kCFBooleanTrue.unwrap() }.as_ref()
+        } else {
+            unsafe { objc2_core_foundation::kCFBooleanFalse.unwrap() }.as_ref()
+        };
+        set_attr_value(&self.0, "AXFocused", val)
     }
 }
 
