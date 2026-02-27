@@ -42,6 +42,26 @@ pub fn attr_string(element: &AXUIElement, attribute: &str) -> Option<String> {
     value.downcast_ref::<CFString>().map(|s| s.to_string())
 }
 
+/// Read a CFArray-of-CFString attribute (e.g. AXDOMClassList) as Vec<String>.
+pub fn attr_string_list(element: &AXUIElement, attribute: &str) -> Vec<String> {
+    let Some(value) = attr_value(element, attribute) else {
+        return Vec::new();
+    };
+    // The attribute is a CFArray containing CFString elements.
+    let arr_ptr = value.as_ref() as *const CFType as *const CFArray;
+    let arr = unsafe { &*arr_ptr };
+    let count = arr.len();
+    let mut result = Vec::with_capacity(count);
+    for i in 0..count {
+        let ptr = unsafe { arr.as_opaque().value_at_index(i as CFIndex) };
+        if !ptr.is_null() {
+            let s = unsafe { &*(ptr as *const CFString) };
+            result.push(s.to_string());
+        }
+    }
+    result
+}
+
 /// List all attribute names on an element.
 pub fn attr_names(element: &AXUIElement) -> Vec<String> {
     let mut names_ptr: *const CFArray = std::ptr::null();
@@ -142,6 +162,76 @@ fn cf_type_as_ax_elements(value: &CFType) -> Vec<CFRetained<AXUIElement>> {
 // AXQuery — selector-like query builder
 // ---------------------------------------------------------------------------
 
+/// A parsed CSS-class selector for matching AXDOMClassList.
+///
+/// Supports:
+///   - `.class`                — has class
+///   - `.class1.class2`        — has ALL classes (AND)
+///   - `.class1, .class2`      — has ANY group (OR between comma-separated groups)
+///   - `.class1:not(.class2)`  — has class1 AND does NOT have class2
+///
+/// Examples:
+///   - `".message-item.message-self"` → self messages
+///   - `".text-message, .text-card-message"` → text or card messages
+///   - `".message-item:not(.message-self)"` → other people's messages
+#[derive(Debug, Clone)]
+pub struct DOMSelector {
+    /// OR groups: at least one group must match.
+    groups: Vec<DOMSelectorGroup>,
+}
+
+#[derive(Debug, Clone)]
+struct DOMSelectorGroup {
+    /// Classes that must be present.
+    required: Vec<String>,
+    /// Classes that must NOT be present.
+    excluded: Vec<String>,
+}
+
+impl DOMSelector {
+    /// Parse a CSS-class selector string.
+    pub fn parse(selector: &str) -> Self {
+        let groups = selector
+            .split(',')
+            .map(|group| {
+                let group = group.trim();
+                let mut required = Vec::new();
+                let mut excluded = Vec::new();
+
+                // Split by :not( to find excluded classes
+                let parts: Vec<&str> = group.split(":not(").collect();
+                // First part: required classes (split by '.')
+                for class in parts[0].split('.') {
+                    let class = class.trim();
+                    if !class.is_empty() {
+                        required.push(class.to_string());
+                    }
+                }
+                // Remaining parts: excluded classes inside :not(...)
+                for not_part in &parts[1..] {
+                    let inner = not_part.trim_end_matches(')');
+                    for class in inner.split('.') {
+                        let class = class.trim();
+                        if !class.is_empty() {
+                            excluded.push(class.to_string());
+                        }
+                    }
+                }
+                DOMSelectorGroup { required, excluded }
+            })
+            .collect();
+        DOMSelector { groups }
+    }
+
+    /// Check if a list of DOM classes matches this selector.
+    fn matches(&self, classes: &[String]) -> bool {
+        self.groups.iter().any(|g| {
+            g.required.iter().all(|r| classes.iter().any(|c| c == r))
+                && g.excluded.iter().all(|e| !classes.iter().any(|c| c == e))
+        })
+    }
+}
+
 /// A query for matching AX elements. All set fields must match (AND logic).
 #[derive(Debug, Default, Clone)]
 pub struct AXQuery {
@@ -152,6 +242,8 @@ pub struct AXQuery {
     subrole: Option<String>,
     min_children: Option<usize>,
     has_descendant_text: Option<String>,
+    dom_class: Option<String>,
+    dom_sel: Option<DOMSelector>,
     predicate: Option<fn(&AXNode) -> bool>,
 }
 
@@ -194,6 +286,23 @@ impl AXQuery {
     /// Match only elements that contain the given text somewhere in their subtree.
     pub fn has_text(mut self, text: &str) -> Self {
         self.has_descendant_text = Some(text.to_string());
+        self
+    }
+
+    /// Match elements whose AXDOMClassList contains the given class.
+    pub fn dom_class(mut self, class: &str) -> Self {
+        self.dom_class = Some(class.to_string());
+        self
+    }
+
+    /// Match elements using a CSS-class selector string.
+    ///
+    /// Examples:
+    /// - `".message-item.message-self"` — self messages
+    /// - `".text-message, .text-card-message"` — text or card messages
+    /// - `".message-item:not(.message-self)"` — others' messages
+    pub fn dom_selector(mut self, selector: &str) -> Self {
+        self.dom_sel = Some(DOMSelector::parse(selector));
         self
     }
 
@@ -248,6 +357,21 @@ impl AXQuery {
             let found = node.texts(15).iter().any(|t| t.contains(text.as_str()));
             if !found {
                 return false;
+            }
+        }
+        // DOM class checks — lazy-read the class list only once if needed
+        let need_dom = self.dom_class.is_some() || self.dom_sel.is_some();
+        if need_dom {
+            let classes = attr_string_list(element, "AXDOMClassList");
+            if let Some(ref class) = self.dom_class {
+                if !classes.iter().any(|c| c == class) {
+                    return false;
+                }
+            }
+            if let Some(ref sel) = self.dom_sel {
+                if !sel.matches(&classes) {
+                    return false;
+                }
             }
         }
         if let Some(pred) = self.predicate {
@@ -360,6 +484,16 @@ impl AXNode {
         attr_string(&self.0, "AXDescription")
     }
 
+    /// Read AXDOMClassList (Electron/web apps).
+    pub fn dom_classes(&self) -> Vec<String> {
+        attr_string_list(&self.0, "AXDOMClassList")
+    }
+
+    /// Check if element has a specific DOM class.
+    pub fn has_dom_class(&self, class: &str) -> bool {
+        self.dom_classes().iter().any(|c| c == class)
+    }
+
     pub fn subrole(&self) -> Option<String> {
         attr_string(&self.0, "AXSubrole")
     }
@@ -409,6 +543,22 @@ impl AXNode {
             .collect()
     }
 
+    /// Find an element using a locator string (as produced by `generate_locator`).
+    ///
+    /// ```ignore
+    /// let btn = app.locate(r#"AXButton[title="Send"]"#);
+    /// let el  = app.locate("#messenger-chat >> AXStaticText[text=\"Hello\"]");
+    /// let nth = app.locate("AXGroup:nth(2)");
+    /// ```
+    pub fn locate(&self, locator: &str) -> Option<AXNode> {
+        resolve_locator(&self.0, locator).map(AXNode::new)
+    }
+
+    /// Generate a locator string that uniquely identifies `target` within this node's subtree.
+    pub fn locator(&self, target: &AXNode) -> String {
+        generate_locator(&self.0, &target.0)
+    }
+
     /// Navigate a path of queries: at each step, find the first descendant
     /// matching the query (DFS), then continue from that node.
     ///
@@ -456,6 +606,18 @@ impl AXNode {
     /// Check if subtree contains an element with the given role.
     pub fn has_role(&self, r: &str, max_depth: usize) -> bool {
         find_first(&self.0, &role(r), max_depth).is_some()
+    }
+
+    /// Get the parent element.
+    pub fn parent(&self) -> Option<AXNode> {
+        let value = attr_value(&self.0, "AXParent")?;
+        // AXParent returns an AXUIElement
+        let el = unsafe {
+            CFRetained::retain(NonNull::new_unchecked(
+                value.as_ref() as *const CFType as *mut AXUIElement,
+            ))
+        };
+        Some(AXNode::new(el))
     }
 
     /// List available actions on this element.
@@ -520,6 +682,535 @@ impl AXNode {
             unsafe { objc2_core_foundation::kCFBooleanFalse.unwrap() }.as_ref()
         };
         set_attr_value(&self.0, "AXFocused", val)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// App discovery
+// ---------------------------------------------------------------------------
+
+/// Find a running application by name (partial match on bundle ID or localized name).
+/// Returns `(pid, localized_name)` if found.
+pub fn find_app_by_name(_mtm: objc2::MainThreadMarker, name: &str) -> Option<(i32, String)> {
+    use objc2_app_kit::NSRunningApplication;
+
+    let workspace_cls = objc2::runtime::AnyClass::get(c"NSWorkspace").unwrap();
+    let workspace: objc2::rc::Retained<objc2::runtime::NSObject> =
+        unsafe { objc2::msg_send![workspace_cls, sharedWorkspace] };
+    let apps: objc2::rc::Retained<objc2_foundation::NSArray<NSRunningApplication>> =
+        unsafe { objc2::msg_send![&workspace, runningApplications] };
+
+    let name_lower = name.to_lowercase();
+    for app in apps.iter() {
+        let bundle = app
+            .bundleIdentifier()
+            .map(|b| b.to_string())
+            .unwrap_or_default();
+        let localized = app
+            .localizedName()
+            .map(|n| n.to_string())
+            .unwrap_or_default();
+        if bundle.to_lowercase().contains(&name_lower)
+            || localized.to_lowercase().contains(&name_lower)
+        {
+            return Some((app.processIdentifier(), localized));
+        }
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
+// Locator generation — Playwright-style simplified selectors
+// ---------------------------------------------------------------------------
+
+/// Compare two AXUIElement references for identity using CFEqual.
+fn is_same_element(a: &AXUIElement, b: &AXUIElement) -> bool {
+    use objc2_core_foundation::CFEqual;
+    CFEqual(Some(a.as_ref()), Some(b.as_ref()))
+}
+
+/// A candidate token with a score (lower = better) and the selector string.
+struct Token {
+    score: u32,
+    selector: String,
+}
+
+/// Generate candidate tokens for an element, sorted by score (ascending).
+fn candidate_tokens(el: &AXUIElement) -> Vec<Token> {
+    let mut tokens = Vec::new();
+
+    // 1. AXDOMIdentifier → #id (score 10)
+    if let Some(dom_id) = attr_string(el, "AXDOMIdentifier") {
+        if !dom_id.is_empty() {
+            tokens.push(Token {
+                score: 10,
+                selector: format!("#{dom_id}"),
+            });
+        }
+    }
+
+    let role = attr_string(el, "AXRole").unwrap_or_default();
+
+    // 2. Role + AXTitle (score 100)
+    if let Some(title) = attr_string(el, "AXTitle") {
+        if !title.is_empty() && title.len() <= 80 {
+            tokens.push(Token {
+                score: 100,
+                selector: format!("{role}[title={:?}]", title),
+            });
+        }
+    }
+
+    // 3. Role + AXDescription (score 120)
+    if let Some(desc) = attr_string(el, "AXDescription") {
+        if !desc.is_empty() && desc.len() <= 80 {
+            tokens.push(Token {
+                score: 120,
+                selector: format!("{role}[desc={:?}]", desc),
+            });
+        }
+    }
+
+    // 4. Role + AXValue ≤80 chars (score 140)
+    if let Some(val) = attr_string(el, "AXValue") {
+        let val = val.replace('\u{200b}', "");
+        if !val.is_empty() && val.len() <= 80 {
+            tokens.push(Token {
+                score: 140,
+                selector: format!("{role}[text={:?}]", val),
+            });
+        }
+    }
+
+    // 5. Role + DOMClassList (score 200)
+    let classes = attr_string_list(el, "AXDOMClassList");
+    if !classes.is_empty() {
+        let class_str = classes.iter().map(|c| format!(".{c}")).collect::<String>();
+        tokens.push(Token {
+            score: 200,
+            selector: format!("{role}{class_str}"),
+        });
+    }
+
+    // 6. Role only (score 510)
+    if !role.is_empty() {
+        tokens.push(Token {
+            score: 510,
+            selector: role,
+        });
+    }
+
+    tokens.sort_by_key(|t| t.score);
+    tokens
+}
+
+/// Result of counting matches in the tree.
+enum MatchResult {
+    /// Found exactly the target, no other matches.
+    Unique,
+    /// Found 0 or more-than-1 matches.
+    NotUnique,
+}
+
+/// DFS match count. A token "matches" an element if its generated candidate_tokens
+/// contain a selector equal to `selector`. Early-returns when >1 match found.
+fn count_matches(
+    root: &AXUIElement,
+    selector: &str,
+    target: &AXUIElement,
+    max_depth: usize,
+) -> MatchResult {
+    let mut found_target = false;
+    let mut found_other = false;
+    count_matches_inner(
+        root,
+        selector,
+        target,
+        max_depth,
+        &mut found_target,
+        &mut found_other,
+    );
+    if found_target && !found_other {
+        MatchResult::Unique
+    } else {
+        MatchResult::NotUnique
+    }
+}
+
+fn count_matches_inner(
+    root: &AXUIElement,
+    selector: &str,
+    target: &AXUIElement,
+    depth: usize,
+    found_target: &mut bool,
+    found_other: &mut bool,
+) {
+    if depth == 0 || *found_other {
+        return;
+    }
+    for child in children(root) {
+        if *found_other {
+            return;
+        }
+        // Check if this child matches the selector
+        if element_matches_selector(&child, selector) {
+            if is_same_element(&child, target) {
+                *found_target = true;
+            } else {
+                *found_other = true;
+                return;
+            }
+        }
+        count_matches_inner(&child, selector, target, depth - 1, found_target, found_other);
+    }
+}
+
+/// Check if an element matches a selector string.
+fn element_matches_selector(el: &AXUIElement, selector: &str) -> bool {
+    if selector.starts_with('#') {
+        // DOM ID selector
+        let id = &selector[1..];
+        return attr_string(el, "AXDOMIdentifier").as_deref() == Some(id);
+    }
+
+    // Parse role[attr="value"] or Role.class1.class2 or Role:nth(n)
+    if let Some(bracket_start) = selector.find('[') {
+        let role = &selector[..bracket_start];
+        let el_role = attr_string(el, "AXRole").unwrap_or_default();
+        if el_role != role {
+            return false;
+        }
+        // Extract attr=value
+        let inner = &selector[bracket_start + 1..selector.len() - 1];
+        if let Some((attr, val_quoted)) = inner.split_once('=') {
+            // Remove quotes from value
+            let val = val_quoted.trim_matches('"');
+            match attr {
+                "title" => attr_string(el, "AXTitle").as_deref() == Some(val),
+                "desc" => attr_string(el, "AXDescription").as_deref() == Some(val),
+                "text" => {
+                    let el_val = attr_string(el, "AXValue")
+                        .map(|v| v.replace('\u{200b}', ""))
+                        .unwrap_or_default();
+                    el_val == val
+                }
+                _ => false,
+            }
+        } else {
+            false
+        }
+    } else if selector.contains('.') {
+        // Role.class1.class2
+        let mut parts = selector.split('.');
+        let role = parts.next().unwrap_or("");
+        let el_role = attr_string(el, "AXRole").unwrap_or_default();
+        if el_role != role {
+            return false;
+        }
+        let classes = attr_string_list(el, "AXDOMClassList");
+        parts.all(|c| classes.iter().any(|ec| ec == c))
+    } else if selector.contains(":nth(") {
+        // Role:nth(n) — handled separately, don't match here
+        false
+    } else {
+        // Plain role
+        attr_string(el, "AXRole").as_deref() == Some(selector)
+    }
+}
+
+/// Find the nth-among-siblings index (0-based) for the element among siblings with the same role.
+fn nth_among_siblings(el: &AXUIElement) -> Option<(String, usize)> {
+    let role = attr_string(el, "AXRole")?;
+    let parent_val = attr_value(el, "AXParent")?;
+    let parent = unsafe {
+        &*(parent_val.as_ref() as *const CFType as *const AXUIElement)
+    };
+    let siblings = children(parent);
+    let mut idx = 0;
+    for sib in &siblings {
+        if is_same_element(sib, el) {
+            return Some((role, idx));
+        }
+        if attr_string(sib, "AXRole").as_deref() == Some(&role) {
+            idx += 1;
+        }
+    }
+    None
+}
+
+/// Generate a Playwright-style locator that uniquely identifies `target` within `root`.
+///
+/// Returns a string like `#id`, `AXButton[title="Send"]`, or
+/// `AXWindow[title="Main"] >> AXButton[title="Send"]`.
+pub fn generate_locator(root: &AXUIElement, target: &AXUIElement) -> String {
+    let target_tokens = candidate_tokens(target);
+
+    // Step 1: Try single token
+    for token in &target_tokens {
+        if token.score >= 10000 {
+            break; // skip index-based
+        }
+        if let MatchResult::Unique = count_matches(root, &token.selector, target, 50) {
+            return token.selector.clone();
+        }
+    }
+
+    // Step 2: Try ancestor >> target combinations (up to 5 ancestors)
+    let mut best: Option<(u32, String)> = None;
+    let mut current = unsafe {
+        CFRetained::retain(NonNull::new_unchecked(
+            target as *const AXUIElement as *mut AXUIElement,
+        ))
+    };
+
+    for _ in 0..5 {
+        let parent_val = match attr_value(&current, "AXParent") {
+            Some(v) => v,
+            None => break,
+        };
+        let parent = unsafe {
+            CFRetained::retain(NonNull::new_unchecked(
+                parent_val.as_ref() as *const CFType as *mut AXUIElement,
+            ))
+        };
+
+        // Don't go above root
+        if is_same_element(&parent, root) {
+            break;
+        }
+
+        let ancestor_tokens = candidate_tokens(&parent);
+
+        for at in &ancestor_tokens {
+            if at.score >= 10000 {
+                break;
+            }
+            for tt in &target_tokens {
+                if tt.score >= 10000 {
+                    break;
+                }
+                let combined_score = at.score + tt.score;
+                if best.as_ref().is_some_and(|(s, _)| combined_score >= *s) {
+                    continue;
+                }
+                let combined = format!("{} >> {}", at.selector, tt.selector);
+                // For chain selectors, we need a custom check:
+                // find elements matching ancestor, then within each, find target
+                if chain_is_unique(root, &at.selector, &tt.selector, target) {
+                    best = Some((combined_score, combined));
+                }
+            }
+        }
+
+        current = parent;
+    }
+
+    if let Some((_, locator)) = best {
+        return locator;
+    }
+
+    // Step 3: Fallback — nth among siblings
+    if let Some((role, idx)) = nth_among_siblings(target) {
+        return format!("{role}:nth({idx})");
+    }
+
+    // Last resort
+    "?".to_string()
+}
+
+/// Check if `ancestor_sel >> target_sel` uniquely identifies the target.
+fn chain_is_unique(
+    root: &AXUIElement,
+    ancestor_sel: &str,
+    target_sel: &str,
+    target: &AXUIElement,
+) -> bool {
+    let mut found_target = false;
+    let mut found_other = false;
+    chain_check_inner(
+        root,
+        ancestor_sel,
+        target_sel,
+        target,
+        50,
+        &mut found_target,
+        &mut found_other,
+    );
+    found_target && !found_other
+}
+
+fn chain_check_inner(
+    root: &AXUIElement,
+    ancestor_sel: &str,
+    target_sel: &str,
+    target: &AXUIElement,
+    depth: usize,
+    found_target: &mut bool,
+    found_other: &mut bool,
+) {
+    if depth == 0 || *found_other {
+        return;
+    }
+    for child in children(root) {
+        if *found_other {
+            return;
+        }
+        if element_matches_selector(&child, ancestor_sel) {
+            // Search within this ancestor for target_sel matches
+            count_matches_inner(
+                &child,
+                target_sel,
+                target,
+                50,
+                found_target,
+                found_other,
+            );
+        } else {
+            chain_check_inner(
+                &child,
+                ancestor_sel,
+                target_sel,
+                target,
+                depth - 1,
+                found_target,
+                found_other,
+            );
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Locator resolution — find element by locator string
+// ---------------------------------------------------------------------------
+
+/// Resolve a locator string to the matching element under `root`.
+///
+/// Supports all locator forms produced by `generate_locator`:
+/// - `#id`
+/// - `AXButton[title="Send"]`
+/// - `AXGroup.class1.class2`
+/// - `AXRole`
+/// - `AXGroup:nth(2)`
+/// - `ancestor >> target` (chain selector)
+pub fn resolve_locator(
+    root: &AXUIElement,
+    locator: &str,
+) -> Option<CFRetained<AXUIElement>> {
+    // Chain selector: split by " >> "
+    if let Some((ancestor_sel, target_sel)) = locator.split_once(" >> ") {
+        return resolve_chain(root, ancestor_sel.trim(), target_sel.trim(), 50);
+    }
+    // Single token
+    resolve_single(root, locator.trim(), 50)
+}
+
+/// Find the first element matching a single selector token via DFS.
+fn resolve_single(
+    root: &AXUIElement,
+    selector: &str,
+    max_depth: usize,
+) -> Option<CFRetained<AXUIElement>> {
+    // Handle :nth(n) — needs parent-relative resolution
+    if let Some((role, n)) = parse_nth_selector(selector) {
+        return resolve_nth(root, &role, n, max_depth);
+    }
+
+    if max_depth == 0 {
+        return None;
+    }
+    for child in children(root) {
+        if element_matches_selector(&child, selector) {
+            return Some(child);
+        }
+        if let Some(found) = resolve_single(&child, selector, max_depth - 1) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// Parse `Role:nth(n)` → Some((role, n)), else None.
+fn parse_nth_selector(selector: &str) -> Option<(String, usize)> {
+    let idx = selector.find(":nth(")?;
+    let role = &selector[..idx];
+    let inner = &selector[idx + 5..selector.len() - 1]; // skip ":nth(" and ")"
+    let n: usize = inner.parse().ok()?;
+    Some((role.to_string(), n))
+}
+
+/// Find the nth element (0-based) with the given role among its siblings.
+/// Searches DFS for any parent that has children with this role, then picks the nth.
+fn resolve_nth(
+    root: &AXUIElement,
+    role: &str,
+    n: usize,
+    max_depth: usize,
+) -> Option<CFRetained<AXUIElement>> {
+    if max_depth == 0 {
+        return None;
+    }
+    let kids = children(root);
+    // Check if this node's children contain the role
+    let mut count = 0;
+    for child in &kids {
+        if attr_string(child, "AXRole").as_deref() == Some(role) {
+            if count == n {
+                return Some(child.clone());
+            }
+            count += 1;
+        }
+    }
+    // Recurse
+    for child in &kids {
+        if let Some(found) = resolve_nth(child, role, n, max_depth - 1) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// Resolve a chain selector: find ancestor, then find target within it.
+fn resolve_chain(
+    root: &AXUIElement,
+    ancestor_sel: &str,
+    target_sel: &str,
+    max_depth: usize,
+) -> Option<CFRetained<AXUIElement>> {
+    // Find all ancestors matching ancestor_sel, then search within each
+    let ancestors = collect_matching(root, ancestor_sel, max_depth);
+    for ancestor in &ancestors {
+        if let Some(found) = resolve_single(ancestor, target_sel, 50) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// Collect all elements matching a selector (DFS).
+fn collect_matching(
+    root: &AXUIElement,
+    selector: &str,
+    max_depth: usize,
+) -> Vec<CFRetained<AXUIElement>> {
+    let mut results = Vec::new();
+    collect_matching_inner(root, selector, max_depth, &mut results);
+    results
+}
+
+fn collect_matching_inner(
+    root: &AXUIElement,
+    selector: &str,
+    depth: usize,
+    results: &mut Vec<CFRetained<AXUIElement>>,
+) {
+    if depth == 0 {
+        return;
+    }
+    for child in children(root) {
+        if element_matches_selector(&child, selector) {
+            results.push(child.clone());
+        }
+        collect_matching_inner(&child, selector, depth - 1, results);
     }
 }
 
