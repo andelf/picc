@@ -4,6 +4,8 @@
 //!   cargo run --example ax_print -- --app Lark
 //!   cargo run --example ax_print -- --pid 1234
 //!   cargo run --example ax_print -- --pid 1234 --depth 15
+//!   cargo run --example ax_print -- --app Lark --locator '#root'
+//!   cargo run --example ax_print -- --app Lark --locator 'AXButton[title="Send"]'
 
 use picc::accessibility::{self, AXNode};
 
@@ -34,7 +36,7 @@ fn main() {
         eprintln!("Found app: {localized} (pid={pid})");
         AXNode::app(pid)
     } else {
-        eprintln!("Usage: ax_print --app <name> | --pid <pid> [--depth N]");
+        eprintln!("Usage: ax_print --app <name> | --pid <pid> [--depth N] [--locator SEL]");
         std::process::exit(1);
     };
 
@@ -43,8 +45,25 @@ fn main() {
         std::process::exit(1);
     }
 
+    // --locator: resolve a locator string and use that subtree as root
+    let root = if let Some(pos) = args.iter().position(|a| a == "--locator") {
+        let loc = args.get(pos + 1).expect("--locator requires a selector string");
+        let node = app
+            .locate(loc)
+            .unwrap_or_else(|| panic!("locator not found: {loc}"));
+        eprintln!(
+            "Resolved locator → role={:?} title={:?} children={}",
+            node.role(),
+            node.title(),
+            node.child_count()
+        );
+        node
+    } else {
+        app
+    };
+
     let mut interactive = 0usize;
-    print_tree(&app, 0, max_depth, &mut interactive);
+    print_tree(&root, 0, max_depth, &mut interactive);
     eprintln!("\n({interactive} interactive elements)");
 }
 
