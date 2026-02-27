@@ -40,6 +40,30 @@ path = "src/bin/lark.rs"
 name = "lark_send"
 path = "src/bin/lark_send.rs"
 
+[[bin]]
+name = "lark_normal_group"
+path = "src/bin/lark_normal_group.rs"
+
+[[bin]]
+name = "lark_autoreply"
+path = "src/bin/lark_autoreply.rs"
+
+[[bin]]
+name = "temp_hover_test"
+path = "src/bin/temp_hover_test.rs"
+
+[[bin]]
+name = "chrome_ax"
+path = "src/bin/chrome_ax.rs"
+
+[[bin]]
+name = "ax_traverse"
+path = "src/bin/ax_traverse.rs"
+
+[[bin]]
+name = "ax_tui"
+path = "src/bin/ax_tui.rs"
+
 [dependencies]
 objc2 = "0.6.3"
 block2 = "0.6.2"
@@ -85,6 +109,8 @@ objc2-core-graphics = { version = "0.3.2", features = [
     "CGWindow",
     "CGWindowLevel",
     "CGEventTypes",
+    "CGEvent",
+    "CGEventSource",
 ] }
 objc2-vision = { version = "0.3.2", features = [
     "VNRecognizeTextRequest",
@@ -121,6 +147,14 @@ objc2-application-services = { version = "0.3.2", features = [
     "AXActionConstants",
     "AXValue",
 ] }
+clap = { version = "4", features = ["derive"] }
+reqwest = { version = "0.12", features = ["blocking", "json"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+ratatui = "0.29"
+crossterm = "0.28"
+tui-tree-widget = "0.23"
+regex = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["local-time", "env-filter"] }
 time = { version = "0.3", features = ["local-offset", "formatting", "macros"] }
