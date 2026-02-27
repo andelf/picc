@@ -372,7 +372,7 @@ impl App {
 
     /// Enter action mode for the currently selected node.
     fn enter_action_mode(&mut self) {
-        let mut items = vec!["Move to".into(), "Click".into(), "Focus".into()];
+        let mut items = vec!["Move to".into(), "Click".into(), "Focus".into(), "Text content".into()];
         if let Some(info) = self.selected_node_info() {
             for action in info.ax_node.actions() {
                 items.push(action);
@@ -426,6 +426,16 @@ impl App {
                 } else {
                     "Focus failed".into()
                 };
+                None
+            }
+            "Text content" => {
+                let text = info.ax_node.text(15);
+                if text.is_empty() {
+                    self.status_msg = "(empty)".into();
+                } else {
+                    self.yank_to_clipboard(&text, "text content");
+                    self.status_msg = format!("Copied: {}", trunc(&text, 80));
+                }
                 None
             }
             ax_action => {
