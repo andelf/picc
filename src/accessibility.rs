@@ -873,6 +873,23 @@ fn count_matches_inner(
     }
 }
 
+/// Check if `el_role` (e.g. "AXButton") matches `selector_role` (e.g. "button", "AXButton", "text").
+/// "text" is a special alias matching AXStaticText, AXTextArea, AXTextField.
+fn role_matches(el_role: &str, selector_role: &str) -> bool {
+    if el_role == selector_role {
+        return true;
+    }
+    let short = el_role.strip_prefix("AX").unwrap_or(el_role).to_lowercase();
+    let sel = selector_role.to_lowercase();
+    if short == sel {
+        return true;
+    }
+    if sel == "text" {
+        return short == "statictext" || short == "textarea" || short == "textfield";
+    }
+    false
+}
+
 /// Check if an element matches a selector string.
 fn element_matches_selector(el: &AXUIElement, selector: &str) -> bool {
     if selector.starts_with('#') {
@@ -899,7 +916,7 @@ fn element_matches_selector(el: &AXUIElement, selector: &str) -> bool {
     if let Some(bracket_start) = selector.find('[') {
         let role = &selector[..bracket_start];
         let el_role = attr_string(el, "AXRole").unwrap_or_default();
-        if el_role != role && el_role.strip_prefix("AX").unwrap_or(&el_role).to_lowercase() != role.to_lowercase() {
+        if !role_matches(&el_role, role) {
             return false;
         }
         // Extract attr=value
@@ -927,7 +944,7 @@ fn element_matches_selector(el: &AXUIElement, selector: &str) -> bool {
         let role = parts.next().unwrap_or("");
         if !role.is_empty() {
             let el_role = attr_string(el, "AXRole").unwrap_or_default();
-            if el_role != role && el_role.strip_prefix("AX").unwrap_or(&el_role).to_lowercase() != role.to_lowercase() {
+            if !role_matches(&el_role, role) {
                 return false;
             }
         }
@@ -939,11 +956,7 @@ fn element_matches_selector(el: &AXUIElement, selector: &str) -> bool {
     } else {
         // Plain role — support both "AXButton" and "button" (case-insensitive without AX prefix)
         let el_role = attr_string(el, "AXRole").unwrap_or_default();
-        if el_role == selector {
-            return true;
-        }
-        let short = el_role.strip_prefix("AX").unwrap_or(&el_role).to_lowercase();
-        short == selector.to_lowercase()
+        role_matches(&el_role, selector)
     }
 }
 

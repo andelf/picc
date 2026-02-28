@@ -25,7 +25,7 @@ use picc::accessibility::{self, AXNode};
 use picc::{input, screenshot, tree_fmt};
 
 #[derive(Parser)]
-#[command(name = "axcli", about = "macOS Accessibility CLI tool", after_help = "\
+#[command(name = "axcli", version, about = "macOS Accessibility CLI tool", after_help = "\
 Locator syntax:
   #id                       DOM ID           e.g. #root, #modal
   .class                    DOM class        e.g. .SearchButton, .msg-item
@@ -64,6 +64,9 @@ enum Command {
         /// Show all matches instead of just the first
         #[arg(long)]
         all: bool,
+        /// Max text/title display length (0 = no truncation)
+        #[arg(long, default_value = "80")]
+        max_text_len: usize,
     },
     /// Click element
     Click {
@@ -150,7 +153,7 @@ fn main() {
 
     match cli.command {
         Command::ListApps => unreachable!(),
-        Command::Snapshot { locator, depth, all } => cmd_snapshot(&app, locator.as_deref(), depth, all),
+        Command::Snapshot { locator, depth, all, max_text_len } => cmd_snapshot(&app, locator.as_deref(), depth, all, max_text_len),
         Command::Click { locator } => cmd_click(&app, pid, &locator),
         Command::Dblclick { locator } => cmd_dblclick(&app, pid, &locator),
         Command::Input { locator, text } => cmd_input(&app, pid, &locator, &text),
@@ -160,7 +163,7 @@ fn main() {
         Command::Focus { locator } => cmd_focus(&app, pid, &locator),
         Command::ScrollTo { locator } => cmd_scroll_to(&app, pid, &locator),
         Command::Scroll { locator, direction, pixels } => cmd_scroll(&app, pid, &locator, &direction, pixels),
-        Command::Screenshot { locator, output } => cmd_screenshot(&app, locator.as_deref(), output.as_deref()),
+        Command::Screenshot { locator, output } => cmd_screenshot(&app, pid, locator.as_deref(), output.as_deref()),
         Command::Wait { target } => cmd_wait(&app, &target),
         Command::Get { attr, locator } => cmd_get(&app, &attr, &locator),
     }
@@ -320,8 +323,9 @@ fn cmd_list_apps() {
     eprintln!("\n({} apps)", entries.len());
 }
 
-fn cmd_snapshot(app: &AXNode, locator: Option<&str>, depth: usize, all: bool) {
-    let mut interactive = 0usize;
+fn cmd_snapshot(app: &AXNode, locator: Option<&str>, depth: usize, all: bool, max_text_len: usize) {
+    let mut printer = tree_fmt::TreePrinter::new();
+    printer.max_text_len = max_text_len;
 
     if let Some(loc) = locator {
         validate_locator(loc);
@@ -335,7 +339,7 @@ fn cmd_snapshot(app: &AXNode, locator: Option<&str>, depth: usize, all: bool) {
             for (i, node) in nodes.iter().enumerate() {
                 if i > 0 { println!(); }
                 eprintln!("--- match {}/{} ---", i + 1, nodes.len());
-                tree_fmt::print_with_ancestors(node, depth, &mut interactive);
+                printer.print_with_ancestors(node, depth);
             }
         } else {
             let node = &nodes[0];
@@ -349,13 +353,13 @@ fn cmd_snapshot(app: &AXNode, locator: Option<&str>, depth: usize, all: bool) {
                 "Resolved → role={:?} title={:?} children={}",
                 node.role(), node.title(), node.child_count()
             );
-            tree_fmt::print_with_ancestors(node, depth, &mut interactive);
+            printer.print_with_ancestors(node, depth);
         }
     } else {
-        tree_fmt::print_tree(app, 0, depth, &mut interactive);
+        printer.print_tree(app, 0, depth);
     }
 
-    eprintln!("\n({interactive} interactive elements)");
+    eprintln!("\n({} interactive elements)", printer.interactive_count());
 }
 
 fn cmd_click(app: &AXNode, pid: i32, locator: &str) {
@@ -514,7 +518,10 @@ fn cmd_scroll(app: &AXNode, pid: i32, locator: &str, direction: &str, pixels: i3
     input::scroll_wheel(cx, cy, dx, dy);
 }
 
-fn cmd_screenshot(app: &AXNode, locator: Option<&str>, output: Option<&str>) {
+fn cmd_screenshot(app: &AXNode, pid: i32, locator: Option<&str>, output: Option<&str>) {
+    // Bring app to foreground so it's visible for screen capture
+    input::activate_app(pid);
+    std::thread::sleep(std::time::Duration::from_millis(300));
     let path = output
         .map(String::from)
         .unwrap_or_else(|| {
@@ -532,8 +539,21 @@ fn cmd_screenshot(app: &AXNode, locator: Option<&str>, output: Option<&str>) {
         eprintln!("Capturing {w:.0}x{h:.0} at ({x:.0},{y:.0}) → {path}");
         CGRect::new(CGPoint::new(x, y), CGSize::new(w, h))
     } else {
-        eprintln!("Capturing full screen → {path}");
-        CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(0.0, 0.0))
+        // No locator: capture the app's main window area
+        let windows = app.children();
+        let win = windows.iter().find(|w| {
+            w.role().as_deref() == Some("AXWindow")
+                && w.size().map_or(false, |(w, h)| w > 0.0 && h > 0.0)
+        });
+        if let Some(win) = win {
+            let (x, y) = win.position().unwrap_or((0.0, 0.0));
+            let (w, h) = win.size().unwrap_or((0.0, 0.0));
+            eprintln!("Capturing window {w:.0}x{h:.0} at ({x:.0},{y:.0}) → {path}");
+            CGRect::new(CGPoint::new(x, y), CGSize::new(w, h))
+        } else {
+            eprintln!("warning: no visible window found, capturing full screen → {path}");
+            CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(0.0, 0.0))
+        }
     };
 
     let image = screenshot::capture(rect).expect("screenshot failed");
@@ -571,13 +591,58 @@ fn cmd_wait(app: &AXNode, target: &str) {
     }
 }
 
+/// Collect text from a subtree, inserting newlines at group boundaries.
+fn collect_text(node: &AXNode, max_depth: usize) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    collect_text_inner(node, max_depth, &mut parts);
+    parts.join("")
+}
+
+fn collect_text_inner(node: &AXNode, max_depth: usize, parts: &mut Vec<String>) {
+    if max_depth == 0 {
+        return;
+    }
+    let role = node.role().unwrap_or_default();
+
+    // Text leaf: emit value
+    if role == "AXStaticText" || role == "AXTextArea" || role == "AXTextField" {
+        if let Some(val) = node.value() {
+            if !val.is_empty() {
+                parts.push(val);
+            }
+        }
+        return;
+    }
+
+    // Block-level elements: insert newline before if we already have content
+    let is_block = role == "AXGroup" || role == "AXList" || role == "AXTable"
+        || role == "AXRow" || role == "AXHeading" || role == "AXParagraph"
+        || role == "AXBlockquote" || role == "AXArticle";
+
+    if is_block && !parts.is_empty() {
+        // Only add newline if last part doesn't already end with one
+        if !parts.last().map_or(true, |s| s.ends_with('\n')) {
+            parts.push("\n".to_string());
+        }
+    }
+
+    for child in node.children() {
+        collect_text_inner(&child, max_depth - 1, parts);
+    }
+
+    if is_block && !parts.is_empty() {
+        if !parts.last().map_or(true, |s| s.ends_with('\n')) {
+            parts.push("\n".to_string());
+        }
+    }
+}
+
 fn cmd_get(app: &AXNode, attr: &str, locator: &str) {
     let node = resolve_one(app, locator);
 
     let result = match attr.to_lowercase().as_str() {
         "text" => {
-            // Get subtree text
-            Some(node.text(50))
+            Some(collect_text(&node, 50))
         }
         "role" => node.role(),
         "title" | "axtitle" => node.title(),
