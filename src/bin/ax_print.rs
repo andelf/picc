@@ -155,12 +155,15 @@ fn main() {
 
     // Default: print tree
     let mut interactive = 0usize;
+    let multi = roots.len() > 1;
     for (i, root) in roots.iter().enumerate() {
-        if roots.len() > 1 {
+        if multi {
             if i > 0 { println!(); }
             eprintln!("--- match {}/{} ---", i + 1, roots.len());
+            print_with_ancestors(root, max_depth, &mut interactive);
+        } else {
+            print_tree(root, 0, max_depth, &mut interactive);
         }
-        print_tree(root, 0, max_depth, &mut interactive);
     }
     eprintln!("\n({interactive} interactive elements)");
 }
@@ -233,6 +236,72 @@ fn type_text(text: &str) {
             CGEvent::post(CGEventTapLocation::HIDEventTap, Some(ev));
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// Format a one-line summary of a node (no trailing newline).
+fn format_node_line(node: &AXNode) -> String {
+    let role = node.role().unwrap_or_default();
+    let title = node.title().unwrap_or_default();
+    let desc = node.description().unwrap_or_default();
+    let value = node.value().unwrap_or_default();
+    let dom_id = accessibility::attr_string(&node.0, "AXDOMIdentifier").unwrap_or_default();
+    let dom_classes = node.dom_classes();
+    let is_text = TEXT_ROLES.iter().any(|r| role == *r);
+
+    let short_role = role.strip_prefix("AX").unwrap_or(&role).to_lowercase();
+
+    if is_text && !value.is_empty() {
+        return format!("text: \"{}\"", truncate(&value, 60));
+    }
+
+    let mut s = short_role;
+    if !dom_id.is_empty() {
+        s.push_str(&format!("#{dom_id}"));
+    }
+    for cls in &dom_classes {
+        if !cls.starts_with('_') {
+            s.push_str(&format!(".{cls}"));
+        }
+    }
+    if !title.is_empty() {
+        s.push_str(&format!(" \"{}\"", truncate(&title, 40)));
+    } else if !desc.is_empty() {
+        s.push_str(&format!(" \"{}\"", truncate(&desc, 40)));
+    }
+    s
+}
+
+/// Print a matched node with up to 3 ancestor levels for context.
+fn print_with_ancestors(node: &AXNode, max_depth: usize, interactive: &mut usize) {
+    // Collect up to 3 ancestors
+    let mut ancestors = Vec::new();
+    let mut cur = node.parent();
+    for _ in 0..3 {
+        match cur {
+            Some(p) => {
+                ancestors.push(p);
+                cur = ancestors.last().unwrap().parent();
+            }
+            None => break,
+        }
+    }
+    ancestors.reverse();
+
+    // Print ancestor chain
+    for (i, anc) in ancestors.iter().enumerate() {
+        let indent = "  ".repeat(i);
+        println!("{indent}- {}:", format_node_line(anc));
+    }
+
+    // Print matched node + its subtree
+    let base_depth = ancestors.len();
+    let indent = "  ".repeat(base_depth);
+    let line = format_node_line(node);
+    println!("{indent}- {line}  ← matched");
+    // Subtree children
+    for child in node.children() {
+        print_tree_inner(&child, base_depth + 1, base_depth + max_depth, interactive, false);
     }
 }
 
