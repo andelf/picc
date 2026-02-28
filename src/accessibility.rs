@@ -554,6 +554,14 @@ impl AXNode {
         resolve_locator(&self.0, locator).map(AXNode::new)
     }
 
+    /// Find all elements matching a locator string (supports `>>` chains).
+    pub fn locate_all(&self, locator: &str) -> Vec<AXNode> {
+        resolve_locator_all(&self.0, locator)
+            .into_iter()
+            .map(AXNode::new)
+            .collect()
+    }
+
     /// Generate a locator string that uniquely identifies `target` within this node's subtree.
     pub fn locator(&self, target: &AXNode) -> String {
         generate_locator(&self.0, &target.0)
@@ -873,6 +881,20 @@ fn element_matches_selector(el: &AXUIElement, selector: &str) -> bool {
         return attr_string(el, "AXDOMIdentifier").as_deref() == Some(id);
     }
 
+    // text=VALUE or text~=VALUE — shorthand for text content matching
+    if let Some(rest) = selector.strip_prefix("text=") {
+        let val = rest.trim_matches('"');
+        return [attr_string(el, "AXValue"), attr_string(el, "AXTitle"), attr_string(el, "AXDescription")]
+            .iter()
+            .any(|v| v.as_deref() == Some(val));
+    }
+    if let Some(rest) = selector.strip_prefix("text~=") {
+        let val = rest.trim_matches('"');
+        return [attr_string(el, "AXValue"), attr_string(el, "AXTitle"), attr_string(el, "AXDescription")]
+            .iter()
+            .any(|v| v.as_ref().is_some_and(|s| s.contains(val)));
+    }
+
     // Parse role[attr="value"] or Role.class1.class2 or Role:nth(n)
     if let Some(bracket_start) = selector.find('[') {
         let role = &selector[..bracket_start];
@@ -900,15 +922,17 @@ fn element_matches_selector(el: &AXUIElement, selector: &str) -> bool {
             false
         }
     } else if selector.contains('.') {
-        // Role.class1.class2
+        // Role.class1.class2 or .class1.class2 (role optional)
         let mut parts = selector.split('.');
         let role = parts.next().unwrap_or("");
-        let el_role = attr_string(el, "AXRole").unwrap_or_default();
-        if el_role != role {
-            return false;
+        if !role.is_empty() {
+            let el_role = attr_string(el, "AXRole").unwrap_or_default();
+            if el_role != role {
+                return false;
+            }
         }
         let classes = attr_string_list(el, "AXDOMClassList");
-        parts.all(|c| classes.iter().any(|ec| ec == c))
+        parts.all(|c| c.is_empty() || classes.iter().any(|ec| ec == c))
     } else if selector.contains(":nth(") {
         // Role:nth(n) — handled separately, don't match here
         false
@@ -1083,111 +1107,79 @@ fn chain_check_inner(
 // Locator resolution — find element by locator string
 // ---------------------------------------------------------------------------
 
-/// Resolve a locator string to the matching element under `root`.
+/// Resolve a locator string to the first matching element under `root`.
 ///
-/// Supports all locator forms produced by `generate_locator`:
+/// Supports selector chains separated by ` >> `:
 /// - `#id`
 /// - `AXButton[title="Send"]`
-/// - `AXGroup.class1.class2`
+/// - `AXGroup.class1.class2` or `.class`
+/// - `text=Value` or `text~=Substring`
 /// - `AXRole`
-/// - `AXGroup:nth(2)`
-/// - `ancestor >> target` (chain selector)
+/// - `AXGroup:nth(2)` — nth among siblings with same role
+/// - `nth=N` — pick Nth result from previous step
+/// - `sel1 >> sel2 >> nth=0` — pipeline chain
 pub fn resolve_locator(
     root: &AXUIElement,
     locator: &str,
 ) -> Option<CFRetained<AXUIElement>> {
-    // Chain selector: split by " >> "
-    if let Some((ancestor_sel, target_sel)) = locator.split_once(" >> ") {
-        return resolve_chain(root, ancestor_sel.trim(), target_sel.trim(), 50);
-    }
-    // Single token
-    resolve_single(root, locator.trim(), 50)
+    resolve_locator_all(root, locator).into_iter().next()
 }
 
-/// Find the first element matching a single selector token via DFS.
-fn resolve_single(
+/// Resolve a locator string to all matching elements under `root`.
+///
+/// Supports arbitrary-length ` >> ` chains. Each step searches within
+/// the results of the previous step. Special selectors:
+/// - `nth=N` — pick the Nth element (0-based) from current results
+/// - `first` / `last` — pick first/last element from current results
+pub fn resolve_locator_all(
     root: &AXUIElement,
-    selector: &str,
-    max_depth: usize,
-) -> Option<CFRetained<AXUIElement>> {
-    // Handle :nth(n) — needs parent-relative resolution
-    if let Some((role, n)) = parse_nth_selector(selector) {
-        return resolve_nth(root, &role, n, max_depth);
-    }
+    locator: &str,
+) -> Vec<CFRetained<AXUIElement>> {
+    let steps: Vec<&str> = locator.split(" >> ").map(|s| s.trim()).collect();
 
-    if max_depth == 0 {
-        return None;
-    }
-    for child in children(root) {
-        if element_matches_selector(&child, selector) {
-            return Some(child);
+    // Start: collect all matches for the first selector
+    let Some(first) = steps.first() else {
+        return Vec::new();
+    };
+    let mut current = collect_matching(root, first, 50);
+
+    // Pipeline: each subsequent step searches within current results
+    for step in &steps[1..] {
+        current = apply_step(&current, step);
+        if current.is_empty() {
+            break;
         }
-        if let Some(found) = resolve_single(&child, selector, max_depth - 1) {
-            return Some(found);
-        }
     }
-    None
+    current
 }
 
-/// Parse `Role:nth(n)` → Some((role, n)), else None.
-fn parse_nth_selector(selector: &str) -> Option<(String, usize)> {
-    let idx = selector.find(":nth(")?;
-    let role = &selector[..idx];
-    let inner = &selector[idx + 5..selector.len() - 1]; // skip ":nth(" and ")"
-    let n: usize = inner.parse().ok()?;
-    Some((role.to_string(), n))
+/// Apply a single pipeline step to a set of elements.
+fn apply_step(elements: &[CFRetained<AXUIElement>], step: &str) -> Vec<CFRetained<AXUIElement>> {
+    // nth=N — pick Nth element from current set
+    if let Some(n_str) = step.strip_prefix("nth=") {
+        if let Ok(n) = n_str.parse::<usize>() {
+            return elements.get(n).cloned().into_iter().collect();
+        }
+        return Vec::new();
+    }
+    // first / last — convenience aliases
+    if step == "first" {
+        return elements.first().cloned().into_iter().collect();
+    }
+    if step == "last" {
+        return elements.last().cloned().into_iter().collect();
+    }
+
+    // Normal selector: search within each element's subtree
+    let mut results = Vec::new();
+    for el in elements {
+        collect_matching_inner(el, step, 50, &mut results);
+    }
+    results
 }
 
-/// Find the nth element (0-based) with the given role among its siblings.
-/// Searches DFS for any parent that has children with this role, then picks the nth.
-fn resolve_nth(
-    root: &AXUIElement,
-    role: &str,
-    n: usize,
-    max_depth: usize,
-) -> Option<CFRetained<AXUIElement>> {
-    if max_depth == 0 {
-        return None;
-    }
-    let kids = children(root);
-    // Check if this node's children contain the role
-    let mut count = 0;
-    for child in &kids {
-        if attr_string(child, "AXRole").as_deref() == Some(role) {
-            if count == n {
-                return Some(child.clone());
-            }
-            count += 1;
-        }
-    }
-    // Recurse
-    for child in &kids {
-        if let Some(found) = resolve_nth(child, role, n, max_depth - 1) {
-            return Some(found);
-        }
-    }
-    None
-}
-
-/// Resolve a chain selector: find ancestor, then find target within it.
-fn resolve_chain(
-    root: &AXUIElement,
-    ancestor_sel: &str,
-    target_sel: &str,
-    max_depth: usize,
-) -> Option<CFRetained<AXUIElement>> {
-    // Find all ancestors matching ancestor_sel, then search within each
-    let ancestors = collect_matching(root, ancestor_sel, max_depth);
-    for ancestor in &ancestors {
-        if let Some(found) = resolve_single(ancestor, target_sel, 50) {
-            return Some(found);
-        }
-    }
-    None
-}
-
-/// Collect all elements matching a selector (DFS).
-fn collect_matching(
+/// Collect all elements matching a selector string (DFS).
+pub fn collect_matching(
     root: &AXUIElement,
     selector: &str,
     max_depth: usize,
