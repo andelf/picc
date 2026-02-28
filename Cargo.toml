@@ -61,6 +61,10 @@ name = "ax_traverse"
 path = "src/bin/ax_traverse.rs"
 
 [[bin]]
+name = "ax_print"
+path = "src/bin/ax_print.rs"
+
+[[bin]]
 name = "ax_tui"
 path = "src/bin/ax_tui.rs"
 

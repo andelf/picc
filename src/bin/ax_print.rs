@@ -1,15 +1,15 @@
 //! Print a simplified, DevTools-style accessibility tree for a macOS app.
 //!
 //! Usage:
-//!   cargo run --example ax_print -- --app Lark
-//!   cargo run --example ax_print -- --pid 1234
-//!   cargo run --example ax_print -- --pid 1234 --depth 15
-//!   cargo run --example ax_print -- --app Lark --locator '#root'
-//!   cargo run --example ax_print -- --app Lark --locator 'AXButton[title="Send"]'
-//!   cargo run --example ax_print -- --app Lark --locator '.feed-shortcut-item' --all
-//!   cargo run --example ax_print -- --app Lark --locator '.SearchButton' --move-to
-//!   cargo run --example ax_print -- --app Lark --locator '.SearchButton' --click
-//!   cargo run --example ax_print -- --app Lark --locator '.SearchButton' --input 'hello'
+//!   cargo run --bin ax_print -- --app Lark
+//!   cargo run --bin ax_print -- --pid 1234
+//!   cargo run --bin ax_print -- --pid 1234 --depth 15
+//!   cargo run --bin ax_print -- --app Lark --locator '#root'
+//!   cargo run --bin ax_print -- --app Lark --locator 'AXButton[title="Send"]'
+//!   cargo run --bin ax_print -- --app Lark --locator '.feed-shortcut-item' --all
+//!   cargo run --bin ax_print -- --app Lark --locator '.SearchButton' --move-to
+//!   cargo run --bin ax_print -- --app Lark --locator '.SearchButton' --click
+//!   cargo run --bin ax_print -- --app Lark --locator '.SearchButton' --input 'hello'
 
 use objc2_app_kit::NSRunningApplication;
 use objc2_core_foundation::CGPoint;
