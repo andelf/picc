@@ -13,6 +13,7 @@
 //!   cargo run --bin ax_print -- --app Lark --press Enter
 //!   cargo run --bin ax_print -- --app Lark --press 'Control+a'
 //!   cargo run --bin ax_print -- --app Lark --press 'Command+Shift+v'
+//!   cargo run --bin ax_print -- --app Lark --locator '.SearchButton' --scroll-to
 //!   cargo run --bin ax_print -- --app Lark --locator '.SearchButton' --screenshot
 //!   cargo run --bin ax_print -- --app Lark --locator '.SearchButton' --screenshot /tmp/shot.png
 
@@ -66,6 +67,7 @@ fn main() {
     }
 
     let show_all = args.iter().any(|a| a == "--all");
+    let do_scroll_to = args.iter().any(|a| a == "--scroll-to");
     let do_move = args.iter().any(|a| a == "--move-to");
     let do_click = args.iter().any(|a| a == "--click");
     let input_text = args
@@ -86,7 +88,7 @@ fn main() {
     } else {
         None
     };
-    let has_action = do_move || do_click || input_text.is_some() || do_screenshot;
+    let has_action = do_scroll_to || do_move || do_click || input_text.is_some() || do_screenshot;
     let _needs_app = has_action || press_key.is_some();
 
     // --locator: resolve a locator string
@@ -139,7 +141,21 @@ fn main() {
         let role = node.role().unwrap_or_default();
         let is_menu = role == "AXMenuItem" || role == "AXMenuBarItem";
 
-        // Validate element is visible (menu items exempt — they can be AXPress'd without size)
+        // Bring app to foreground
+        activate_app(pid);
+        std::thread::sleep(std::time::Duration::from_millis(200));
+
+        // --scroll-to: ask the scroll container to reveal this element
+        if do_scroll_to {
+            eprintln!("Scrolling element into view...");
+            if !accessibility::perform_action(&node.0, "AXScrollToVisible") {
+                eprintln!("warning: AXScrollToVisible failed (element may not be in a scroll area)");
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(300));
+            }
+        }
+
+        // Get position/size (after scroll, so coordinates are up-to-date)
         let (w, h) = node.size().unwrap_or((0.0, 0.0));
         if w == 0.0 && h == 0.0 && !is_menu {
             eprintln!("error: element has zero size (not visible)");
@@ -148,10 +164,6 @@ fn main() {
         let (x, y) = node.position().unwrap_or((0.0, 0.0));
         let center_x = x + w / 2.0;
         let center_y = y + h / 2.0;
-
-        // Bring app to foreground
-        activate_app(pid);
-        std::thread::sleep(std::time::Duration::from_millis(200));
 
         if do_move {
             if is_menu {

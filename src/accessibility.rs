@@ -1160,10 +1160,15 @@ pub fn resolve_locator_all(
 
 /// Apply a single pipeline step to a set of elements.
 fn apply_step(elements: &[CFRetained<AXUIElement>], step: &str) -> Vec<CFRetained<AXUIElement>> {
-    // nth=N — pick Nth element from current set
+    // nth=N — pick Nth element from current set (supports negative index)
     if let Some(n_str) = step.strip_prefix("nth=") {
-        if let Ok(n) = n_str.parse::<usize>() {
-            return elements.get(n).cloned().into_iter().collect();
+        if let Ok(n) = n_str.parse::<isize>() {
+            let idx = if n < 0 {
+                elements.len().checked_sub((-n) as usize)
+            } else {
+                Some(n as usize)
+            };
+            return idx.and_then(|i| elements.get(i)).cloned().into_iter().collect();
         }
         return Vec::new();
     }
