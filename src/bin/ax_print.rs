@@ -10,12 +10,21 @@
 //!   cargo run --bin ax_print -- --app Lark --locator '.SearchButton' --move-to
 //!   cargo run --bin ax_print -- --app Lark --locator '.SearchButton' --click
 //!   cargo run --bin ax_print -- --app Lark --locator '.SearchButton' --input 'hello'
+//!   cargo run --bin ax_print -- --app Lark --press Enter
+//!   cargo run --bin ax_print -- --app Lark --press 'Control+a'
+//!   cargo run --bin ax_print -- --app Lark --press 'Command+Shift+v'
+//!   cargo run --bin ax_print -- --app Lark --locator '.SearchButton' --screenshot
+//!   cargo run --bin ax_print -- --app Lark --locator '.SearchButton' --screenshot /tmp/shot.png
+
+use std::ffi::c_void;
 
 use objc2_app_kit::NSRunningApplication;
-use objc2_core_foundation::CGPoint;
+use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use objc2_core_graphics::{
-    CGEvent, CGEventSource, CGEventSourceStateID, CGEventTapLocation, CGEventType, CGMouseButton,
+    CGEvent, CGEventFlags, CGEventSource, CGEventSourceStateID, CGEventTapLocation, CGEventType,
+    CGImage, CGMouseButton,
 };
+use objc2_foundation::NSString;
 use picc::accessibility::{self, AXNode};
 
 const TEXT_ROLES: &[&str] = &["AXStaticText", "AXTextArea", "AXTextField"];
@@ -63,7 +72,22 @@ fn main() {
         .iter()
         .position(|a| a == "--input")
         .map(|i| args.get(i + 1).expect("--input requires a TEXT value").clone());
-    let has_action = do_move || do_click || input_text.is_some();
+    let press_key = args
+        .iter()
+        .position(|a| a == "--press")
+        .map(|i| args.get(i + 1).expect("--press requires a key like Enter, Tab, Control+a").clone());
+    let do_screenshot = args.iter().any(|a| a == "--screenshot");
+    let screenshot_path = if do_screenshot {
+        // Next arg after --screenshot is optional path (if it doesn't start with --)
+        let pos = args.iter().position(|a| a == "--screenshot").unwrap();
+        args.get(pos + 1)
+            .filter(|s| !s.starts_with("--"))
+            .cloned()
+    } else {
+        None
+    };
+    let has_action = do_move || do_click || input_text.is_some() || do_screenshot;
+    let _needs_app = has_action || press_key.is_some();
 
     // --locator: resolve a locator string
     let roots = if let Some(pos) = args.iter().position(|a| a == "--locator") {
@@ -102,7 +126,7 @@ fn main() {
         }
     } else {
         if has_action {
-            eprintln!("error: actions require --locator");
+            eprintln!("error: --move-to/--click/--input require --locator");
             std::process::exit(1);
         }
         vec![app]
@@ -112,9 +136,12 @@ fn main() {
     if has_action {
         let node = &roots[0];
 
-        // Validate element is visible (has non-zero size and position)
+        let role = node.role().unwrap_or_default();
+        let is_menu = role == "AXMenuItem" || role == "AXMenuBarItem";
+
+        // Validate element is visible (menu items exempt — they can be AXPress'd without size)
         let (w, h) = node.size().unwrap_or((0.0, 0.0));
-        if w == 0.0 && h == 0.0 {
+        if w == 0.0 && h == 0.0 && !is_menu {
             eprintln!("error: element has zero size (not visible)");
             std::process::exit(1);
         }
@@ -127,14 +154,26 @@ fn main() {
         std::thread::sleep(std::time::Duration::from_millis(200));
 
         if do_move {
-            eprintln!("Moving mouse to ({center_x:.0}, {center_y:.0})");
-            mouse_move(center_x, center_y);
+            if is_menu {
+                eprintln!("warning: --move-to not meaningful for menu items");
+            } else {
+                eprintln!("Moving mouse to ({center_x:.0}, {center_y:.0})");
+                mouse_move(center_x, center_y);
+            }
         }
         if do_click {
-            eprintln!("Clicking at ({center_x:.0}, {center_y:.0})");
-            mouse_move(center_x, center_y);
-            std::thread::sleep(std::time::Duration::from_millis(50));
-            mouse_click(center_x, center_y);
+            if is_menu {
+                eprintln!("Performing AXPress on {role}");
+                if !accessibility::perform_action(&node.0, "AXPress") {
+                    eprintln!("error: AXPress failed");
+                    std::process::exit(1);
+                }
+            } else {
+                eprintln!("Clicking at ({center_x:.0}, {center_y:.0})");
+                mouse_move(center_x, center_y);
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                mouse_click(center_x, center_y);
+            }
         }
         if let Some(ref text) = input_text {
             // Focus element, then type text
@@ -150,6 +189,29 @@ fn main() {
             eprintln!("Typing: {text:?}");
             type_text(text);
         }
+        if do_screenshot {
+            let path = screenshot_path.clone().unwrap_or_else(|| {
+                let ts = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs();
+                format!("/tmp/ax_screenshot_{ts}.png")
+            });
+            let rect = CGRect::new(CGPoint::new(x, y), CGSize::new(w, h));
+            eprintln!("Capturing {w:.0}x{h:.0} at ({x:.0},{y:.0}) → {path}");
+            let image = picc::screenshot(rect).expect("screenshot failed");
+            save_cgimage(&image, &path);
+        }
+        return;
+    }
+
+    // --press: send key combo to the app (no locator needed)
+    if let Some(ref combo) = press_key {
+        activate_app(pid);
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        let (keycode, flags) = parse_key_combo(combo);
+        eprintln!("Pressing: {combo} (keycode={keycode}, flags=0x{flags:x})");
+        press_key_combo(keycode, flags);
         return;
     }
 
@@ -236,6 +298,87 @@ fn type_text(text: &str) {
             CGEvent::post(CGEventTapLocation::HIDEventTap, Some(ev));
         }
         std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+fn parse_key_combo(combo: &str) -> (u16, u64) {
+    let parts: Vec<&str> = combo.split('+').map(|s| s.trim()).collect();
+    let mut flags: u64 = 0;
+    let mut key_name = "";
+
+    for part in &parts {
+        match part.to_lowercase().as_str() {
+            "control" | "ctrl" => flags |= 0x40000,
+            "shift" => flags |= 0x20000,
+            "option" | "alt" => flags |= 0x80000,
+            "command" | "cmd" | "super" => flags |= 0x100000,
+            _ => key_name = part,
+        }
+    }
+
+    let keycode = match key_name.to_lowercase().as_str() {
+        "return" | "enter" => 36,
+        "tab" => 48,
+        "space" => 49,
+        "delete" | "backspace" => 51,
+        "escape" | "esc" => 53,
+        "left" => 123,
+        "right" => 124,
+        "down" => 125,
+        "up" => 126,
+        "home" => 115,
+        "end" => 119,
+        "pageup" => 116,
+        "pagedown" => 121,
+        "f1" => 122, "f2" => 120, "f3" => 99, "f4" => 118,
+        "f5" => 96, "f6" => 97, "f7" => 98, "f8" => 100,
+        "f9" => 101, "f10" => 109, "f11" => 103, "f12" => 111,
+        // Single character keys
+        s if s.len() == 1 => {
+            let ch = s.chars().next().unwrap();
+            match ch {
+                'a' => 0, 's' => 1, 'd' => 2, 'f' => 3, 'h' => 4,
+                'g' => 5, 'z' => 6, 'x' => 7, 'c' => 8, 'v' => 9,
+                'b' => 11, 'q' => 12, 'w' => 13, 'e' => 14, 'r' => 15,
+                'y' => 16, 't' => 17, '1' => 18, '2' => 19, '3' => 20,
+                '4' => 21, '6' => 22, '5' => 23, '=' => 24, '9' => 25,
+                '7' => 26, '-' => 27, '8' => 28, '0' => 29, ']' => 30,
+                'o' => 31, 'u' => 32, '[' => 33, 'i' => 34, 'p' => 35,
+                'l' => 37, 'j' => 38, '\'' => 39, 'k' => 40, ';' => 41,
+                '\\' => 42, ',' => 43, '/' => 44, 'n' => 45, 'm' => 46,
+                '.' => 47,
+                _ => {
+                    eprintln!("warning: unknown key '{ch}', using keycode 0");
+                    0
+                }
+            }
+        }
+        _ => {
+            eprintln!("warning: unknown key '{key_name}', using keycode 0");
+            0
+        }
+    };
+
+    (keycode, flags)
+}
+
+fn press_key_combo(keycode: u16, flags: u64) {
+    let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState);
+
+    let down = CGEvent::new_keyboard_event(source.as_deref(), keycode, true);
+    if let Some(ref ev) = down {
+        if flags != 0 {
+            CGEvent::set_flags(Some(ev), CGEventFlags(flags));
+        }
+        CGEvent::post(CGEventTapLocation::HIDEventTap, Some(ev));
+    }
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    let up = CGEvent::new_keyboard_event(source.as_deref(), keycode, false);
+    if let Some(ref ev) = up {
+        if flags != 0 {
+            CGEvent::set_flags(Some(ev), CGEventFlags(flags));
+        }
+        CGEvent::post(CGEventTapLocation::HIDEventTap, Some(ev));
     }
 }
 
@@ -432,5 +575,58 @@ fn truncate(s: &str, max: usize) -> String {
     } else {
         let truncated: String = s.chars().take(max).collect();
         format!("{}...", truncated.replace('\n', "\\n"))
+    }
+}
+
+fn save_cgimage(image: &CGImage, path: &str) {
+    #[link(name = "ImageIO", kind = "framework")]
+    extern "C" {
+        fn CGImageDestinationCreateWithURL(
+            url: *const c_void,
+            ty: *const c_void,
+            count: usize,
+            options: *const c_void,
+        ) -> *mut c_void;
+        fn CGImageDestinationAddImage(
+            dest: *mut c_void,
+            image: *const c_void,
+            properties: *const c_void,
+        );
+        fn CGImageDestinationFinalize(dest: *mut c_void) -> bool;
+    }
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    extern "C" {
+        fn CFURLCreateWithFileSystemPath(
+            allocator: *const c_void,
+            path: *const c_void,
+            style: i32,
+            is_dir: bool,
+        ) -> *const c_void;
+    }
+
+    unsafe {
+        let ns_path = NSString::from_str(path);
+        let url = CFURLCreateWithFileSystemPath(
+            std::ptr::null(),
+            (&*ns_path as *const NSString).cast(),
+            0, // kCFURLPOSIXPathStyle
+            false,
+        );
+        let png_type = NSString::from_str("public.png");
+        let dest = CGImageDestinationCreateWithURL(
+            url,
+            (&*png_type as *const NSString).cast(),
+            1,
+            std::ptr::null(),
+        );
+        CGImageDestinationAddImage(dest, (image as *const CGImage).cast(), std::ptr::null());
+        let ok = CGImageDestinationFinalize(dest);
+        if ok {
+            eprintln!("Saved: {path}");
+        } else {
+            eprintln!("error: failed to save {path}");
+            std::process::exit(1);
+        }
     }
 }

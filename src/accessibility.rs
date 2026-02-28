@@ -899,7 +899,7 @@ fn element_matches_selector(el: &AXUIElement, selector: &str) -> bool {
     if let Some(bracket_start) = selector.find('[') {
         let role = &selector[..bracket_start];
         let el_role = attr_string(el, "AXRole").unwrap_or_default();
-        if el_role != role {
+        if el_role != role && el_role.strip_prefix("AX").unwrap_or(&el_role).to_lowercase() != role.to_lowercase() {
             return false;
         }
         // Extract attr=value
@@ -927,7 +927,7 @@ fn element_matches_selector(el: &AXUIElement, selector: &str) -> bool {
         let role = parts.next().unwrap_or("");
         if !role.is_empty() {
             let el_role = attr_string(el, "AXRole").unwrap_or_default();
-            if el_role != role {
+            if el_role != role && el_role.strip_prefix("AX").unwrap_or(&el_role).to_lowercase() != role.to_lowercase() {
                 return false;
             }
         }
@@ -937,8 +937,13 @@ fn element_matches_selector(el: &AXUIElement, selector: &str) -> bool {
         // Role:nth(n) — handled separately, don't match here
         false
     } else {
-        // Plain role
-        attr_string(el, "AXRole").as_deref() == Some(selector)
+        // Plain role — support both "AXButton" and "button" (case-insensitive without AX prefix)
+        let el_role = attr_string(el, "AXRole").unwrap_or_default();
+        if el_role == selector {
+            return true;
+        }
+        let short = el_role.strip_prefix("AX").unwrap_or(&el_role).to_lowercase();
+        short == selector.to_lowercase()
     }
 }
 
