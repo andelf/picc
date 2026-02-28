@@ -128,10 +128,18 @@ enum Command {
         attr: String,
         locator: String,
     },
+    /// List running applications visible to accessibility
+    ListApps,
 }
 
 fn main() {
     let cli = Cli::parse();
+
+    // list-apps doesn't need --app/--pid
+    if matches!(cli.command, Command::ListApps) {
+        cmd_list_apps();
+        return;
+    }
 
     let (pid, app) = resolve_app(&cli);
 
@@ -141,6 +149,7 @@ fn main() {
     }
 
     match cli.command {
+        Command::ListApps => unreachable!(),
         Command::Snapshot { locator, depth, all } => cmd_snapshot(&app, locator.as_deref(), depth, all),
         Command::Click { locator } => cmd_click(&app, pid, &locator),
         Command::Dblclick { locator } => cmd_dblclick(&app, pid, &locator),
@@ -276,6 +285,40 @@ fn is_menu_role(role: &str) -> bool {
 }
 
 // --- Commands ---
+
+fn cmd_list_apps() {
+    use objc2_app_kit::NSRunningApplication;
+
+    let mtm = objc2::MainThreadMarker::new().expect("must run on main thread");
+    let _ = mtm;
+    let workspace_cls = objc2::runtime::AnyClass::get(c"NSWorkspace").unwrap();
+    let workspace: objc2::rc::Retained<objc2::runtime::NSObject> =
+        unsafe { objc2::msg_send![workspace_cls, sharedWorkspace] };
+    let apps: objc2::rc::Retained<objc2_foundation::NSArray<NSRunningApplication>> =
+        unsafe { objc2::msg_send![&workspace, runningApplications] };
+
+    let mut entries: Vec<(i32, String, String)> = Vec::new();
+    for app in apps.iter() {
+        let pid = app.processIdentifier();
+        let bundle = app
+            .bundleIdentifier()
+            .map(|b| b.to_string())
+            .unwrap_or_default();
+        let name = app
+            .localizedName()
+            .map(|n| n.to_string())
+            .unwrap_or_default();
+        if !bundle.is_empty() && !name.is_empty() {
+            entries.push((pid, name, bundle));
+        }
+    }
+    entries.sort_by(|a, b| a.1.to_lowercase().cmp(&b.1.to_lowercase()));
+
+    for (pid, name, bundle) in &entries {
+        println!("{pid:>6}  {name:<30} {bundle}");
+    }
+    eprintln!("\n({} apps)", entries.len());
+}
 
 fn cmd_snapshot(app: &AXNode, locator: Option<&str>, depth: usize, all: bool) {
     let mut interactive = 0usize;
