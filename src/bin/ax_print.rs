@@ -30,6 +30,19 @@ use picc::accessibility::{self, AXNode};
 
 const TEXT_ROLES: &[&str] = &["AXStaticText", "AXTextArea", "AXTextField"];
 
+/// Sort class names: meaningful ones first, noisy ones (numeric, `-` or `_` prefixed) last.
+fn sort_classes(classes: &[String]) -> Vec<&str> {
+    let mut visible: Vec<&str> = classes.iter().filter(|c| !c.starts_with('_')).map(|s| s.as_str()).collect();
+    visible.sort_by_key(|c| {
+        if c.starts_with('-') || c.chars().next().map_or(true, |ch| ch.is_ascii_digit()) {
+            1
+        } else {
+            0
+        }
+    });
+    visible
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
 
@@ -414,10 +427,8 @@ fn format_node_line(node: &AXNode) -> String {
     if !dom_id.is_empty() {
         s.push_str(&format!("#{dom_id}"));
     }
-    for cls in &dom_classes {
-        if !cls.starts_with('_') {
-            s.push_str(&format!(".{cls}"));
-        }
+    for cls in sort_classes(&dom_classes) {
+        s.push_str(&format!(".{cls}"));
     }
     if !title.is_empty() {
         s.push_str(&format!(" \"{}\"", truncate(&title, 40)));
@@ -521,10 +532,8 @@ fn print_tree_inner(node: &AXNode, depth: usize, max_depth: usize, interactive: 
             if !dom_id.is_empty() {
                 line.push_str(&format!("#{dom_id}"));
             }
-            for cls in &dom_classes {
-                if !cls.starts_with('_') {
-                    line.push_str(&format!(".{cls}"));
-                }
+            for cls in sort_classes(&dom_classes) {
+                line.push_str(&format!(".{cls}"));
             }
 
             if !title.is_empty() {
