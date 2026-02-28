@@ -68,6 +68,10 @@ path = "src/bin/ax_print.rs"
 name = "ax_tui"
 path = "src/bin/ax_tui.rs"
 
+[[bin]]
+name = "axcli"
+path = "src/bin/axcli.rs"
+
 [dependencies]
 objc2 = "0.6.3"
 block2 = "0.6.2"

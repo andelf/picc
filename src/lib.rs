@@ -1,7 +1,10 @@
 pub mod accessibility;
 pub mod avfaudio;
 pub mod core_graphics;
+pub mod input;
 pub mod locator;
+pub mod screenshot;
+pub mod tree_fmt;
 pub mod vision;
 
 use objc2_core_foundation::CFRetained;
