@@ -3,6 +3,7 @@ use std::ptr::NonNull;
 use std::sync::Mutex;
 
 use block2::RcBlock;
+use tracing::{debug, info, warn};
 use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject, NSObject};
 use objc2::sel;
@@ -24,6 +25,8 @@ struct StandupState {
     wake_secs: f64,
     is_breaking: bool,
     skip_next: bool,
+    /// 防止 show_countdown 在休眠唤醒期间被 work_timer 和 menubar_timer 同时触发
+    show_countdown_guard: bool,
 }
 
 static STATE: Mutex<StandupState> = Mutex::new(StandupState {
@@ -33,6 +36,7 @@ static STATE: Mutex<StandupState> = Mutex::new(StandupState {
     wake_secs: 10.0 * 60.0,
     is_breaking: false,
     skip_next: false,
+    show_countdown_guard: false,
 });
 
 // 定时器和窗口引用，仅在主线程访问
@@ -57,6 +61,7 @@ define_class!(
     impl MenuDelegate {
         #[unsafe(method(breakNow:))]
         fn break_now(&self, _sender: &AnyObject) {
+            info!("Menu action: break now");
             show_countdown();
         }
 
@@ -67,12 +72,14 @@ define_class!(
                 state.skip_next = !state.skip_next;
                 state.skip_next
             };
+            info!("Menu action: skip_next toggled to {}", new_skip);
             // 更新菜单项标题
             update_skip_menu_title(new_skip);
         }
 
         #[unsafe(method(quit:))]
         fn quit(&self, _sender: &AnyObject) {
+            info!("Menu action: quit");
             std::process::exit(0);
         }
     }
@@ -101,7 +108,10 @@ define_class!(
 
         #[unsafe(method(keyDown:))]
         fn keyDown(&self, event: &NSEvent) {
-            if event.keyCode() == 53 {
+            let key_code = event.keyCode();
+            debug!("keyDown: keyCode={}, isKeyWindow={}", key_code, self.isKeyWindow());
+            if key_code == 53 {
+                info!("ESC pressed, dismissing countdown");
                 dismiss_countdown();
             }
         }
@@ -343,7 +353,10 @@ fn update_menubar_title() {
         if timer_expired {
             let wake_secs = STATE.lock().unwrap().wake_secs;
             start_work_timer_with(wake_secs);
-            println!("Wake from sleep, next break in {:.0}s", wake_secs);
+            info!(
+                "Wake from sleep detected, work timer expired, reset next break in {:.0}s",
+                wake_secs
+            );
             // 继续走下面的渲染逻辑，用新 timer 显示倒计时
             let m = (wake_secs as u32) / 60;
             let s = (wake_secs as u32) % 60;
@@ -401,6 +414,25 @@ fn update_skip_menu_title(skip: bool) {
 // -- 核心控制函数 --
 
 fn show_countdown() {
+    // 防重入：如果已经在 break 中，不再触发
+    {
+        let state = STATE.lock().unwrap();
+        if state.is_breaking {
+            warn!(
+                "show_countdown called while already breaking (remaining={}s), ignoring",
+                state.remaining_secs
+            );
+            return;
+        }
+        if state.show_countdown_guard {
+            warn!("show_countdown re-entered, ignoring");
+            return;
+        }
+    }
+
+    // 设置 guard
+    STATE.lock().unwrap().show_countdown_guard = true;
+
     // 检查 skip 标志
     let should_skip = {
         let mut state = STATE.lock().unwrap();
@@ -414,7 +446,8 @@ fn show_countdown() {
     if should_skip {
         update_skip_menu_title(false);
         start_work_timer();
-        println!("Break skipped.");
+        info!("Break skipped by user preference");
+        STATE.lock().unwrap().show_countdown_guard = false;
         return;
     }
 
@@ -425,8 +458,11 @@ fn show_countdown() {
         state.break_secs
     };
 
+    info!("Break started: {}s ({}m{}s)", break_secs, break_secs / 60, break_secs % 60);
+
     // 停止工作定时器
     WORK_TIMER.with(|t| invalidate_timer(t));
+    debug!("Work timer invalidated for break");
 
     with_window(|window| {
         let mtm = MainThreadMarker::new().unwrap();
@@ -443,6 +479,10 @@ fn show_countdown() {
         #[allow(deprecated)]
         app.activateIgnoringOtherApps(true);
 
+        let is_key = window.isKeyWindow();
+        let is_visible = window.isVisible();
+        debug!("Break window shown: isKey={}, isVisible={}", is_key, is_visible);
+
         refresh_view(window);
     });
 
@@ -457,34 +497,62 @@ fn show_countdown() {
     });
 
     update_menubar_title();
-    println!("Break started: {} seconds", break_secs);
+
+    STATE.lock().unwrap().show_countdown_guard = false;
 }
 
 fn tick_countdown() {
-    let remaining = {
+    let (remaining, is_breaking) = {
         let mut state = STATE.lock().unwrap();
+        if !state.is_breaking {
+            debug!("tick_countdown called but not breaking, ignoring");
+            return;
+        }
         if state.remaining_secs > 0 {
             state.remaining_secs -= 1;
         }
-        state.remaining_secs
+        (state.remaining_secs, state.is_breaking)
     };
 
-    with_window(|window| refresh_view(window));
+    debug!("tick: remaining={}s, is_breaking={}", remaining, is_breaking);
+
+    with_window(|window| {
+        refresh_view(window);
+
+        // 每次 tick 确保窗口仍然是 key window（休眠恢复后可能丢失焦点）
+        if !window.isKeyWindow() {
+            warn!("Window lost key status during break, re-acquiring");
+            window.makeKeyAndOrderFront(None);
+            let mtm = MainThreadMarker::new().unwrap();
+            let app = NSApplication::sharedApplication(mtm);
+            #[allow(deprecated)]
+            app.activateIgnoringOtherApps(true);
+        }
+    });
 
     if remaining == 0 {
+        info!("Countdown reached zero, dismissing");
         dismiss_countdown();
     }
 }
 
 fn dismiss_countdown() {
-    {
+    let was_breaking = {
         let mut state = STATE.lock().unwrap();
+        let was = state.is_breaking;
         state.remaining_secs = 0;
         state.is_breaking = false;
+        was
+    };
+
+    if !was_breaking {
+        debug!("dismiss_countdown called but was not breaking, ignoring");
+        return;
     }
 
     // 停止倒计时定时器
     COUNTDOWN_TIMER.with(|t| invalidate_timer(t));
+    debug!("Countdown timer invalidated");
 
     with_window(|window| window.orderOut(None));
 
@@ -492,11 +560,12 @@ fn dismiss_countdown() {
     start_work_timer();
 
     update_menubar_title();
-    println!("Break ended. Back to work!");
+    info!("Break ended, back to work");
 }
 
 fn start_work_timer() {
     let work_secs = STATE.lock().unwrap().work_secs;
+    info!("Starting work timer: {:.0}s ({:.1}m)", work_secs, work_secs / 60.0);
     start_work_timer_with(work_secs);
 }
 
@@ -505,6 +574,7 @@ fn start_work_timer_with(secs: f64) {
     WORK_TIMER.with(|t| invalidate_timer(t));
 
     let block = RcBlock::new(move |_timer: NonNull<NSTimer>| {
+        debug!("Work timer fired after {:.0}s", secs);
         show_countdown();
     });
     let timer = unsafe {
@@ -513,6 +583,7 @@ fn start_work_timer_with(secs: f64) {
     WORK_TIMER.with(|t| {
         *t.borrow_mut() = Some(timer);
     });
+    debug!("Work timer scheduled for {:.0}s", secs);
 }
 
 // -- 命令行参数解析 --
@@ -559,6 +630,20 @@ fn parse_args() -> (f64, f64, f64) {
 }
 
 fn main() {
+    let local_time = tracing_subscriber::fmt::time::OffsetTime::new(
+        time::UtcOffset::current_local_offset().unwrap_or(time::UtcOffset::UTC),
+        time::macros::format_description!(
+            "[year]-[month]-[day] [hour]:[minute]:[second].[subsecond digits:3]"
+        ),
+    );
+    tracing_subscriber::fmt()
+        .with_timer(local_time)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::from_default_env()
+                .add_directive(tracing::Level::INFO.into()),
+        )
+        .init();
+
     let (work_mins, break_mins, wake_mins) = parse_args();
 
     let mtm = MainThreadMarker::new().expect("must be on the main thread");
@@ -616,9 +701,9 @@ fn main() {
     start_menubar_timer();
     update_menubar_title();
 
-    println!(
-        "Standup running. Break every {:.1} minutes for {:.1} minutes.",
-        work_mins, break_mins
+    info!(
+        "Standup running: work={:.1}m, break={:.1}m, wake={:.1}m",
+        work_mins, break_mins, wake_mins
     );
 
     app.run();
