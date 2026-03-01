@@ -35,9 +35,17 @@ Locator syntax:
   Role[attr=\"val\"]          Attribute match  e.g. AXButton[title=\"Send\"]
   text=VALUE                Exact text       e.g. text=\"Hello\"
   text~=VALUE               Contains text    e.g. text~=\"partial\"
+  text=/regex/flags         Regex text       e.g. text=/\\d+条新消息/, text=/Log\\s*in/i
   L >> R                    Chain (scope)    e.g. .sidebar >> AXButton
+  L > R                     Direct child     e.g. AXWindow > AXGroup
   L >> nth=N                Pick Nth match   e.g. .item >> nth=0, nth=-1
   L >> first / last         Pick first/last  e.g. .item >> last
+
+Pseudo-classes:
+  :has-text(\"text\")         Subtree text     e.g. .card:has-text(\"会议\")
+  :has(selector)            Has descendant   e.g. .item:has(.reaction)
+  :visible                  Non-zero size    e.g. AXButton:visible
+  :nth-child(N)             Nth child (0-based) e.g. AXGroup:nth-child(0)
 ")]
 struct Cli {
     /// Application name
@@ -50,6 +58,74 @@ struct Cli {
 
     #[command(subcommand)]
     command: Command,
+}
+
+/// Known attribute names for `get` command. Also accepts raw AX* attribute names.
+#[derive(Clone, Debug)]
+enum GetAttr {
+    /// Subtree text (with newlines at block boundaries)
+    Text,
+    /// AXRole
+    Role,
+    /// AXTitle
+    Title,
+    /// AXDescription
+    Description,
+    /// AXValue
+    Value,
+    /// AXDOMIdentifier
+    DomId,
+    /// AXDOMClassList
+    Classes,
+    /// Available actions
+    Actions,
+    /// Screen position (x, y)
+    Position,
+    /// Element size (w, h)
+    Size,
+    /// Number of children
+    ChildCount,
+    /// Raw AX attribute (e.g. AXHelp, AXURL)
+    Raw(String),
+}
+
+impl std::fmt::Display for GetAttr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Text => write!(f, "text"),
+            Self::Role => write!(f, "role"),
+            Self::Title => write!(f, "title"),
+            Self::Description => write!(f, "description"),
+            Self::Value => write!(f, "value"),
+            Self::DomId => write!(f, "domid"),
+            Self::Classes => write!(f, "classes"),
+            Self::Actions => write!(f, "actions"),
+            Self::Position => write!(f, "position"),
+            Self::Size => write!(f, "size"),
+            Self::ChildCount => write!(f, "child-count"),
+            Self::Raw(s) => write!(f, "{s}"),
+        }
+    }
+}
+
+impl std::str::FromStr for GetAttr {
+    type Err = std::convert::Infallible;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s.to_lowercase().as_str() {
+            "text" => Self::Text,
+            "role" => Self::Role,
+            "title" | "axtitle" => Self::Title,
+            "description" | "desc" | "axdescription" => Self::Description,
+            "value" | "axvalue" => Self::Value,
+            "domid" | "dom-id" | "axdomidentifier" => Self::DomId,
+            "classes" | "class" | "axdomclasslist" => Self::Classes,
+            "actions" => Self::Actions,
+            "position" | "pos" => Self::Position,
+            "size" => Self::Size,
+            "children" | "child-count" | "childcount" => Self::ChildCount,
+            _ => Self::Raw(s.to_string()),
+        })
+    }
 }
 
 #[derive(Subcommand)]
@@ -67,6 +143,9 @@ enum Command {
         /// Max text/title display length (0 = no truncation)
         #[arg(long, default_value = "80")]
         max_text_len: usize,
+        /// Simplify output: hide DOM IDs/classes, prune empty subtrees
+        #[arg(long)]
+        simplify: bool,
     },
     /// Click element
     Click {
@@ -126,9 +205,25 @@ enum Command {
         target: String,
     },
     /// Get element attribute value
+    #[command(after_help = "\
+Known attributes:
+  text         Subtree text (with newlines at block boundaries)
+  role         AXRole (e.g. AXButton, AXStaticText)
+  title        AXTitle
+  desc         AXDescription (alias: description)
+  value        AXValue
+  domid        AXDOMIdentifier (alias: dom-id)
+  classes      AXDOMClassList (alias: class)
+  actions      Available AX actions
+  position     Screen position as x,y (alias: pos)
+  size         Element size as w,h
+  child-count  Number of children (alias: children)
+  AX*          Any raw AX attribute (e.g. AXHelp, AXURL)
+")]
     Get {
-        /// Attribute name (e.g. AXValue, AXTitle, text, role)
-        attr: String,
+        /// Attribute to read
+        #[arg(value_name = "ATTR")]
+        attr: GetAttr,
         locator: String,
     },
     /// List running applications visible to accessibility
@@ -153,7 +248,7 @@ fn main() {
 
     match cli.command {
         Command::ListApps => unreachable!(),
-        Command::Snapshot { locator, depth, all, max_text_len } => cmd_snapshot(&app, locator.as_deref(), depth, all, max_text_len),
+        Command::Snapshot { locator, depth, all, max_text_len, simplify } => cmd_snapshot(&app, locator.as_deref(), depth, all, max_text_len, simplify),
         Command::Click { locator } => cmd_click(&app, pid, &locator),
         Command::Dblclick { locator } => cmd_dblclick(&app, pid, &locator),
         Command::Input { locator, text } => cmd_input(&app, pid, &locator, &text),
@@ -166,6 +261,7 @@ fn main() {
         Command::Screenshot { locator, output } => cmd_screenshot(&app, pid, locator.as_deref(), output.as_deref()),
         Command::Wait { target } => cmd_wait(&app, &target),
         Command::Get { attr, locator } => cmd_get(&app, &attr, &locator),
+
     }
 }
 
@@ -186,20 +282,63 @@ fn resolve_app(cli: &Cli) -> (i32, AXNode) {
     std::process::exit(1);
 }
 
-/// Validate a single locator segment (between `>>`).
+/// Strip known pseudo-class suffixes from a segment for validation.
+/// Returns the base segment after removing `:has-text(...)`, `:has(...)`, `:visible`.
+fn strip_pseudo_classes(s: &str) -> &str {
+    let mut base = s;
+    loop {
+        if let Some(stripped) = base.strip_suffix(":visible") {
+            base = stripped;
+            continue;
+        }
+        if let Some(pos) = base.rfind(":nth-child(") {
+            if base.ends_with(')') {
+                base = &base[..pos];
+                continue;
+            }
+        }
+        if let Some(pos) = base.rfind(":has-text(") {
+            if base.ends_with(')') {
+                base = &base[..pos];
+                continue;
+            }
+        }
+        if let Some(pos) = base.rfind(":has(") {
+            if base.ends_with(')') {
+                base = &base[..pos];
+                continue;
+            }
+        }
+        break;
+    }
+    base
+}
+
+/// Validate a single locator segment (between `>>` or `>`).
 /// Valid forms:
 ///   #id                        — DOM ID
 ///   .class1.class2             — DOM class(es)
 ///   Role.class                 — role + class
 ///   Role[attr="value"]         — role + attribute
 ///   text=VALUE / text~=VALUE   — text match
+///   text=/regex/flags          — regex text match
 ///   role (plain word)          — AXRole or short role
 ///   nth=N / first / last       — pipeline index selectors
+///   :has-text("text")          — pseudo-class (can be appended to any selector)
+///   :has(selector)             — pseudo-class
+///   :visible                   — pseudo-class
 fn validate_segment(seg: &str) -> Result<(), String> {
     let s = seg.trim();
     if s.is_empty() {
         return Err("empty segment (double `>>` or trailing `>>`)".into());
     }
+    // Strip pseudo-classes for base validation
+    let base = strip_pseudo_classes(s);
+    // If entire selector is pseudo-classes only (e.g. `:has-text("Hello")`)
+    if base.is_empty() {
+        return Ok(());
+    }
+    let s = base;
     // Pipeline selectors
     if s == "first" || s == "last" || s.starts_with("nth=") {
         return Ok(());
@@ -223,10 +362,10 @@ fn validate_segment(seg: &str) -> Result<(), String> {
         }
         return Ok(());
     }
-    // Dot selector: .class or Role.class
+    // Dot selector: .class or Role.class (may include :not())
     if s.contains('.') {
-        // At least one class name after a dot
-        let has_class = s.split('.').skip(1).any(|c| !c.is_empty());
+        let without_not = s.split(":not(").next().unwrap_or(s);
+        let has_class = without_not.split('.').skip(1).any(|c| !c.is_empty());
         return if has_class { Ok(()) } else { Err(format!("empty class name in `{s}`")) };
     }
     // Plain role name: must be alphanumeric (allow AXFoo or foo)
@@ -236,13 +375,16 @@ fn validate_segment(seg: &str) -> Result<(), String> {
     Err(format!("unrecognized locator syntax: `{s}`"))
 }
 
-/// Validate an entire locator string (may contain `>>` chains).
+/// Validate an entire locator string (may contain `>>` and `>` chains).
 fn validate_locator(locator: &str) {
-    for seg in locator.split(" >> ") {
-        if let Err(msg) = validate_segment(seg) {
-            eprintln!("error: invalid locator: {msg}");
-            eprintln!("  locator: {locator}");
-            std::process::exit(1);
+    // Split by >> first, then by > within each part
+    for desc_part in locator.split(" >> ") {
+        for seg in desc_part.split(" > ") {
+            if let Err(msg) = validate_segment(seg) {
+                eprintln!("error: invalid locator: {msg}");
+                eprintln!("  locator: {locator}");
+                std::process::exit(1);
+            }
         }
     }
 }
@@ -265,9 +407,9 @@ fn resolve_one(app: &AXNode, locator: &str) -> AXNode {
     }
     let node = &nodes[0];
     eprintln!(
-        "Resolved → role={:?} title={:?}",
-        node.role(),
-        node.title(),
+        "Resolved → role=\"{}\" title=\"{}\"",
+        node.role().unwrap_or_default(),
+        node.title().unwrap_or_default(),
     );
     nodes.into_iter().next().unwrap()
 }
@@ -323,9 +465,10 @@ fn cmd_list_apps() {
     eprintln!("\n({} apps)", entries.len());
 }
 
-fn cmd_snapshot(app: &AXNode, locator: Option<&str>, depth: usize, all: bool, max_text_len: usize) {
+fn cmd_snapshot(app: &AXNode, locator: Option<&str>, depth: usize, all: bool, max_text_len: usize, simplify: bool) {
     let mut printer = tree_fmt::TreePrinter::new();
     printer.max_text_len = max_text_len;
+    printer.simplify = simplify;
 
     if let Some(loc) = locator {
         validate_locator(loc);
@@ -350,8 +493,10 @@ fn cmd_snapshot(app: &AXNode, locator: Option<&str>, depth: usize, all: bool, ma
                 );
             }
             eprintln!(
-                "Resolved → role={:?} title={:?} children={}",
-                node.role(), node.title(), node.child_count()
+                "Resolved → role=\"{}\" title=\"{}\" children={}",
+                node.role().unwrap_or_default(),
+                node.title().unwrap_or_default(),
+                node.child_count()
             );
             printer.print_with_ancestors(node, depth);
         }
@@ -637,44 +782,67 @@ fn collect_text_inner(node: &AXNode, max_depth: usize, parts: &mut Vec<String>) 
     }
 }
 
-fn cmd_get(app: &AXNode, attr: &str, locator: &str) {
+fn cmd_get(app: &AXNode, attr: &GetAttr, locator: &str) {
     let node = resolve_one(app, locator);
 
-    let result = match attr.to_lowercase().as_str() {
-        "text" => {
-            Some(collect_text(&node, 50))
+    match attr {
+        GetAttr::Text => {
+            println!("{}", collect_text(&node, 50));
         }
-        "role" => node.role(),
-        "title" | "axtitle" => node.title(),
-        "description" | "axdescription" => node.description(),
-        "value" | "axvalue" => node.value(),
-        "domid" | "axdomidentifier" => {
-            accessibility::attr_string(&node.0, "AXDOMIdentifier")
+        GetAttr::Role => {
+            println!("{}", node.role().unwrap_or_default());
         }
-        _ => {
-            // Try as raw AX attribute
-            let ax_attr = if attr.starts_with("AX") {
-                attr.to_string()
+        GetAttr::Title => {
+            println!("{}", node.title().unwrap_or_default());
+        }
+        GetAttr::Description => {
+            println!("{}", node.description().unwrap_or_default());
+        }
+        GetAttr::Value => {
+            println!("{}", node.value().unwrap_or_default());
+        }
+        GetAttr::DomId => {
+            let id = accessibility::attr_string(&node.0, "AXDOMIdentifier").unwrap_or_default();
+            println!("{id}");
+        }
+        GetAttr::Classes => {
+            let classes = node.dom_classes();
+            println!("{}", classes.join(" "));
+        }
+        GetAttr::Actions => {
+            let actions = node.actions();
+            println!("{}", actions.join(" "));
+        }
+        GetAttr::Position => {
+            match node.position() {
+                Some((x, y)) => println!("{x:.0},{y:.0}"),
+                None => { eprintln!("(no position)"); std::process::exit(1); }
+            }
+        }
+        GetAttr::Size => {
+            match node.size() {
+                Some((w, h)) => println!("{w:.0},{h:.0}"),
+                None => { eprintln!("(no size)"); std::process::exit(1); }
+            }
+        }
+        GetAttr::ChildCount => {
+            println!("{}", node.child_count());
+        }
+        GetAttr::Raw(name) => {
+            let ax_name = if name.starts_with("AX") {
+                name.clone()
             } else {
-                format!("AX{}", capitalize(attr))
+                let mut c = name.chars();
+                let cap = match c.next() {
+                    None => String::new(),
+                    Some(f) => f.to_uppercase().to_string() + c.as_str(),
+                };
+                format!("AX{cap}")
             };
-            accessibility::attr_string(&node.0, &ax_attr)
+            match accessibility::attr_string(&node.0, &ax_name) {
+                Some(val) => println!("{val}"),
+                None => { eprintln!("(no value for {ax_name})"); std::process::exit(1); }
+            }
         }
-    };
-
-    match result {
-        Some(val) => println!("{val}"),
-        None => {
-            eprintln!("(no value)");
-            std::process::exit(1);
-        }
-    }
-}
-
-fn capitalize(s: &str) -> String {
-    let mut c = s.chars();
-    match c.next() {
-        None => String::new(),
-        Some(f) => f.to_uppercase().to_string() + c.as_str(),
     }
 }
