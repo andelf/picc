@@ -35,6 +35,8 @@ pub fn truncate(s: &str, max: usize) -> String {
 pub struct TreePrinter {
     /// Max text/title/description display length. 0 = no truncation.
     pub max_text_len: usize,
+    /// Simplify output: hide dom_id/dom_classes and prune empty subtrees.
+    pub simplify: bool,
     /// Count of interactive elements seen during printing.
     interactive: usize,
 }
@@ -43,6 +45,7 @@ impl TreePrinter {
     pub fn new() -> Self {
         Self {
             max_text_len: 80,
+            simplify: false,
             interactive: 0,
         }
     }
@@ -58,8 +61,6 @@ impl TreePrinter {
         let title = node.title().unwrap_or_default();
         let desc = node.description().unwrap_or_default();
         let value = node.value().unwrap_or_default();
-        let dom_id = accessibility::attr_string(&node.0, "AXDOMIdentifier").unwrap_or_default();
-        let dom_classes = node.dom_classes();
         let is_text = TEXT_ROLES.iter().any(|r| role == *r);
         let max = self.max_text_len;
 
@@ -70,11 +71,15 @@ impl TreePrinter {
         }
 
         let mut s = short_role;
-        if !dom_id.is_empty() {
-            s.push_str(&format!("#{dom_id}"));
-        }
-        for cls in sort_classes(&dom_classes) {
-            s.push_str(&format!(".{cls}"));
+        if !self.simplify {
+            let dom_id = accessibility::attr_string(&node.0, "AXDOMIdentifier").unwrap_or_default();
+            let dom_classes = node.dom_classes();
+            if !dom_id.is_empty() {
+                s.push_str(&format!("#{dom_id}"));
+            }
+            for cls in sort_classes(&dom_classes) {
+                s.push_str(&format!(".{cls}"));
+            }
         }
         let title_max = if max == 0 { 0 } else { max.min(60) };
         if !title.is_empty() {
@@ -138,16 +143,27 @@ impl TreePrinter {
             }
         }
 
+        // In simplify mode, prune subtrees with no visible content
+        if self.simplify && !is_root && !has_content(node, max_depth.saturating_sub(depth)) {
+            return;
+        }
+
         let role = node.role().unwrap_or_default();
         let title = node.title().unwrap_or_default();
         let desc = node.description().unwrap_or_default();
         let value = node.value().unwrap_or_default();
-        let dom_id =
-            accessibility::attr_string(&node.0, "AXDOMIdentifier").unwrap_or_default();
-        let dom_classes = node.dom_classes();
         let actions = node.actions();
         let is_text = TEXT_ROLES.iter().any(|r| role == *r);
         let max = self.max_text_len;
+
+        let (dom_id, dom_classes) = if self.simplify {
+            (String::new(), Vec::new())
+        } else {
+            (
+                accessibility::attr_string(&node.0, "AXDOMIdentifier").unwrap_or_default(),
+                node.dom_classes(),
+            )
+        };
 
         let has_visible_class = dom_classes.iter().any(|c| !c.starts_with('_'));
         let has_identity = !title.is_empty()
@@ -221,6 +237,32 @@ impl TreePrinter {
             }
         }
     }
+}
+
+/// Check whether a node or its subtree has any visible content (title, desc, value, or text).
+fn has_content(node: &AXNode, max_depth: usize) -> bool {
+    if let Some((w, h)) = node.size() {
+        if w == 0.0 && h == 0.0 {
+            return false;
+        }
+    }
+
+    let role = node.role().unwrap_or_default();
+    let is_text = TEXT_ROLES.iter().any(|r| role == *r);
+    if is_text && node.value().map_or(false, |v| !v.is_empty()) {
+        return true;
+    }
+    if !node.title().unwrap_or_default().is_empty()
+        || !node.description().unwrap_or_default().is_empty()
+        || !node.value().unwrap_or_default().is_empty()
+    {
+        return true;
+    }
+
+    if max_depth == 0 {
+        return false;
+    }
+    node.children().iter().any(|c| has_content(c, max_depth - 1))
 }
 
 /// Count descendants up to a shallow depth, capped at 100 for speed.
