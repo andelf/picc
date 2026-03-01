@@ -890,16 +890,197 @@ fn role_matches(el_role: &str, selector_role: &str) -> bool {
     false
 }
 
+/// Parsed pseudo-class conditions extracted from a selector.
+struct PseudoClasses<'a> {
+    base: &'a str,
+    has_text: Option<String>,
+    has_selector: Option<String>,
+    visible: bool,
+    /// `:nth-child(N)` — 0-based index among all siblings (regardless of role).
+    nth_child: Option<usize>,
+}
+
+/// Extract pseudo-classes from the end of a selector string.
+///
+/// Supported pseudo-classes:
+///   - `:has-text("text")` — subtree contains text
+///   - `:has(selector)` — subtree contains element matching selector
+///   - `:visible` — element has non-zero size
+fn parse_pseudo_classes(selector: &str) -> PseudoClasses<'_> {
+    let mut base = selector;
+    let mut has_text = None;
+    let mut has_selector = None;
+    let mut visible = false;
+    let mut nth_child = None;
+
+    // Parse from the end, peeling off pseudo-classes
+    loop {
+        if let Some(stripped) = base.strip_suffix(":visible") {
+            base = stripped;
+            visible = true;
+            continue;
+        }
+        // :nth-child(N)
+        if let Some(pos) = base.rfind(":nth-child(") {
+            let after = &base[pos + ":nth-child(".len()..];
+            if let Some(end) = after.strip_suffix(')') {
+                if let Ok(n) = end.trim().parse::<usize>() {
+                    nth_child = Some(n);
+                    base = &base[..pos];
+                    continue;
+                }
+            }
+        }
+        // :has-text("...") — must check before :has(...)
+        if let Some(pos) = base.rfind(":has-text(") {
+            let after = &base[pos + ":has-text(".len()..];
+            if let Some(end) = after.strip_suffix(')') {
+                let text = end.trim_matches('"').trim_matches('\'');
+                has_text = Some(text.to_string());
+                base = &base[..pos];
+                continue;
+            }
+        }
+        // :has(...)
+        if let Some(pos) = base.rfind(":has(") {
+            let after = &base[pos + ":has(".len()..];
+            if let Some(end) = after.strip_suffix(')') {
+                has_selector = Some(end.to_string());
+                base = &base[..pos];
+                continue;
+            }
+        }
+        break;
+    }
+
+    PseudoClasses { base, has_text, has_selector, visible, nth_child }
+}
+
+/// Check if an element's subtree contains the given text.
+fn subtree_has_text(el: &AXUIElement, text: &str) -> bool {
+    // Check this element's own text attributes
+    for attr in &["AXValue", "AXTitle", "AXDescription"] {
+        if let Some(val) = attr_string(el, attr) {
+            if val.contains(text) {
+                return true;
+            }
+        }
+    }
+    // DFS into children
+    for child in children(el) {
+        if subtree_has_text(&child, text) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Check if an element has non-zero size (visible).
+fn element_is_visible(el: &AXUIElement) -> bool {
+    use objc2_application_services::{AXValue, AXValueType};
+    use objc2_core_foundation::CGSize;
+    let Some(value) = attr_value(el, "AXSize") else { return false };
+    let ax_val = unsafe { &*(value.as_ref() as *const CFType as *const AXValue) };
+    let mut size = CGSize { width: 0.0, height: 0.0 };
+    let ok = unsafe {
+        ax_val.value(
+            AXValueType(2),
+            NonNull::new_unchecked(&mut size as *mut CGSize as *mut _),
+        )
+    };
+    ok && size.width > 0.0 && size.height > 0.0
+}
+
+/// Check if an element is the Nth child (0-based) among all its parent's children.
+fn is_nth_child(el: &AXUIElement, n: usize) -> bool {
+    let Some(parent_val) = attr_value(el, "AXParent") else { return false };
+    let parent = unsafe {
+        &*(parent_val.as_ref() as *const CFType as *const AXUIElement)
+    };
+    let siblings = children(parent);
+    siblings.get(n).is_some_and(|sib| is_same_element(sib, el))
+}
+
 /// Check if an element matches a selector string.
+///
+/// Supports pseudo-classes: `:has-text("text")`, `:has(selector)`, `:visible`, `:nth-child(N)`.
+/// Supports `text=/regex/flags` for regex matching.
 fn element_matches_selector(el: &AXUIElement, selector: &str) -> bool {
+    // Parse pseudo-classes from the selector
+    let pseudo = parse_pseudo_classes(selector);
+    let base = pseudo.base;
+
+    // If base is empty (e.g. `:has-text("Hello")`), match any element
+    let base_matches = if base.is_empty() {
+        true
+    } else {
+        element_matches_base_selector(el, base)
+    };
+
+    if !base_matches {
+        return false;
+    }
+
+    // Check :visible
+    if pseudo.visible && !element_is_visible(el) {
+        return false;
+    }
+
+    // Check :has-text("...")
+    if let Some(ref text) = pseudo.has_text {
+        if !subtree_has_text(el, text) {
+            return false;
+        }
+    }
+
+    // Check :has(selector)
+    if let Some(ref inner_sel) = pseudo.has_selector {
+        let matches = collect_matching(el, inner_sel, 20);
+        if matches.is_empty() {
+            return false;
+        }
+    }
+
+    // Check :nth-child(N) — 0-based index among ALL siblings
+    if let Some(n) = pseudo.nth_child {
+        if !is_nth_child(el, n) {
+            return false;
+        }
+    }
+
+    true
+}
+
+/// Check if an element matches the base part of a selector (no pseudo-classes).
+fn element_matches_base_selector(el: &AXUIElement, selector: &str) -> bool {
     if selector.starts_with('#') {
         // DOM ID selector
         let id = &selector[1..];
         return attr_string(el, "AXDOMIdentifier").as_deref() == Some(id);
     }
 
-    // text=VALUE or text~=VALUE — shorthand for text content matching
+    // text=/regex/flags — regex text matching
     if let Some(rest) = selector.strip_prefix("text=") {
+        if rest.starts_with('/') {
+            // Parse /pattern/flags
+            if let Some(last_slash) = rest[1..].rfind('/') {
+                let pattern = &rest[1..1 + last_slash];
+                let flags = &rest[1 + last_slash + 1..];
+                let case_insensitive = flags.contains('i');
+                let regex_pattern = if case_insensitive {
+                    format!("(?i){pattern}")
+                } else {
+                    pattern.to_string()
+                };
+                if let Ok(re) = regex::Regex::new(&regex_pattern) {
+                    return [attr_string(el, "AXValue"), attr_string(el, "AXTitle"), attr_string(el, "AXDescription")]
+                        .iter()
+                        .any(|v| v.as_ref().is_some_and(|s| re.is_match(s)));
+                }
+            }
+            return false;
+        }
+        // text=VALUE — exact text matching
         let val = rest.trim_matches('"');
         return [attr_string(el, "AXValue"), attr_string(el, "AXTitle"), attr_string(el, "AXDescription")]
             .iter()
@@ -940,16 +1121,25 @@ fn element_matches_selector(el: &AXUIElement, selector: &str) -> bool {
         }
     } else if selector.contains('.') {
         // Role.class1.class2 or .class1.class2 (role optional)
-        let mut parts = selector.split('.');
-        let role = parts.next().unwrap_or("");
-        if !role.is_empty() {
+        // Handle :not() within DOM class selectors
+        let sel = if selector.contains(":not(") {
+            selector.to_string()
+        } else {
+            selector.to_string()
+        };
+        let dom_sel = DOMSelector::parse(&sel);
+        // Extract role part (before first dot)
+        let role_part = sel.split('.').next().unwrap_or("");
+        // Also handle :not() stripping for role check
+        let role_clean = role_part.split(":not(").next().unwrap_or(role_part);
+        if !role_clean.is_empty() {
             let el_role = attr_string(el, "AXRole").unwrap_or_default();
-            if !role_matches(&el_role, role) {
+            if !role_matches(&el_role, role_clean) {
                 return false;
             }
         }
         let classes = attr_string_list(el, "AXDOMClassList");
-        parts.all(|c| c.is_empty() || classes.iter().any(|ec| ec == c))
+        dom_sel.matches(&classes)
     } else if selector.contains(":nth(") {
         // Role:nth(n) — handled separately, don't match here
         false
@@ -1143,27 +1333,70 @@ pub fn resolve_locator(
     resolve_locator_all(root, locator).into_iter().next()
 }
 
+/// A parsed locator step: either a descendant search (`>>`) or direct child (`>`).
+enum LocatorStep<'a> {
+    /// `>>` — search all descendants
+    Descendant(&'a str),
+    /// `>` — search only direct children
+    DirectChild(&'a str),
+}
+
+/// Parse a locator string into steps, respecting both `>>` and `>` operators.
+///
+/// ` >> ` splits as descendant, ` > ` splits as direct child.
+/// We first split by ` >> `, then within each part split by ` > `.
+fn parse_locator_steps(locator: &str) -> Vec<LocatorStep<'_>> {
+    let mut steps = Vec::new();
+    let desc_parts: Vec<&str> = locator.split(" >> ").collect();
+    for (i, desc_part) in desc_parts.iter().enumerate() {
+        // Within each >> segment, split by " > " for direct child
+        let child_parts: Vec<&str> = desc_part.split(" > ").collect();
+        for (j, part) in child_parts.iter().enumerate() {
+            let trimmed = part.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            if i == 0 && j == 0 {
+                // First step is always descendant (from root)
+                steps.push(LocatorStep::Descendant(trimmed));
+            } else if j == 0 {
+                // First part after >> is descendant
+                steps.push(LocatorStep::Descendant(trimmed));
+            } else {
+                // Parts after > within a >> segment are direct child
+                steps.push(LocatorStep::DirectChild(trimmed));
+            }
+        }
+    }
+    steps
+}
+
 /// Resolve a locator string to all matching elements under `root`.
 ///
-/// Supports arbitrary-length ` >> ` chains. Each step searches within
-/// the results of the previous step. Special selectors:
+/// Supports arbitrary-length ` >> ` and ` > ` chains. Each `>>` step
+/// searches descendants, each `>` step searches only direct children.
+/// Special selectors:
 /// - `nth=N` — pick the Nth element (0-based) from current results
 /// - `first` / `last` — pick first/last element from current results
 pub fn resolve_locator_all(
     root: &AXUIElement,
     locator: &str,
 ) -> Vec<CFRetained<AXUIElement>> {
-    let steps: Vec<&str> = locator.split(" >> ").map(|s| s.trim()).collect();
+    let steps = parse_locator_steps(locator);
 
-    // Start: collect all matches for the first selector
-    let Some(first) = steps.first() else {
+    if steps.is_empty() {
         return Vec::new();
+    }
+
+    // First step
+    let mut current = match &steps[0] {
+        LocatorStep::Descendant(sel) => collect_matching(root, sel, 50),
+        LocatorStep::DirectChild(sel) => collect_direct_children_matching(root, sel),
     };
-    let mut current = collect_matching(root, first, 50);
 
     // Pipeline: each subsequent step searches within current results
     for step in &steps[1..] {
-        current = apply_step(&current, step);
+        current = apply_step_typed(&current, step);
         if current.is_empty() {
             break;
         }
@@ -1171,8 +1404,17 @@ pub fn resolve_locator_all(
     current
 }
 
+/// Apply a typed pipeline step (descendant or direct child).
+fn apply_step_typed(elements: &[CFRetained<AXUIElement>], step: &LocatorStep<'_>) -> Vec<CFRetained<AXUIElement>> {
+    match step {
+        LocatorStep::Descendant(sel) => apply_step_inner(elements, sel, false),
+        LocatorStep::DirectChild(sel) => apply_step_inner(elements, sel, true),
+    }
+}
+
 /// Apply a single pipeline step to a set of elements.
-fn apply_step(elements: &[CFRetained<AXUIElement>], step: &str) -> Vec<CFRetained<AXUIElement>> {
+/// If `direct_only` is true, only search direct children (not descendants).
+fn apply_step_inner(elements: &[CFRetained<AXUIElement>], step: &str, direct_only: bool) -> Vec<CFRetained<AXUIElement>> {
     // nth=N — pick Nth element from current set (supports negative index)
     if let Some(n_str) = step.strip_prefix("nth=") {
         if let Ok(n) = n_str.parse::<isize>() {
@@ -1193,12 +1435,31 @@ fn apply_step(elements: &[CFRetained<AXUIElement>], step: &str) -> Vec<CFRetaine
         return elements.last().cloned().into_iter().collect();
     }
 
-    // Normal selector: search within each element's subtree
+    // Normal selector: search within each element
     let mut results = Vec::new();
     for el in elements {
-        collect_matching_inner(el, step, 50, &mut results);
+        if direct_only {
+            for child in children(el) {
+                if element_matches_selector(&child, step) {
+                    results.push(child);
+                }
+            }
+        } else {
+            collect_matching_inner(el, step, 50, &mut results);
+        }
     }
     results
+}
+
+/// Collect direct children matching a selector (no recursion).
+fn collect_direct_children_matching(
+    root: &AXUIElement,
+    selector: &str,
+) -> Vec<CFRetained<AXUIElement>> {
+    children(root)
+        .into_iter()
+        .filter(|child| element_matches_selector(child, selector))
+        .collect()
 }
 
 /// Collect all elements matching a selector string (DFS).
