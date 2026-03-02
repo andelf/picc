@@ -156,7 +156,12 @@ define_class!(
         }
 
         #[unsafe(method(mouseMoved:))]
-        fn mouseMoved(&self, _event: &NSEvent) {}
+        fn mouseMoved(&self, _event: &NSEvent) {
+            // 鼠标移入时自动成为 key window，避免跨屏需要点击两次
+            if !self.isKeyWindow() {
+                self.makeKeyWindow();
+            }
+        }
 
         #[unsafe(method(mouseDragged:))]
         fn mouseDragged(&self, _event: &NSEvent) {
