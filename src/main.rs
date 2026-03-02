@@ -19,8 +19,65 @@ use objc2_foundation::{NSArray, NSDate, NSPoint, NSRect, NSRunLoop, NSSize, NSSt
 use picc::vision;
 
 use std::sync::Mutex;
-/// 选区坐标 (x, y, w, h)，AppKit 坐标系
+/// 选区坐标 (x, y, w, h)，AppKit 全局坐标系
 static SEL_RECT: Mutex<[f64; 4]> = Mutex::new([0.0, 0.0, 0.0, 0.0]);
+
+/// 获取 primary screen（菜单栏所在屏，origin 为 (0,0)）的高度
+fn primary_screen_height(mtm: MainThreadMarker) -> f64 {
+    for screen in NSScreen::screens(mtm).iter() {
+        let f = screen.frame();
+        if f.origin.x == 0.0 && f.origin.y == 0.0 {
+            return f.size.height;
+        }
+    }
+    NSScreen::mainScreen(mtm).unwrap().frame().size.height
+}
+
+/// 判断窗口是否为 SnapWindow
+fn is_snap_window(win: &NSWindow) -> bool {
+    let cls_name: Retained<NSString> = unsafe { msg_send![win, className] };
+    cls_name.to_string() == "SnapWindow"
+}
+
+/// 遍历所有 SnapWindow 并执行操作
+fn for_each_snap_window(f: impl Fn(&NSWindow)) {
+    let mtm = MainThreadMarker::new().unwrap();
+    let app = NSApplication::sharedApplication(mtm);
+    for win in app.windows().iter() {
+        if is_snap_window(&win) {
+            f(&win);
+        }
+    }
+}
+
+/// 刷新所有 SnapWindow 的 overlay view
+fn refresh_all_overlays() {
+    for_each_snap_window(|win| {
+        if let Some(content) = win.contentView() {
+            if let Some(overlay) = content.subviews().firstObject() {
+                overlay.display();
+            }
+        }
+    });
+}
+
+/// 隐藏所有 SnapWindow
+fn hide_all_windows() {
+    for_each_snap_window(|win| {
+        win.orderOut(None);
+    });
+}
+
+/// 隐藏所有 SnapWindow 的 overlay
+fn hide_all_overlays() {
+    for_each_snap_window(|win| {
+        if let Some(content) = win.contentView() {
+            if let Some(overlay) = content.subviews().firstObject() {
+                overlay.setHidden(true);
+            }
+        }
+    });
+}
 
 /// 保存 CGImage 到 PNG 文件
 #[allow(dead_code)]
@@ -113,9 +170,7 @@ define_class!(
 
             *SEL_RECT.lock().unwrap() = [x, y, w, h];
 
-            let subviews = self.contentView().unwrap().subviews();
-            let overlay_view = subviews.firstObject().unwrap();
-            overlay_view.display();
+            refresh_all_overlays();
         }
 
         #[unsafe(method(acceptsFirstMouse:))]
@@ -133,12 +188,7 @@ define_class!(
             }
             // 重置选区
             *SEL_RECT.lock().unwrap() = [0.0, 0.0, 0.0, 0.0];
-            self.contentView()
-                .unwrap()
-                .subviews()
-                .firstObject()
-                .unwrap()
-                .display();
+            refresh_all_overlays();
         }
 
         #[unsafe(method(mouseUp:))]
@@ -159,15 +209,16 @@ define_class!(
             }
 
             // AppKit 坐标系 (左下角原点, y向上) -> CoreGraphics 坐标系 (左上角原点, y向下)
+            // 使用 primary screen 高度，多屏幕下也能正确转换
             let mtm = MainThreadMarker::new().unwrap();
-            let screen_height = NSScreen::mainScreen(mtm).unwrap().frame().size.height;
-            let cg_y = screen_height - (y + h);
+            let primary_h = primary_screen_height(mtm);
+            let cg_y = primary_h - (y + h);
 
             let rect = CGRect::new(CGPoint::new(x, cg_y), CGSize::new(w, h));
             println!("Crop Rect: {:?}", rect);
 
-            // 隐藏覆盖窗口，避免截图时把遮罩层也截进去
-            self.orderOut(None);
+            // 隐藏所有覆盖窗口，避免截图时把遮罩层也截进去
+            hide_all_windows();
             NSRunLoop::currentRunLoop()
                 .runUntilDate(&NSDate::dateWithTimeIntervalSinceNow(0.1));
 
@@ -188,22 +239,13 @@ define_class!(
         #[unsafe(method(keyDown:))]
         fn keyDown(&self, event: &NSEvent) {
             if event.keyCode() == 53 || event.keyCode() == 12 {
-                // ESC (53) 或 Q (12) — 隐藏窗口，回到待命状态
-                self.orderOut(None);
+                // ESC (53) 或 Q (12) — 隐藏所有窗口，回到待命状态
+                hide_all_windows();
                 *SEL_RECT.lock().unwrap() = [0.0, 0.0, 0.0, 0.0];
-                if let Some(content) = self.contentView() {
-                    if let Some(overlay) = content.subviews().firstObject() {
-                        overlay.display();
-                    }
-                }
+                refresh_all_overlays();
             } else if event.keyCode() == 49 {
-                // SPACE — 隐藏遮罩层
-                self.contentView()
-                    .unwrap()
-                    .subviews()
-                    .firstObject()
-                    .unwrap()
-                    .setHidden(true);
+                // SPACE — 隐藏所有屏幕的遮罩层
+                hide_all_overlays();
             }
         }
     }
@@ -215,17 +257,21 @@ impl SnapWindow {
             start_pos: Cell::new(NSPoint::new(0.0, 0.0)),
             end_pos: Cell::new(NSPoint::new(0.0, 0.0)),
         });
-        let frame = screen.frame();
-        unsafe {
+        // 先用小 rect 创建，再用 setFrame 设置精确位置
+        // initWithContentRect 会被 backing scale 影响，导致非主屏窗口位置错误
+        let init_rect = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(100.0, 100.0));
+        let win: Retained<Self> = unsafe {
             msg_send![
                 super(this),
-                initWithContentRect: frame,
+                initWithContentRect: init_rect,
                 styleMask: NSWindowStyleMask::NonactivatingPanel,
                 backing: NSBackingStoreType::Buffered,
                 defer: false,
                 screen: screen,
             ]
-        }
+        };
+        win.setFrame_display_animate(screen.frame(), false, false);
+        win
     }
 }
 
@@ -248,7 +294,11 @@ define_class!(
 
             // 如果有选区，挖空选区并画红色边框
             if w > 1.0 && h > 1.0 {
-                let sel_rect = NSRect::new(NSPoint::new(x, y), NSSize::new(w, h));
+                // 全局 AppKit 坐标 → 视图本地坐标
+                let win_frame = self.window().unwrap().frame();
+                let local_x = x - win_frame.origin.x;
+                let local_y = y - win_frame.origin.y;
+                let sel_rect = NSRect::new(NSPoint::new(local_x, local_y), NSSize::new(w, h));
 
                 // 用 Copy 模式 + clearColor 擦除选区内的遮罩
                 let ctx = NSGraphicsContext::currentContext().unwrap();
@@ -294,11 +344,11 @@ define_class!(
                     let bg_h = text_size.height + pad_y * 2.0;
 
                     // 默认放在选框右下角下方，如果太靠近屏幕底部则放到上方
-                    let bg_x = x + w - bg_w;
-                    let bg_y = if y > bg_h + gap {
-                        y - bg_h - gap
+                    let bg_x = local_x + w - bg_w;
+                    let bg_y = if local_y > bg_h + gap {
+                        local_y - bg_h - gap
                     } else {
-                        y + h + gap
+                        local_y + h + gap
                     };
 
                     let bg_rect =
@@ -324,21 +374,37 @@ impl DrawPathView {
 }
 
 fn ocr(img: &CGImage) {
-    let req = vision::VNRecognizeTextRequest::new();
+    let text_req = vision::VNRecognizeTextRequest::new();
 
     let zh = NSString::from_str("zh-Hans");
     let en = NSString::from_str("en-US");
     let lang = NSArray::from_slice(&[&*zh, &*en]);
-    req.setRecognitionLanguages(&lang);
+    text_req.setRecognitionLanguages(&lang);
+
+    let barcode_req = unsafe { objc2_vision::VNDetectBarcodesRequest::new() };
 
     let handler = vision::new_handler_with_cgimage(img);
 
-    let reqs = NSArray::from_retained_slice(&[req.clone()]);
-    let reqs: &NSArray<objc2_vision::VNRequest> =
-        unsafe { &*((&*reqs) as *const _ as *const _) };
-    vision::perform_requests(&handler, reqs).unwrap();
+    // 同时执行 OCR 和二维码检测
+    let text_req_ref: &objc2_vision::VNRequest =
+        unsafe { &*((&*text_req) as *const _ as *const objc2_vision::VNRequest) };
+    let barcode_req_ref: &objc2_vision::VNRequest =
+        unsafe { &*((&*barcode_req) as *const _ as *const objc2_vision::VNRequest) };
+    let reqs = NSArray::from_slice(&[text_req_ref, barcode_req_ref]);
+    vision::perform_requests(&handler, &reqs).unwrap();
 
-    if let Some(results) = req.results() {
+    // 处理二维码结果
+    if let Some(results) = unsafe { barcode_req.results() } {
+        for item in results.iter() {
+            if let Some(payload) = unsafe { item.payloadStringValue() } {
+                let symbology = unsafe { item.symbology() };
+                println!("[QRCode] ({}) {}", symbology, payload);
+            }
+        }
+    }
+
+    // 处理 OCR 结果
+    if let Some(results) = text_req.results() {
         for item in results.iter() {
             let candidates = item.topCandidates(1);
             for candidate in candidates.iter() {
@@ -357,31 +423,49 @@ fn is_hotkey(event: &NSEvent) -> bool {
     event.keyCode() == 0 && has_ctrl && has_cmd
 }
 
-/// 显示截图窗口
-fn show_snap_window(window: &SnapWindow) {
+/// 显示所有屏幕的截图窗口
+fn show_snap_windows() {
     let mtm = MainThreadMarker::new().unwrap();
+    let app = NSApplication::sharedApplication(mtm);
 
     // 重置选区
     *SEL_RECT.lock().unwrap() = [0.0, 0.0, 0.0, 0.0];
 
-    // 更新 frame 到当前屏幕尺寸
-    let frame = NSScreen::mainScreen(mtm).unwrap().frame();
-    window.setFrame_display_animate(frame, true, false);
+    // 通过 frame origin 匹配窗口到屏幕（app.windows() 顺序按 z-order，不可靠）
+    let screens = NSScreen::screens(mtm);
+    let windows = app.windows();
 
-    // 刷新 overlay view
-    if let Some(content) = window.contentView() {
-        if let Some(overlay) = content.subviews().firstObject() {
-            overlay.setFrame(frame);
-            overlay.setHidden(false);
-            overlay.display();
+    for screen in screens.iter() {
+        let screen_frame = screen.frame();
+        // 找到 origin 匹配的 SnapWindow
+        for win in windows.iter() {
+            if !is_snap_window(&win) {
+                continue;
+            }
+            let win_frame = win.frame();
+            if (win_frame.origin.x - screen_frame.origin.x).abs() < 1.0
+                && (win_frame.origin.y - screen_frame.origin.y).abs() < 1.0
+            {
+                win.setFrame_display_animate(screen_frame, true, false);
+
+                // 刷新 overlay view（使用本地坐标，origin 为 0,0）
+                if let Some(content) = win.contentView() {
+                    if let Some(overlay) = content.subviews().firstObject() {
+                        let content_frame =
+                            NSRect::new(NSPoint::new(0.0, 0.0), screen_frame.size);
+                        overlay.setFrame(content_frame);
+                        overlay.setHidden(false);
+                        overlay.display();
+                    }
+                }
+
+                win.makeKeyAndOrderFront(None);
+                break;
+            }
         }
     }
 
-    // 显示窗口
-    window.makeKeyAndOrderFront(None);
-
     // 激活应用，使其获得焦点
-    let app = NSApplication::sharedApplication(mtm);
     #[allow(deprecated)]
     app.activateIgnoringOtherApps(true);
 }
@@ -393,8 +477,11 @@ fn main() {
     // Accessory 模式：不显示 Dock 图标
     app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
 
-    let window = {
-        let screen = NSScreen::mainScreen(mtm).unwrap();
+    // 为所有屏幕创建覆盖窗口
+    let screens = NSScreen::screens(mtm);
+    let mut windows: Vec<Retained<SnapWindow>> = Vec::new();
+
+    for screen in screens.iter() {
         let win = SnapWindow::new(&screen, mtm);
 
         win.setAcceptsMouseMovedEvents(true);
@@ -417,20 +504,21 @@ fn main() {
         win.setLevel(1000);
 
         win.setMovable(false);
-        win
-    };
 
-    // 添加 overlay view（但不显示窗口）
-    let frame = NSScreen::mainScreen(mtm).unwrap().frame();
-    let path_view = DrawPathView::new(frame, mtm);
-    window.contentView().unwrap().addSubview(&path_view);
+        // 添加 overlay view（使用本地坐标，origin 为 0,0）
+        let screen_frame = screen.frame();
+        let content_frame = NSRect::new(NSPoint::new(0.0, 0.0), screen_frame.size);
+        let path_view = DrawPathView::new(content_frame, mtm);
+        win.contentView().unwrap().addSubview(&path_view);
+
+        windows.push(win);
+    }
 
     // 注册全局快捷键监听（app 没有焦点时）
-    let win_clone = window.clone();
     let global_block = RcBlock::new(move |event: NonNull<NSEvent>| {
         let event = unsafe { event.as_ref() };
         if is_hotkey(event) {
-            show_snap_window(&win_clone);
+            show_snap_windows();
         }
     });
     let _global_monitor = NSEvent::addGlobalMonitorForEventsMatchingMask_handler(
@@ -439,11 +527,10 @@ fn main() {
     );
 
     // 注册本地快捷键监听（app 有焦点时）
-    let win_clone = window.clone();
     let local_block = RcBlock::new(move |event: NonNull<NSEvent>| -> *mut NSEvent {
         let event_ref = unsafe { event.as_ref() };
         if is_hotkey(event_ref) {
-            show_snap_window(&win_clone);
+            show_snap_windows();
             std::ptr::null_mut() // 消费掉该事件
         } else {
             event.as_ptr() // 传递事件
@@ -458,8 +545,8 @@ fn main() {
 
     println!("PICC running. Press Ctrl+Cmd+A to capture screenshot.");
 
-    // 保持 monitor token 存活
-    let _keep_alive = (_global_monitor, _local_monitor);
+    // 保持 monitor token 和窗口存活
+    let _keep_alive = (_global_monitor, _local_monitor, windows);
 
     app.run();
 }
