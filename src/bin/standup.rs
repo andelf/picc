@@ -3,6 +3,7 @@ use std::ptr::NonNull;
 use std::sync::Mutex;
 
 use block2::RcBlock;
+use clap::Parser;
 use tracing::{debug, info, warn};
 use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject, NSObject};
@@ -16,6 +17,20 @@ use objc2_app_kit::{
 };
 use objc2_foundation::{NSDate, NSPoint, NSRect, NSSize, NSString, NSTimer};
 
+#[derive(Parser)]
+#[command(about = "Standup break reminder for macOS")]
+struct Args {
+    /// Work interval in minutes
+    #[arg(long, default_value_t = 25.0)]
+    work: f64,
+    /// Break duration in minutes
+    #[arg(long, alias = "break", default_value_t = 5.0)]
+    brk: f64,
+    /// Wake-from-sleep grace period in minutes
+    #[arg(long, default_value_t = 10.0)]
+    wake: f64,
+}
+
 // -- 全局状态 --
 
 struct StandupState {
@@ -25,6 +40,8 @@ struct StandupState {
     wake_secs: f64,
     is_breaking: bool,
     skip_next: bool,
+    /// break 开始的墙钟时间，用于休眠唤醒后计算真实已过时间
+    break_start_time: Option<std::time::SystemTime>,
     /// 防止 show_countdown 在休眠唤醒期间被 work_timer 和 menubar_timer 同时触发
     show_countdown_guard: bool,
 }
@@ -36,6 +53,7 @@ static STATE: Mutex<StandupState> = Mutex::new(StandupState {
     wake_secs: 10.0 * 60.0,
     is_breaking: false,
     skip_next: false,
+    break_start_time: None,
     show_countdown_guard: false,
 });
 
@@ -43,7 +61,7 @@ static STATE: Mutex<StandupState> = Mutex::new(StandupState {
 thread_local! {
     static COUNTDOWN_TIMER: RefCell<Option<Retained<NSTimer>>> = const { RefCell::new(None) };
     static WORK_TIMER: RefCell<Option<Retained<NSTimer>>> = const { RefCell::new(None) };
-    static WINDOW: RefCell<Option<Retained<StandupWindow>>> = const { RefCell::new(None) };
+    static WINDOWS: RefCell<Vec<Retained<StandupWindow>>> = const { RefCell::new(Vec::new()) };
     static STATUS_ITEM: RefCell<Option<Retained<NSStatusItem>>> = const { RefCell::new(None) };
     static MENUBAR_TIMER: RefCell<Option<Retained<NSTimer>>> = const { RefCell::new(None) };
 }
@@ -120,20 +138,24 @@ define_class!(
 
 impl StandupWindow {
     fn new(screen: &NSScreen, mtm: MainThreadMarker) -> Retained<Self> {
-        let frame = screen.frame();
         let this = Self::alloc(mtm).set_ivars(StandupWindowIvars {
             _dummy: Cell::new(false),
         });
-        unsafe {
+        // 先用小 rect 创建，再用 setFrame 设置精确位置
+        // initWithContentRect 会被 backing scale 影响，导致非主屏窗口位置错误
+        let init_rect = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(100.0, 100.0));
+        let win: Retained<Self> = unsafe {
             msg_send![
                 super(this),
-                initWithContentRect: frame,
+                initWithContentRect: init_rect,
                 styleMask: NSWindowStyleMask::NonactivatingPanel,
                 backing: NSBackingStoreType::Buffered,
                 defer: false,
                 screen: screen,
             ]
-        }
+        };
+        win.setFrame_display_animate(screen.frame(), false, false);
+        win
     }
 }
 
@@ -208,9 +230,9 @@ fn with_status_item(f: impl FnOnce(&NSStatusItem)) {
     });
 }
 
-fn with_window(f: impl FnOnce(&StandupWindow)) {
-    WINDOW.with(|w| {
-        if let Some(win) = w.borrow().as_ref() {
+fn with_windows(f: impl Fn(&StandupWindow)) {
+    WINDOWS.with(|w| {
+        for win in w.borrow().iter() {
             f(win);
         }
     });
@@ -222,7 +244,7 @@ fn invalidate_timer(cell: &RefCell<Option<Retained<NSTimer>>>) {
     }
 }
 
-// -- 刷新窗口中的视图 --
+// -- 多屏窗口管理 --
 
 fn refresh_view(window: &StandupWindow) {
     if let Some(content) = window.contentView() {
@@ -230,6 +252,72 @@ fn refresh_view(window: &StandupWindow) {
             view.display();
         }
     }
+}
+
+/// 为每个屏幕创建窗口并显示
+fn create_and_show_windows() {
+    let mtm = MainThreadMarker::new().unwrap();
+    let screens = NSScreen::screens(mtm);
+    let mut windows = Vec::new();
+
+    for screen in screens.iter() {
+        let frame = screen.frame();
+        let win = StandupWindow::new(&screen, mtm);
+
+        win.setFloatingPanel(true);
+        win.setCollectionBehavior(
+            NSWindowCollectionBehavior::CanJoinAllSpaces
+                | NSWindowCollectionBehavior::FullScreenAuxiliary,
+        );
+        win.setMovableByWindowBackground(false);
+        win.setExcludedFromWindowsMenu(true);
+        win.setAlphaValue(1.0);
+        win.setOpaque(false);
+        win.setBackgroundColor(Some(&NSColor::clearColor()));
+        win.setHasShadow(false);
+        win.setHidesOnDeactivate(false);
+        win.setRestorable(false);
+        win.disableSnapshotRestoration();
+        win.setLevel(1000);
+        win.setMovable(false);
+
+        let local_frame = NSRect::new(NSPoint::new(0.0, 0.0), frame.size);
+        let countdown_view = CountdownView::new(local_frame, mtm);
+        win.contentView().unwrap().addSubview(&countdown_view);
+
+        windows.push(win);
+    }
+
+    info!("Created {} windows for {} screens", windows.len(), screens.len());
+
+    // 显示所有窗口
+    for win in &windows {
+        win.makeKeyAndOrderFront(None);
+        refresh_view(win);
+    }
+
+    WINDOWS.with(|ws| {
+        *ws.borrow_mut() = windows;
+    });
+
+    let app = NSApplication::sharedApplication(mtm);
+    #[allow(deprecated)]
+    app.activateIgnoringOtherApps(true);
+}
+
+/// 隐藏并销毁所有窗口
+fn destroy_all_windows() {
+    WINDOWS.with(|ws| {
+        let windows = ws.borrow_mut().drain(..).collect::<Vec<_>>();
+        for win in &windows {
+            win.orderOut(None);
+        }
+        // windows dropped here, releasing ObjC objects
+    });
+}
+
+fn refresh_all_views() {
+    with_windows(|win| refresh_view(win));
 }
 
 /// 用等宽数字字体设置 button title，避免数字变化时宽度晃动
@@ -349,20 +437,10 @@ fn update_menubar_title() {
             _ => (0u32, true),
         });
 
-        // 休眠恢复：定时器过期，用 wake_secs 重启工作定时器
+        // 休眠恢复由 handle_wake 处理，这里只显示占位
         if timer_expired {
-            let wake_secs = STATE.lock().unwrap().wake_secs;
-            start_work_timer_with(wake_secs);
-            info!(
-                "Wake from sleep detected, work timer expired, reset next break in {:.0}s",
-                wake_secs
-            );
-            // 继续走下面的渲染逻辑，用新 timer 显示倒计时
-            let m = (wake_secs as u32) / 60;
-            let s = (wake_secs as u32) % 60;
-            let time = format!("{:02}:{:02}", m, s);
-            let skip_suffix = if skip_next { " (will skip)" } else { "" };
-            let info = format!("Next break: {}{}", time, skip_suffix);
+            let time = String::from("--:--");
+            let info = String::from("Waking up...");
             (time, info, "cup.and.saucer.fill")
         } else {
             let m = remaining / 60;
@@ -455,6 +533,7 @@ fn show_countdown() {
         let mut state = STATE.lock().unwrap();
         state.remaining_secs = state.break_secs;
         state.is_breaking = true;
+        state.break_start_time = Some(std::time::SystemTime::now());
         state.break_secs
     };
 
@@ -464,27 +543,7 @@ fn show_countdown() {
     WORK_TIMER.with(|t| invalidate_timer(t));
     debug!("Work timer invalidated for break");
 
-    with_window(|window| {
-        let mtm = MainThreadMarker::new().unwrap();
-        let frame = NSScreen::mainScreen(mtm).unwrap().frame();
-        window.setFrame_display_animate(frame, true, false);
-        if let Some(content) = window.contentView() {
-            if let Some(view) = content.subviews().firstObject() {
-                view.setFrame(frame);
-            }
-        }
-
-        window.makeKeyAndOrderFront(None);
-        let app = NSApplication::sharedApplication(mtm);
-        #[allow(deprecated)]
-        app.activateIgnoringOtherApps(true);
-
-        let is_key = window.isKeyWindow();
-        let is_visible = window.isVisible();
-        debug!("Break window shown: isKey={}, isVisible={}", is_key, is_visible);
-
-        refresh_view(window);
-    });
+    create_and_show_windows();
 
     // 启动 1s 倒计时定时器
     let block = RcBlock::new(move |_timer: NonNull<NSTimer>| {
@@ -516,19 +575,22 @@ fn tick_countdown() {
 
     debug!("tick: remaining={}s, is_breaking={}", remaining, is_breaking);
 
-    with_window(|window| {
-        refresh_view(window);
+    refresh_all_views();
 
-        // 每次 tick 确保窗口仍然是 key window（休眠恢复后可能丢失焦点）
-        if !window.isKeyWindow() {
-            warn!("Window lost key status during break, re-acquiring");
-            window.makeKeyAndOrderFront(None);
-            let mtm = MainThreadMarker::new().unwrap();
-            let app = NSApplication::sharedApplication(mtm);
-            #[allow(deprecated)]
-            app.activateIgnoringOtherApps(true);
-        }
-    });
+    // 确保至少有一个窗口是 key window
+    let any_key = WINDOWS.with(|ws| ws.borrow().iter().any(|w| w.isKeyWindow()));
+    if !any_key {
+        warn!("No window is key during break, re-acquiring");
+        WINDOWS.with(|ws| {
+            if let Some(win) = ws.borrow().first() {
+                win.makeKeyAndOrderFront(None);
+            }
+        });
+        let mtm = MainThreadMarker::new().unwrap();
+        let app = NSApplication::sharedApplication(mtm);
+        #[allow(deprecated)]
+        app.activateIgnoringOtherApps(true);
+    }
 
     if remaining == 0 {
         info!("Countdown reached zero, dismissing");
@@ -542,6 +604,7 @@ fn dismiss_countdown() {
         let was = state.is_breaking;
         state.remaining_secs = 0;
         state.is_breaking = false;
+        state.break_start_time = None;
         was
     };
 
@@ -554,7 +617,7 @@ fn dismiss_countdown() {
     COUNTDOWN_TIMER.with(|t| invalidate_timer(t));
     debug!("Countdown timer invalidated");
 
-    with_window(|window| window.orderOut(None));
+    destroy_all_windows();
 
     // 重启工作定时器
     start_work_timer();
@@ -586,47 +649,87 @@ fn start_work_timer_with(secs: f64) {
     debug!("Work timer scheduled for {:.0}s", secs);
 }
 
-// -- 命令行参数解析 --
+// -- 休眠唤醒处理 --
 
-fn parse_args() -> (f64, f64, f64) {
-    let args: Vec<String> = std::env::args().collect();
-    let mut work_mins = 25.0_f64;
-    let mut break_mins = 5.0_f64;
-    let mut wake_mins = 10.0_f64;
+fn ensure_menubar_timer() {
+    let needs_restart = MENUBAR_TIMER.with(|t| {
+        t.borrow().as_ref().map_or(true, |timer| !timer.isValid())
+    });
+    if needs_restart {
+        start_menubar_timer();
+        info!("Menubar timer was invalid after wake, restarted");
+    }
+}
 
-    let mut i = 1;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--work" => {
-                if i + 1 < args.len() {
-                    if let Ok(v) = args[i + 1].parse::<f64>() {
-                        work_mins = v;
-                    }
-                    i += 1;
-                }
+fn ensure_countdown_timer() {
+    let needs_restart = COUNTDOWN_TIMER.with(|t| {
+        t.borrow().as_ref().map_or(true, |timer| !timer.isValid())
+    });
+    if needs_restart {
+        let block = RcBlock::new(move |_timer: NonNull<NSTimer>| {
+            tick_countdown();
+        });
+        let timer = unsafe {
+            NSTimer::scheduledTimerWithTimeInterval_repeats_block(1.0, true, &block)
+        };
+        COUNTDOWN_TIMER.with(|t| {
+            *t.borrow_mut() = Some(timer);
+        });
+        info!("Countdown timer was invalid after wake, restarted");
+    }
+}
+
+fn handle_wake() {
+    info!("System wake detected");
+
+    let (is_breaking, break_secs, break_start_time) = {
+        let state = STATE.lock().unwrap();
+        (state.is_breaking, state.break_secs, state.break_start_time)
+    };
+
+    if is_breaking {
+        if let Some(start) = break_start_time {
+            let elapsed = start.elapsed().unwrap_or_default().as_secs() as u32;
+            if elapsed >= break_secs {
+                info!(
+                    "Wake during break: elapsed {}s >= break {}s, dismissing",
+                    elapsed, break_secs
+                );
+                dismiss_countdown();
+            } else {
+                let new_remaining = break_secs - elapsed;
+                info!("Wake during break: {}s remaining", new_remaining);
+                STATE.lock().unwrap().remaining_secs = new_remaining;
+                ensure_countdown_timer();
+                refresh_all_views();
             }
-            "--break" => {
-                if i + 1 < args.len() {
-                    if let Ok(v) = args[i + 1].parse::<f64>() {
-                        break_mins = v;
-                    }
-                    i += 1;
-                }
-            }
-            "--wake" => {
-                if i + 1 < args.len() {
-                    if let Ok(v) = args[i + 1].parse::<f64>() {
-                        wake_mins = v;
-                    }
-                    i += 1;
-                }
-            }
-            _ => {}
+        } else {
+            info!("Wake during break: no start time recorded, dismissing");
+            dismiss_countdown();
         }
-        i += 1;
+    } else {
+        let timer_ok = WORK_TIMER.with(|t| match t.borrow().as_ref() {
+            Some(timer) if timer.isValid() => {
+                let diff = timer.fireDate().timeIntervalSinceDate(&NSDate::now());
+                if diff > 0.0 {
+                    info!("Wake during work: {:.0}s remaining on work timer", diff);
+                    true
+                } else {
+                    false
+                }
+            }
+            _ => false,
+        });
+
+        if !timer_ok {
+            let wake_secs = STATE.lock().unwrap().wake_secs;
+            start_work_timer_with(wake_secs);
+            info!("Wake during work: timer expired, reset to {:.0}s", wake_secs);
+        }
     }
 
-    (work_mins, break_mins, wake_mins)
+    ensure_menubar_timer();
+    update_menubar_title();
 }
 
 fn main() {
@@ -644,7 +747,7 @@ fn main() {
         )
         .init();
 
-    let (work_mins, break_mins, wake_mins) = parse_args();
+    let args = Args::parse();
 
     let mtm = MainThreadMarker::new().expect("must be on the main thread");
     let app = NSApplication::sharedApplication(mtm);
@@ -653,43 +756,10 @@ fn main() {
     // 设置全局状态
     {
         let mut state = STATE.lock().unwrap();
-        state.work_secs = work_mins * 60.0;
-        state.break_secs = (break_mins * 60.0) as u32;
-        state.wake_secs = wake_mins * 60.0;
+        state.work_secs = args.work * 60.0;
+        state.break_secs = (args.brk * 60.0) as u32;
+        state.wake_secs = args.wake * 60.0;
     }
-
-    let window = {
-        let screen = NSScreen::mainScreen(mtm).unwrap();
-        let win = StandupWindow::new(&screen, mtm);
-
-        win.setFloatingPanel(true);
-        win.setCollectionBehavior(
-            NSWindowCollectionBehavior::CanJoinAllSpaces
-                | NSWindowCollectionBehavior::FullScreenAuxiliary,
-        );
-        win.setMovableByWindowBackground(false);
-        win.setExcludedFromWindowsMenu(true);
-        win.setAlphaValue(1.0);
-        win.setOpaque(false);
-        win.setBackgroundColor(Some(&NSColor::clearColor()));
-        win.setHasShadow(false);
-        win.setHidesOnDeactivate(false);
-        win.setRestorable(false);
-        win.disableSnapshotRestoration();
-        win.setLevel(1000);
-        win.setMovable(false);
-        win
-    };
-
-    // 添加 CountdownView
-    let frame = NSScreen::mainScreen(mtm).unwrap().frame();
-    let countdown_view = CountdownView::new(frame, mtm);
-    window.contentView().unwrap().addSubview(&countdown_view);
-
-    // 存储窗口引用到 thread_local
-    WINDOW.with(|w| {
-        *w.borrow_mut() = Some(window);
-    });
 
     // 设置菜单栏
     setup_menubar(mtm);
@@ -701,9 +771,29 @@ fn main() {
     start_menubar_timer();
     update_menubar_title();
 
+    // 注册系统唤醒通知
+    unsafe {
+        let workspace_cls = AnyClass::get(c"NSWorkspace").unwrap();
+        let workspace: *mut AnyObject = msg_send![workspace_cls, sharedWorkspace];
+        let nc: *mut AnyObject = msg_send![workspace, notificationCenter];
+        let wake_name = NSString::from_str("NSWorkspaceDidWakeNotification");
+        let wake_block = RcBlock::new(|_notif: NonNull<AnyObject>| {
+            handle_wake();
+        });
+        let _observer: *mut AnyObject = msg_send![
+            nc,
+            addObserverForName: &*wake_name,
+            object: std::ptr::null::<AnyObject>(),
+            queue: std::ptr::null::<AnyObject>(),
+            usingBlock: &*wake_block,
+        ];
+        std::mem::forget(wake_block);
+    }
+    info!("Registered NSWorkspaceDidWakeNotification handler");
+
     info!(
         "Standup running: work={:.1}m, break={:.1}m, wake={:.1}m",
-        work_mins, break_mins, wake_mins
+        args.work, args.brk, args.wake
     );
 
     app.run();
