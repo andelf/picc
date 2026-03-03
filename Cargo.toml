@@ -21,44 +21,8 @@ name = "standup"
 path = "src/bin/standup.rs"
 
 [[bin]]
-name = "confirm"
-path = "src/bin/confirm.rs"
-
-[[bin]]
-name = "icon_test"
-path = "src/bin/icon_test.rs"
-
-[[bin]]
 name = "hidden"
 path = "src/bin/hidden.rs"
-
-[[bin]]
-name = "lark"
-path = "src/bin/lark.rs"
-
-[[bin]]
-name = "lark_send"
-path = "src/bin/lark_send.rs"
-
-[[bin]]
-name = "lark_normal_group"
-path = "src/bin/lark_normal_group.rs"
-
-[[bin]]
-name = "lark_autoreply"
-path = "src/bin/lark_autoreply.rs"
-
-[[bin]]
-name = "temp_hover_test"
-path = "src/bin/temp_hover_test.rs"
-
-[[bin]]
-name = "chrome_ax"
-path = "src/bin/chrome_ax.rs"
-
-[[bin]]
-name = "ax_traverse"
-path = "src/bin/ax_traverse.rs"
 
 [[bin]]
 name = "ax_print"
