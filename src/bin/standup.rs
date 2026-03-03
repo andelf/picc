@@ -1027,7 +1027,12 @@ fn apply_sync_rules(hb: &Heartbeat) {
 
 fn process_lan_queue() {
     let messages: Vec<Heartbeat> = LAN_QUEUE.lock().unwrap().drain(..).collect();
+    // 每个 peer 只保留最后一条消息，避免处理过期状态导致震荡
+    let mut latest: HashMap<u64, Heartbeat> = HashMap::new();
     for hb in messages {
+        latest.insert(hb.id, hb);
+    }
+    for (_, hb) in latest {
         update_peer(hb.id, &hb);
         apply_sync_rules(&hb);
     }
