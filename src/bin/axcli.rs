@@ -22,6 +22,8 @@
 use clap::{Parser, Subcommand};
 use objc2_core_foundation::{CGPoint, CGSize, CGRect};
 use picc::accessibility::{self, AXNode};
+use picc::actions::ExecutionContext;
+use picc::error::{AxError, exit_code};
 use picc::{input, screenshot, tree_fmt};
 
 #[derive(Parser)]
@@ -225,6 +227,9 @@ Known attributes:
         #[arg(value_name = "ATTR")]
         attr: GetAttr,
         locator: String,
+        /// Show all matches instead of just the first
+        #[arg(long)]
+        all: bool,
     },
     /// List running applications visible to accessibility
     ListApps,
@@ -239,51 +244,65 @@ fn main() {
         return;
     }
 
-    let (pid, app) = resolve_app(&cli);
+    if let Err(e) = run(cli) {
+        eprintln!("error: {e}");
+        std::process::exit(exit_code(&e));
+    }
+}
+
+fn run(cli: Cli) -> Result<(), AxError> {
+    let (pid, app) = resolve_app(&cli)?;
 
     if !accessibility::is_trusted() {
-        eprintln!("error: accessibility not granted");
-        std::process::exit(1);
+        return Err(AxError::AccessDenied);
     }
+
+    let ctx = ExecutionContext::new(pid, app);
 
     match cli.command {
         Command::ListApps => unreachable!(),
-        Command::Snapshot { locator, depth, all, max_text_len, simplify } => cmd_snapshot(&app, locator.as_deref(), depth, all, max_text_len, simplify),
-        Command::Click { locator } => cmd_click(&app, pid, &locator),
-        Command::Dblclick { locator } => cmd_dblclick(&app, pid, &locator),
-        Command::Input { locator, text } => cmd_input(&app, pid, &locator, &text),
-        Command::Fill { locator, text } => cmd_fill(&app, pid, &locator, &text),
-        Command::Press { key } => cmd_press(pid, &key),
-        Command::Hover { locator } => cmd_hover(&app, pid, &locator),
-        Command::Focus { locator } => cmd_focus(&app, pid, &locator),
-        Command::ScrollTo { locator } => cmd_scroll_to(&app, pid, &locator),
-        Command::Scroll { locator, direction, pixels } => cmd_scroll(&app, pid, &locator, &direction, pixels),
-        Command::Screenshot { locator, output } => cmd_screenshot(&app, pid, locator.as_deref(), output.as_deref()),
-        Command::Wait { target } => cmd_wait(&app, &target),
-        Command::Get { attr, locator } => cmd_get(&app, &attr, &locator),
-
+        Command::Snapshot { locator, depth, all, max_text_len, simplify } => {
+            cmd_snapshot(&ctx, locator.as_deref(), depth, all, max_text_len, simplify)
+        }
+        Command::Click { locator } => cmd_click(&ctx, &locator),
+        Command::Dblclick { locator } => cmd_dblclick(&ctx, &locator),
+        Command::Input { locator, text } => cmd_input(&ctx, &locator, &text),
+        Command::Fill { locator, text } => cmd_fill(&ctx, &locator, &text),
+        Command::Press { key } => cmd_press(&ctx, &key),
+        Command::Hover { locator } => cmd_hover(&ctx, &locator),
+        Command::Focus { locator } => cmd_focus(&ctx, &locator),
+        Command::ScrollTo { locator } => cmd_scroll_to(&ctx, &locator),
+        Command::Scroll { locator, direction, pixels } => {
+            cmd_scroll(&ctx, &locator, &direction, pixels)
+        }
+        Command::Screenshot { locator, output } => {
+            cmd_screenshot(&ctx, locator.as_deref(), output.as_deref())
+        }
+        Command::Wait { target } => cmd_wait(&ctx, &target),
+        Command::Get { attr, locator, all } => cmd_get(&ctx, &attr, &locator, all),
     }
 }
 
 // --- App resolution ---
 
-fn resolve_app(cli: &Cli) -> (i32, AXNode) {
+fn resolve_app(cli: &Cli) -> Result<(i32, AXNode), AxError> {
     if let Some(pid) = cli.pid {
-        return (pid, AXNode::app(pid));
+        return Ok((pid, AXNode::app(pid)));
     }
     if let Some(ref name) = cli.app {
         let mtm = objc2::MainThreadMarker::new().expect("must run on main thread");
-        let (pid, localized) =
-            accessibility::find_app_by_name(mtm, name).expect("app not found");
-        eprintln!("Found app: {localized} (pid={pid})");
-        return (pid, AXNode::app(pid));
+        match accessibility::find_app_by_name(mtm, name) {
+            Some((pid, localized)) => {
+                eprintln!("Found app: {localized} (pid={pid})");
+                return Ok((pid, AXNode::app(pid)));
+            }
+            None => return Err(AxError::AppNotFound(name.clone())),
+        }
     }
-    eprintln!("error: --app or --pid is required");
-    std::process::exit(1);
+    Err(AxError::InvalidArgument("--app or --pid is required".to_string()))
 }
 
 /// Strip known pseudo-class suffixes from a segment for validation.
-/// Returns the base segment after removing `:has-text(...)`, `:has(...)`, `:visible`.
 fn strip_pseudo_classes(s: &str) -> &str {
     let mut base = s;
     loop {
@@ -315,43 +334,25 @@ fn strip_pseudo_classes(s: &str) -> &str {
 }
 
 /// Validate a single locator segment (between `>>` or `>`).
-/// Valid forms:
-///   #id                        — DOM ID
-///   .class1.class2             — DOM class(es)
-///   Role.class                 — role + class
-///   Role[attr="value"]         — role + attribute
-///   text=VALUE / text~=VALUE   — text match
-///   text=/regex/flags          — regex text match
-///   role (plain word)          — AXRole or short role
-///   nth=N / first / last       — pipeline index selectors
-///   :has-text("text")          — pseudo-class (can be appended to any selector)
-///   :has(selector)             — pseudo-class
-///   :visible                   — pseudo-class
 fn validate_segment(seg: &str) -> Result<(), String> {
     let s = seg.trim();
     if s.is_empty() {
         return Err("empty segment (double `>>` or trailing `>>`)".into());
     }
-    // Strip pseudo-classes for base validation
     let base = strip_pseudo_classes(s);
-    // If entire selector is pseudo-classes only (e.g. `:has-text("Hello")`)
     if base.is_empty() {
         return Ok(());
     }
     let s = base;
-    // Pipeline selectors
     if s == "first" || s == "last" || s.starts_with("nth=") {
         return Ok(());
     }
-    // DOM ID
     if s.starts_with('#') {
         return if s.len() > 1 { Ok(()) } else { Err("empty DOM ID after `#`".into()) };
     }
-    // text= / text~=
     if s.starts_with("text=") || s.starts_with("text~=") {
         return Ok(());
     }
-    // Bracket selector: Role[attr="value"]
     if s.contains('[') {
         if !s.ends_with(']') {
             return Err(format!("unclosed bracket in `{s}`"));
@@ -362,67 +363,39 @@ fn validate_segment(seg: &str) -> Result<(), String> {
         }
         return Ok(());
     }
-    // Dot selector: .class or Role.class (may include :not())
     if s.contains('.') {
         let without_not = s.split(":not(").next().unwrap_or(s);
         let has_class = without_not.split('.').skip(1).any(|c| !c.is_empty());
         return if has_class { Ok(()) } else { Err(format!("empty class name in `{s}`")) };
     }
-    // Plain role name: must be alphanumeric (allow AXFoo or foo)
     if s.chars().all(|c| c.is_alphanumeric() || c == '_') {
         return Ok(());
     }
     Err(format!("unrecognized locator syntax: `{s}`"))
 }
 
-/// Validate an entire locator string (may contain `>>` and `>` chains).
-fn validate_locator(locator: &str) {
-    // Split by >> first, then by > within each part
+/// Validate an entire locator string.
+fn validate_locator(locator: &str) -> Result<(), AxError> {
     for desc_part in locator.split(" >> ") {
         for seg in desc_part.split(" > ") {
             if let Err(msg) = validate_segment(seg) {
-                eprintln!("error: invalid locator: {msg}");
-                eprintln!("  locator: {locator}");
-                std::process::exit(1);
+                return Err(AxError::LocatorInvalid(format!("{msg}\n  locator: {locator}")));
             }
         }
     }
+    Ok(())
 }
 
-/// Resolve a locator to a single node, exit on error.
-fn resolve_one(app: &AXNode, locator: &str) -> AXNode {
-    validate_locator(locator);
-    let nodes = app.locate_all(locator);
-    if nodes.is_empty() {
-        eprintln!("error: locator not found: {locator}");
-        std::process::exit(1);
-    }
-    if nodes.len() > 1 {
-        eprintln!(
-            "error: locator matched {} elements, must be unique for actions",
-            nodes.len()
-        );
-        eprintln!("hint: use 'locator >> nth=N' to select one");
-        std::process::exit(1);
-    }
-    let node = &nodes[0];
+/// Resolve a locator to a single node.
+fn resolve_one(ctx: &ExecutionContext, locator: &str) -> Result<AXNode, AxError> {
+    validate_locator(locator)?;
+    let node = ctx.resolve_one(locator)?;
     eprintln!(
         "Resolved → role=\"{}\" title=\"{}\"",
         node.role().unwrap_or_default(),
         node.title().unwrap_or_default(),
     );
-    nodes.into_iter().next().unwrap()
-}
-
-/// Get element center coordinates. Exit if zero-size (unless is_menu).
-fn element_center(node: &AXNode, allow_zero: bool) -> (f64, f64) {
-    let (w, h) = node.size().unwrap_or((0.0, 0.0));
-    if !allow_zero && w == 0.0 && h == 0.0 {
-        eprintln!("error: element has zero size (not visible)");
-        std::process::exit(1);
-    }
-    let (x, y) = node.position().unwrap_or((0.0, 0.0));
-    (x + w / 2.0, y + h / 2.0)
+    Ok(node)
 }
 
 fn is_menu_role(role: &str) -> bool {
@@ -465,17 +438,16 @@ fn cmd_list_apps() {
     eprintln!("\n({} apps)", entries.len());
 }
 
-fn cmd_snapshot(app: &AXNode, locator: Option<&str>, depth: usize, all: bool, max_text_len: usize, simplify: bool) {
+fn cmd_snapshot(ctx: &ExecutionContext, locator: Option<&str>, depth: usize, all: bool, max_text_len: usize, simplify: bool) -> Result<(), AxError> {
     let mut printer = tree_fmt::TreePrinter::new();
     printer.max_text_len = max_text_len;
     printer.simplify = simplify;
 
     if let Some(loc) = locator {
-        validate_locator(loc);
-        let nodes = app.locate_all(loc);
+        validate_locator(loc)?;
+        let nodes = ctx.app.locate_all(loc);
         if nodes.is_empty() {
-            eprintln!("error: locator not found: {loc}");
-            std::process::exit(1);
+            return Err(AxError::LocatorNotFound(loc.to_string()));
         }
         if all {
             eprintln!("Found {} matches for {loc}", nodes.len());
@@ -501,56 +473,55 @@ fn cmd_snapshot(app: &AXNode, locator: Option<&str>, depth: usize, all: bool, ma
             printer.print_with_ancestors(node, depth);
         }
     } else {
-        printer.print_tree(app, 0, depth);
+        printer.print_tree(&ctx.app, 0, depth);
     }
 
     eprintln!("\n({} interactive elements)", printer.interactive_count());
+    Ok(())
 }
 
-fn cmd_click(app: &AXNode, pid: i32, locator: &str) {
-    let node = resolve_one(app, locator);
+fn cmd_click(ctx: &ExecutionContext, locator: &str) -> Result<(), AxError> {
+    let node = resolve_one(ctx, locator)?;
     let role = node.role().unwrap_or_default();
 
-    input::activate_app(pid);
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    ctx.activate();
 
     if is_menu_role(&role) {
         eprintln!("Performing AXPress on {role}");
         if !accessibility::perform_action(&node.0, "AXPress") {
-            eprintln!("error: AXPress failed");
-            std::process::exit(1);
+            return Err(AxError::ActionFailed("AXPress".to_string()));
         }
     } else {
-        let (cx, cy) = element_center(&node, false);
+        let (cx, cy) = ctx.element_center(&node, false)?;
         eprintln!("Clicking at ({cx:.0}, {cy:.0})");
         input::mouse_move(cx, cy);
         std::thread::sleep(std::time::Duration::from_millis(50));
         input::mouse_click(cx, cy);
     }
+    Ok(())
 }
 
-fn cmd_dblclick(app: &AXNode, pid: i32, locator: &str) {
-    let node = resolve_one(app, locator);
+fn cmd_dblclick(ctx: &ExecutionContext, locator: &str) -> Result<(), AxError> {
+    let node = resolve_one(ctx, locator)?;
 
-    input::activate_app(pid);
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    ctx.activate();
 
-    let (cx, cy) = element_center(&node, false);
+    let (cx, cy) = ctx.element_center(&node, false)?;
     eprintln!("Double-clicking at ({cx:.0}, {cy:.0})");
     input::mouse_move(cx, cy);
     std::thread::sleep(std::time::Duration::from_millis(50));
     input::mouse_dblclick(cx, cy);
+    Ok(())
 }
 
-fn cmd_input(app: &AXNode, pid: i32, locator: &str, text: &str) {
-    let node = resolve_one(app, locator);
+fn cmd_input(ctx: &ExecutionContext, locator: &str, text: &str) -> Result<(), AxError> {
+    let node = resolve_one(ctx, locator)?;
 
-    input::activate_app(pid);
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    ctx.activate();
 
     // Focus
     if !node.set_focused(true) {
-        let (cx, cy) = element_center(&node, false);
+        let (cx, cy) = ctx.element_center(&node, false)?;
         eprintln!("AXFocused failed, clicking to focus...");
         input::mouse_move(cx, cy);
         std::thread::sleep(std::time::Duration::from_millis(50));
@@ -560,17 +531,17 @@ fn cmd_input(app: &AXNode, pid: i32, locator: &str, text: &str) {
 
     eprintln!("Typing: {text:?}");
     input::type_text(text);
+    Ok(())
 }
 
-fn cmd_fill(app: &AXNode, pid: i32, locator: &str, text: &str) {
-    let node = resolve_one(app, locator);
+fn cmd_fill(ctx: &ExecutionContext, locator: &str, text: &str) -> Result<(), AxError> {
+    let node = resolve_one(ctx, locator)?;
 
-    input::activate_app(pid);
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    ctx.activate();
 
     // Focus
     if !node.set_focused(true) {
-        let (cx, cy) = element_center(&node, false);
+        let (cx, cy) = ctx.element_center(&node, false)?;
         eprintln!("AXFocused failed, clicking to focus...");
         input::mouse_move(cx, cy);
         std::thread::sleep(std::time::Duration::from_millis(50));
@@ -588,64 +559,64 @@ fn cmd_fill(app: &AXNode, pid: i32, locator: &str, text: &str) {
 
     eprintln!("Filling: {text:?}");
     input::type_text(text);
+    Ok(())
 }
 
-fn cmd_press(pid: i32, key: &str) {
-    input::activate_app(pid);
-    std::thread::sleep(std::time::Duration::from_millis(200));
+fn cmd_press(ctx: &ExecutionContext, key: &str) -> Result<(), AxError> {
+    ctx.activate();
 
     let (keycode, flags) = input::parse_key_combo(key);
     eprintln!("Pressing: {key} (keycode={keycode}, flags=0x{flags:x})");
     input::press_key_combo(keycode, flags);
+    Ok(())
 }
 
-fn cmd_hover(app: &AXNode, pid: i32, locator: &str) {
-    let node = resolve_one(app, locator);
+fn cmd_hover(ctx: &ExecutionContext, locator: &str) -> Result<(), AxError> {
+    let node = resolve_one(ctx, locator)?;
 
-    input::activate_app(pid);
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    ctx.activate();
 
-    let (cx, cy) = element_center(&node, false);
+    let (cx, cy) = ctx.element_center(&node, false)?;
     eprintln!("Moving mouse to ({cx:.0}, {cy:.0})");
     input::mouse_move(cx, cy);
+    Ok(())
 }
 
-fn cmd_focus(app: &AXNode, pid: i32, locator: &str) {
-    let node = resolve_one(app, locator);
+fn cmd_focus(ctx: &ExecutionContext, locator: &str) -> Result<(), AxError> {
+    let node = resolve_one(ctx, locator)?;
 
-    input::activate_app(pid);
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    ctx.activate();
 
     if node.set_focused(true) {
         eprintln!("Focused via AXFocused");
     } else {
-        let (cx, cy) = element_center(&node, false);
+        let (cx, cy) = ctx.element_center(&node, false)?;
         eprintln!("AXFocused failed, clicking to focus...");
         input::mouse_move(cx, cy);
         std::thread::sleep(std::time::Duration::from_millis(50));
         input::mouse_click(cx, cy);
     }
+    Ok(())
 }
 
-fn cmd_scroll_to(app: &AXNode, pid: i32, locator: &str) {
-    let node = resolve_one(app, locator);
+fn cmd_scroll_to(ctx: &ExecutionContext, locator: &str) -> Result<(), AxError> {
+    let node = resolve_one(ctx, locator)?;
 
-    input::activate_app(pid);
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    ctx.activate();
 
     eprintln!("Scrolling element into view...");
     if !accessibility::perform_action(&node.0, "AXScrollToVisible") {
         eprintln!("warning: AXScrollToVisible failed (element may not be in a scroll area)");
     }
+    Ok(())
 }
 
-fn cmd_scroll(app: &AXNode, pid: i32, locator: &str, direction: &str, pixels: i32) {
-    let node = resolve_one(app, locator);
+fn cmd_scroll(ctx: &ExecutionContext, locator: &str, direction: &str, pixels: i32) -> Result<(), AxError> {
+    let node = resolve_one(ctx, locator)?;
 
-    input::activate_app(pid);
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    ctx.activate();
 
-    let (cx, cy) = element_center(&node, false);
+    let (cx, cy) = ctx.element_center(&node, false)?;
 
     let (dx, dy) = match direction {
         "up" => (0, pixels),
@@ -653,20 +624,24 @@ fn cmd_scroll(app: &AXNode, pid: i32, locator: &str, direction: &str, pixels: i3
         "left" => (pixels, 0),
         "right" => (-pixels, 0),
         _ => {
-            eprintln!("error: invalid direction '{direction}', use up/down/left/right");
-            std::process::exit(1);
+            return Err(AxError::InvalidArgument(
+                format!("invalid direction '{direction}', use up/down/left/right"),
+            ));
         }
     };
     eprintln!("Scrolling {direction} {pixels}px at ({cx:.0}, {cy:.0})");
     input::mouse_move(cx, cy);
     std::thread::sleep(std::time::Duration::from_millis(50));
     input::scroll_wheel(cx, cy, dx, dy);
+    Ok(())
 }
 
-fn cmd_screenshot(app: &AXNode, pid: i32, locator: Option<&str>, output: Option<&str>) {
+fn cmd_screenshot(ctx: &ExecutionContext, locator: Option<&str>, output: Option<&str>) -> Result<(), AxError> {
     // Bring app to foreground so it's visible for screen capture
-    input::activate_app(pid);
-    std::thread::sleep(std::time::Duration::from_millis(300));
+    ctx.activate();
+    // Extra delay for screenshot
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
     let path = output
         .map(String::from)
         .unwrap_or_else(|| {
@@ -678,14 +653,14 @@ fn cmd_screenshot(app: &AXNode, pid: i32, locator: Option<&str>, output: Option<
         });
 
     let rect = if let Some(loc) = locator {
-        let node = resolve_one(app, loc);
+        validate_locator(loc)?;
+        let node = ctx.resolve_one(loc)?;
         let (x, y) = node.position().unwrap_or((0.0, 0.0));
         let (w, h) = node.size().unwrap_or((0.0, 0.0));
         eprintln!("Capturing {w:.0}x{h:.0} at ({x:.0},{y:.0}) → {path}");
         CGRect::new(CGPoint::new(x, y), CGSize::new(w, h))
     } else {
-        // No locator: capture the app's main window area
-        let windows = app.children();
+        let windows = ctx.app.children();
         let win = windows.iter().find(|w| {
             w.role().as_deref() == Some("AXWindow")
                 && w.size().map_or(false, |(w, h)| w > 0.0 && h > 0.0)
@@ -701,39 +676,32 @@ fn cmd_screenshot(app: &AXNode, pid: i32, locator: Option<&str>, output: Option<
         }
     };
 
-    let image = screenshot::capture(rect).expect("screenshot failed");
+    let image = screenshot::capture(rect)
+        .ok_or_else(|| AxError::ScreenshotFailed("capture failed".to_string()))?;
     if screenshot::save_png(&image, &path) {
         eprintln!("Saved: {path}");
+        Ok(())
     } else {
-        eprintln!("error: failed to save {path}");
-        std::process::exit(1);
+        Err(AxError::ScreenshotFailed(format!("failed to save {path}")))
     }
 }
 
-fn cmd_wait(app: &AXNode, target: &str) {
+fn cmd_wait(ctx: &ExecutionContext, target: &str) -> Result<(), AxError> {
     // Pure number = sleep ms
     if let Ok(ms) = target.parse::<u64>() {
         eprintln!("Waiting {ms}ms...");
         std::thread::sleep(std::time::Duration::from_millis(ms));
-        return;
+        return Ok(());
     }
 
     // Otherwise: poll for locator (timeout 10s)
+    validate_locator(target)?;
     eprintln!("Waiting for '{target}'...");
-    let start = std::time::Instant::now();
     let timeout = std::time::Duration::from_secs(10);
-    loop {
-        let nodes = app.locate_all(target);
-        if !nodes.is_empty() {
-            eprintln!("Found after {:.1}s", start.elapsed().as_secs_f64());
-            return;
-        }
-        if start.elapsed() > timeout {
-            eprintln!("error: timeout waiting for '{target}'");
-            std::process::exit(1);
-        }
-        std::thread::sleep(std::time::Duration::from_millis(200));
-    }
+    let node = ctx.wait_for(target, timeout)?;
+    let _ = node;
+    eprintln!("Found!");
+    Ok(())
 }
 
 /// Collect text from a subtree, inserting newlines at group boundaries.
@@ -765,7 +733,6 @@ fn collect_text_inner(node: &AXNode, max_depth: usize, parts: &mut Vec<String>) 
         || role == "AXBlockquote" || role == "AXArticle";
 
     if is_block && !parts.is_empty() {
-        // Only add newline if last part doesn't already end with one
         if !parts.last().map_or(true, |s| s.ends_with('\n')) {
             parts.push("\n".to_string());
         }
@@ -782,52 +749,27 @@ fn collect_text_inner(node: &AXNode, max_depth: usize, parts: &mut Vec<String>) 
     }
 }
 
-fn cmd_get(app: &AXNode, attr: &GetAttr, locator: &str) {
-    let node = resolve_one(app, locator);
-
+fn get_attr_value(node: &AXNode, attr: &GetAttr) -> Result<String, AxError> {
     match attr {
-        GetAttr::Text => {
-            println!("{}", collect_text(&node, 50));
-        }
-        GetAttr::Role => {
-            println!("{}", node.role().unwrap_or_default());
-        }
-        GetAttr::Title => {
-            println!("{}", node.title().unwrap_or_default());
-        }
-        GetAttr::Description => {
-            println!("{}", node.description().unwrap_or_default());
-        }
-        GetAttr::Value => {
-            println!("{}", node.value().unwrap_or_default());
-        }
+        GetAttr::Text => Ok(collect_text(node, 50)),
+        GetAttr::Role => Ok(node.role().unwrap_or_default()),
+        GetAttr::Title => Ok(node.title().unwrap_or_default()),
+        GetAttr::Description => Ok(node.description().unwrap_or_default()),
+        GetAttr::Value => Ok(node.value().unwrap_or_default()),
         GetAttr::DomId => {
-            let id = accessibility::attr_string(&node.0, "AXDOMIdentifier").unwrap_or_default();
-            println!("{id}");
+            Ok(accessibility::attr_string(&node.0, "AXDOMIdentifier").unwrap_or_default())
         }
-        GetAttr::Classes => {
-            let classes = node.dom_classes();
-            println!("{}", classes.join(" "));
-        }
-        GetAttr::Actions => {
-            let actions = node.actions();
-            println!("{}", actions.join(" "));
-        }
-        GetAttr::Position => {
-            match node.position() {
-                Some((x, y)) => println!("{x:.0},{y:.0}"),
-                None => { eprintln!("(no position)"); std::process::exit(1); }
-            }
-        }
-        GetAttr::Size => {
-            match node.size() {
-                Some((w, h)) => println!("{w:.0},{h:.0}"),
-                None => { eprintln!("(no size)"); std::process::exit(1); }
-            }
-        }
-        GetAttr::ChildCount => {
-            println!("{}", node.child_count());
-        }
+        GetAttr::Classes => Ok(node.dom_classes().join(" ")),
+        GetAttr::Actions => Ok(node.actions().join(" ")),
+        GetAttr::Position => match node.position() {
+            Some((x, y)) => Ok(format!("{x:.0},{y:.0}")),
+            None => Err(AxError::AttributeNotFound("AXPosition".to_string())),
+        },
+        GetAttr::Size => match node.size() {
+            Some((w, h)) => Ok(format!("{w:.0},{h:.0}")),
+            None => Err(AxError::AttributeNotFound("AXSize".to_string())),
+        },
+        GetAttr::ChildCount => Ok(node.child_count().to_string()),
         GetAttr::Raw(name) => {
             let ax_name = if name.starts_with("AX") {
                 name.clone()
@@ -840,9 +782,40 @@ fn cmd_get(app: &AXNode, attr: &GetAttr, locator: &str) {
                 format!("AX{cap}")
             };
             match accessibility::attr_string(&node.0, &ax_name) {
-                Some(val) => println!("{val}"),
-                None => { eprintln!("(no value for {ax_name})"); std::process::exit(1); }
+                Some(val) => Ok(val),
+                None => Err(AxError::AttributeNotFound(ax_name)),
             }
         }
     }
+}
+
+fn cmd_get(ctx: &ExecutionContext, attr: &GetAttr, locator: &str, all: bool) -> Result<(), AxError> {
+    validate_locator(locator)?;
+
+    if all {
+        let nodes = ctx.app.locate_all(locator);
+        if nodes.is_empty() {
+            return Err(AxError::LocatorNotFound(locator.to_string()));
+        }
+        eprintln!("Found {} matches for {locator}", nodes.len());
+        for (i, node) in nodes.iter().enumerate() {
+            let val = get_attr_value(node, attr)?;
+            if nodes.len() > 1 {
+                eprintln!("--- match {}/{} ---", i + 1, nodes.len());
+            }
+            print!("{val}");
+            // text 类型可能已经带换行，其他类型补一个
+            if !val.ends_with('\n') {
+                println!();
+            }
+        }
+    } else {
+        let node = resolve_one(ctx, locator)?;
+        let val = get_attr_value(&node, attr)?;
+        print!("{val}");
+        if !val.ends_with('\n') {
+            println!();
+        }
+    }
+    Ok(())
 }
