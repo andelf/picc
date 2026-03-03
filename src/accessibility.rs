@@ -1141,8 +1141,12 @@ fn element_matches_base_selector(el: &AXUIElement, selector: &str) -> bool {
         let classes = attr_string_list(el, "AXDOMClassList");
         dom_sel.matches(&classes)
     } else if selector.contains(":nth(") {
-        // Role:nth(n) — handled separately, don't match here
-        false
+        let Some((role_part, rest)) = selector.split_once(":nth(") else { return false };
+        let Some(n_str) = rest.strip_suffix(')') else { return false };
+        let Ok(n) = n_str.parse::<usize>() else { return false };
+        let el_role = attr_string(el, "AXRole").unwrap_or_default();
+        if !role_matches(&el_role, role_part) { return false }
+        nth_among_siblings(el).is_some_and(|(_, idx)| idx == n)
     } else {
         // Plain role — support both "AXButton" and "button" (case-insensitive without AX prefix)
         let el_role = attr_string(el, "AXRole").unwrap_or_default();

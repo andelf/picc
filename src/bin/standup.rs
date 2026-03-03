@@ -1,9 +1,14 @@
 use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, VecDeque};
+use std::net::UdpSocket;
 use std::ptr::NonNull;
 use std::sync::Mutex;
+use std::time::Instant;
 
 use block2::RcBlock;
 use clap::Parser;
+use rand::Rng;
+use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject, NSObject};
@@ -29,6 +34,12 @@ struct Args {
     /// Wake-from-sleep grace period in minutes
     #[arg(long, default_value_t = 10.0)]
     wake: f64,
+    /// Disable LAN sync, run standalone
+    #[arg(long)]
+    solo: bool,
+    /// LAN sync UDP port
+    #[arg(long, default_value_t = 43210)]
+    port: u16,
 }
 
 // -- 全局状态 --
@@ -57,6 +68,41 @@ static STATE: Mutex<StandupState> = Mutex::new(StandupState {
     show_countdown_guard: false,
 });
 
+// -- LAN Sync --
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct Heartbeat {
+    v: u8,
+    id: u64,
+    state: String,
+    secs_to_break: u32,
+    break_secs: u32,
+    work_secs: u32,
+    peers: u8,
+}
+
+#[allow(dead_code)]
+struct PeerInfo {
+    state: String,
+    secs_to_break: u32,
+    break_secs: u32,
+    work_secs: u32,
+    last_seen: Instant,
+}
+
+#[allow(dead_code)]
+struct LanSync {
+    socket: UdpSocket,
+    node_id: u64,
+    port: u16,
+    broadcast_addrs: Vec<String>,
+    peers: HashMap<u64, PeerInfo>,
+    synced: bool,
+}
+
+static LAN_QUEUE: Mutex<VecDeque<Heartbeat>> = Mutex::new(VecDeque::new());
+static LAN_SYNC: Mutex<Option<LanSync>> = Mutex::new(None);
+
 // 定时器和窗口引用，仅在主线程访问
 thread_local! {
     static COUNTDOWN_TIMER: RefCell<Option<Retained<NSTimer>>> = const { RefCell::new(None) };
@@ -64,6 +110,7 @@ thread_local! {
     static WINDOWS: RefCell<Vec<Retained<StandupWindow>>> = const { RefCell::new(Vec::new()) };
     static STATUS_ITEM: RefCell<Option<Retained<NSStatusItem>>> = const { RefCell::new(None) };
     static MENUBAR_TIMER: RefCell<Option<Retained<NSTimer>>> = const { RefCell::new(None) };
+    static HEARTBEAT_TIMER: RefCell<Option<Retained<NSTimer>>> = const { RefCell::new(None) };
 }
 
 // -- MenuDelegate: 菜单项 action 处理 --
@@ -389,6 +436,10 @@ fn setup_menubar(mtm: MainThreadMarker) {
     info_item.setEnabled(false);
     menu.addItem(&info_item);
 
+    let peer_item = new_menu_item(mtm, "Solo mode", None, "");
+    peer_item.setEnabled(false);
+    menu.addItem(&peer_item);
+
     menu.addItem(&NSMenuItem::separatorItem(mtm));
 
     let break_item = new_menu_item(mtm, "Break now", Some(sel!(breakNow:)), "");
@@ -452,15 +503,34 @@ fn update_menubar_title() {
         }
     };
 
+    let peer_count = get_peer_count();
+    let title_with_peers = if peer_count > 0 {
+        format!(" {} [{}]", time_str, peer_count)
+    } else {
+        format!(" {}", time_str)
+    };
+
+    let peer_status = if peer_count > 0 {
+        format!("Synced with {} peer{}", peer_count, if peer_count > 1 { "s" } else { "" })
+    } else if LAN_SYNC.lock().unwrap().is_some() {
+        "No peers".to_string()
+    } else {
+        "Solo mode".to_string()
+    };
+
     with_status_item(|item| {
         let mtm = MainThreadMarker::new().unwrap();
         if let Some(button) = item.button(mtm) {
-            unsafe { set_button_monospaced_title(&button, &format!(" {}", time_str)) };
+            unsafe { set_button_monospaced_title(&button, &title_with_peers) };
             set_button_icon(&button, icon_name);
         }
         if let Some(menu) = item.menu(mtm) {
             if let Some(info_item) = menu.itemAtIndex(0) {
                 info_item.setTitle(&NSString::from_str(&info_title));
+            }
+            // Update peer status item (index 1)
+            if let Some(peer_item) = menu.itemAtIndex(1) {
+                peer_item.setTitle(&NSString::from_str(&peer_status));
             }
         }
     });
@@ -468,6 +538,7 @@ fn update_menubar_title() {
 
 fn start_menubar_timer() {
     let block = RcBlock::new(move |_timer: NonNull<NSTimer>| {
+        process_lan_queue(); // 兜底处理 LAN 消息
         update_menubar_title();
     });
     let timer =
@@ -481,7 +552,7 @@ fn update_skip_menu_title(skip: bool) {
     with_status_item(|item| {
         let mtm = MainThreadMarker::new().unwrap();
         if let Some(menu) = item.menu(mtm) {
-            if let Some(skip_item) = menu.itemAtIndex(3) {
+            if let Some(skip_item) = menu.itemAtIndex(4) {
                 let title = if skip { "Enable next break" } else { "Skip next break" };
                 skip_item.setTitle(&NSString::from_str(title));
             }
@@ -492,6 +563,11 @@ fn update_skip_menu_title(skip: bool) {
 // -- 核心控制函数 --
 
 fn show_countdown() {
+    show_countdown_with(0);
+}
+
+/// 显示 break 倒计时。override_remaining > 0 时用该值作为倒计时，否则用 break_secs。
+fn show_countdown_with(override_remaining: u32) {
     // 防重入：如果已经在 break 中，不再触发
     {
         let state = STATE.lock().unwrap();
@@ -531,13 +607,22 @@ fn show_countdown() {
 
     let break_secs = {
         let mut state = STATE.lock().unwrap();
-        state.remaining_secs = state.break_secs;
+        state.remaining_secs = if override_remaining > 0 {
+            override_remaining
+        } else {
+            state.break_secs
+        };
         state.is_breaking = true;
         state.break_start_time = Some(std::time::SystemTime::now());
-        state.break_secs
+        state.remaining_secs
     };
 
     info!("Break started: {}s ({}m{}s)", break_secs, break_secs / 60, break_secs % 60);
+
+    // LAN sync: 快速广播 break 事件 (0/50/100ms)
+    send_heartbeat();
+    dispatch_after_ms(50, || send_heartbeat());
+    dispatch_after_ms(100, || send_heartbeat());
 
     // 停止工作定时器
     WORK_TIMER.with(|t| invalidate_timer(t));
@@ -622,6 +707,11 @@ fn dismiss_countdown() {
     // 重启工作定时器
     start_work_timer();
 
+    // LAN sync: 快速广播 dismiss 事件 (0/50/100ms)
+    send_heartbeat();
+    dispatch_after_ms(50, || send_heartbeat());
+    dispatch_after_ms(100, || send_heartbeat());
+
     update_menubar_title();
     info!("Break ended, back to work");
 }
@@ -682,6 +772,9 @@ fn ensure_countdown_timer() {
 fn handle_wake() {
     info!("System wake detected");
 
+    // 处理休眠期间堆积的 LAN 消息
+    process_lan_queue();
+
     let (is_breaking, break_secs, break_start_time) = {
         let state = STATE.lock().unwrap();
         (state.is_breaking, state.break_secs, state.break_start_time)
@@ -730,6 +823,320 @@ fn handle_wake() {
 
     ensure_menubar_timer();
     update_menubar_title();
+}
+
+// -- LAN Sync 函数 --
+
+
+/// dispatch_async 到主线程执行闭包
+fn dispatch_async_main(f: impl Fn() + Send + 'static) {
+    let block = RcBlock::new(move |_: NonNull<AnyObject>| {
+        f();
+    });
+    unsafe {
+        let queue: *mut AnyObject = msg_send![
+            AnyClass::get(c"NSOperationQueue").unwrap(),
+            mainQueue
+        ];
+        let _: () = msg_send![queue, addOperationWithBlock: &*block];
+    }
+}
+
+/// dispatch_after 延迟执行（毫秒），必须在主线程调用
+fn dispatch_after_ms(ms: u64, f: impl Fn() + 'static) {
+    let secs = ms as f64 / 1000.0;
+    let block = RcBlock::new(move |_timer: NonNull<NSTimer>| {
+        f();
+    });
+    unsafe {
+        NSTimer::scheduledTimerWithTimeInterval_repeats_block(secs, false, &block);
+    }
+}
+
+fn get_my_secs_to_break() -> u32 {
+    WORK_TIMER.with(|t| match t.borrow().as_ref() {
+        Some(timer) if timer.isValid() => {
+            let diff = timer.fireDate().timeIntervalSinceDate(&NSDate::now());
+            if diff > 0.0 { diff as u32 } else { 0 }
+        }
+        _ => 0,
+    })
+}
+
+fn get_peer_count() -> u8 {
+    let guard = LAN_SYNC.lock().unwrap();
+    match guard.as_ref() {
+        Some(lan) => lan.peers.len() as u8,
+        None => 0,
+    }
+}
+
+fn send_heartbeat() {
+    // 先读取 STATE（不持有 LAN_SYNC 锁），保持一致的锁顺序
+    let (is_breaking, break_secs, work_secs) = {
+        let state = STATE.lock().unwrap();
+        (state.is_breaking, state.break_secs, state.work_secs as u32)
+    };
+
+    let my_state = if is_breaking { "breaking" } else { "working" };
+    // breaking 时 secs_to_break = 剩余 break 秒数; working 时 = 距下次 break 秒数
+    let secs_to_break = if is_breaking {
+        STATE.lock().unwrap().remaining_secs
+    } else {
+        get_my_secs_to_break()
+    };
+
+    let guard = LAN_SYNC.lock().unwrap();
+    let lan = match guard.as_ref() {
+        Some(lan) => lan,
+        None => return,
+    };
+
+    let hb = Heartbeat {
+        v: 1,
+        id: lan.node_id,
+        state: my_state.to_string(),
+        secs_to_break,
+        break_secs,
+        work_secs,
+        peers: (lan.peers.len() + 1) as u8, // +1 for self
+    };
+
+    if let Ok(json) = serde_json::to_vec(&hb) {
+        for addr in &lan.broadcast_addrs {
+            match lan.socket.send_to(&json, addr.as_str()) {
+                Ok(n) => debug!("Heartbeat sent: {} bytes to {}, state={}, secs_to_break={}, peers={}", n, addr, my_state, secs_to_break, hb.peers),
+                Err(e) => warn!("Failed to send heartbeat to {}: {}", addr, e),
+            }
+        }
+    }
+}
+
+fn update_peer(id: u64, hb: &Heartbeat) {
+    let mut guard = LAN_SYNC.lock().unwrap();
+    let lan = match guard.as_mut() {
+        Some(lan) => lan,
+        None => return,
+    };
+
+    lan.peers.insert(id, PeerInfo {
+        state: hb.state.clone(),
+        secs_to_break: hb.secs_to_break,
+        break_secs: hb.break_secs,
+        work_secs: hb.work_secs,
+        last_seen: Instant::now(),
+    });
+}
+
+fn cleanup_stale_peers() {
+    let mut guard = LAN_SYNC.lock().unwrap();
+    let lan = match guard.as_mut() {
+        Some(lan) => lan,
+        None => return,
+    };
+
+    let before = lan.peers.len();
+    lan.peers.retain(|_id, peer| peer.last_seen.elapsed().as_secs() < 9);
+    let removed = before - lan.peers.len();
+    if removed > 0 {
+        info!("Cleaned up {} stale peers, {} remaining", removed, lan.peers.len());
+    }
+}
+
+fn apply_sync_rules(hb: &Heartbeat) {
+    // 分别获取锁，避免死锁
+    let is_breaking = STATE.lock().unwrap().is_breaking;
+    let synced = LAN_SYNC.lock().unwrap().as_ref().map_or(true, |lan| lan.synced);
+
+    // Rule 0: 首次同步 — 采纳 peer 的 config 和 timing
+    if !synced && hb.state == "working" {
+        info!(
+            "Rule 0: first sync from peer {:x}, adopting config work={}s break={}s, break in {}s",
+            hb.id, hb.work_secs, hb.break_secs, hb.secs_to_break
+        );
+        {
+            let mut state = STATE.lock().unwrap();
+            state.work_secs = hb.work_secs as f64;
+            state.break_secs = hb.break_secs;
+        }
+        {
+            let mut guard = LAN_SYNC.lock().unwrap();
+            if let Some(lan) = guard.as_mut() {
+                lan.synced = true;
+            }
+        }
+        start_work_timer_with(hb.secs_to_break as f64);
+        return;
+    }
+
+    if !synced && hb.state == "breaking" {
+        info!(
+            "Rule 0: first sync, peer {:x} is breaking ({}s remaining), joining",
+            hb.id, hb.secs_to_break
+        );
+        {
+            let mut guard = LAN_SYNC.lock().unwrap();
+            if let Some(lan) = guard.as_mut() {
+                lan.synced = true;
+            }
+        }
+        // 采纳 peer 的 config，用 peer 的剩余时间作为倒计时
+        {
+            let mut state = STATE.lock().unwrap();
+            state.work_secs = hb.work_secs as f64;
+            state.break_secs = hb.break_secs;
+        }
+        show_countdown_with(hb.secs_to_break);
+        return;
+    }
+
+    // Rule 3: breaking 时，如果 peer 是 working → 跟着退出 break
+    if is_breaking {
+        if hb.state == "working" {
+            info!("Rule 3: peer {:x} is working while we're breaking, dismissing", hb.id);
+            dismiss_countdown();
+        }
+        return;
+    }
+
+    // Rule 2: peer 正在 break → 立刻 break，同步剩余时间
+    if hb.state == "breaking" {
+        {
+            let mut state = STATE.lock().unwrap();
+            if hb.break_secs > state.break_secs {
+                state.break_secs = hb.break_secs;
+            }
+        }
+        info!("Rule 2: peer {:x} is breaking ({}s remaining), triggering break", hb.id, hb.secs_to_break);
+        show_countdown_with(hb.secs_to_break);
+        return;
+    }
+
+    // Rule 1: 跟随更早的 break
+    if hb.state == "working" {
+        let my_secs = get_my_secs_to_break();
+        if my_secs > 0 && hb.secs_to_break + 5 < my_secs {
+            info!(
+                "Rule 1: synced to peer {:x}, break in {}s (was {}s)",
+                hb.id, hb.secs_to_break, my_secs
+            );
+            start_work_timer_with(hb.secs_to_break as f64);
+        }
+    }
+}
+
+fn process_lan_queue() {
+    let messages: Vec<Heartbeat> = LAN_QUEUE.lock().unwrap().drain(..).collect();
+    for hb in messages {
+        update_peer(hb.id, &hb);
+        apply_sync_rules(&hb);
+    }
+    cleanup_stale_peers();
+}
+
+fn start_heartbeat_timer() {
+    let block = RcBlock::new(move |_timer: NonNull<NSTimer>| {
+        send_heartbeat();
+    });
+    let timer =
+        unsafe { NSTimer::scheduledTimerWithTimeInterval_repeats_block(3.0, true, &block) };
+    HEARTBEAT_TIMER.with(|t| {
+        *t.borrow_mut() = Some(timer);
+    });
+    info!("Heartbeat timer started (3s interval)");
+}
+
+/// 获取所有活跃网络接口的子网广播地址 (假设 /24)
+fn detect_broadcast_addrs(port: u16) -> Vec<String> {
+    use std::process::Command;
+    let mut addrs = Vec::new();
+    // 解析 ifconfig 获取所有 broadcast 地址
+    if let Ok(output) = Command::new("ifconfig").output() {
+        let text = String::from_utf8_lossy(&output.stdout);
+        for line in text.lines() {
+            let line = line.trim();
+            // macOS ifconfig 格式: "inet 192.168.0.100 netmask 0xffffff00 broadcast 192.168.0.255"
+            if let Some(idx) = line.find("broadcast ") {
+                let bcast = line[idx + 10..].split_whitespace().next().unwrap_or("");
+                if !bcast.is_empty() && bcast != "127.255.255.255" {
+                    let addr = format!("{}:{}", bcast, port);
+                    if !addrs.contains(&addr) {
+                        addrs.push(addr);
+                    }
+                }
+            }
+        }
+    }
+    if addrs.is_empty() {
+        addrs.push(format!("255.255.255.255:{}", port));
+    }
+    info!("Broadcast addresses: {:?}", addrs);
+    addrs
+}
+
+fn create_udp_socket(port: u16) -> Result<UdpSocket, Box<dyn std::error::Error>> {
+    let socket = UdpSocket::bind(("0.0.0.0", port))?;
+    socket.set_broadcast(true)?;
+    Ok(socket)
+}
+
+fn start_lan_sync(port: u16) -> Result<(), Box<dyn std::error::Error>> {
+    let node_id: u64 = rand::thread_rng().gen();
+
+    // 两个独立 socket：recv 绑定目标端口收包，send 用 ephemeral port 发包
+    let recv_socket = create_udp_socket(port)?;
+    let send_socket = UdpSocket::bind("0.0.0.0:0")?;
+    send_socket.set_broadcast(true)?;
+    let broadcast_addrs = detect_broadcast_addrs(port);
+
+    info!("LAN sync started: node_id={:x}, port={}", node_id, port);
+
+    *LAN_SYNC.lock().unwrap() = Some(LanSync {
+        socket: send_socket,
+        node_id,
+        port,
+        broadcast_addrs,
+        peers: HashMap::new(),
+        synced: false,
+    });
+
+    let my_node_id = node_id;
+    std::thread::spawn(move || {
+        let mut buf = [0u8; 1024];
+        loop {
+            match recv_socket.recv_from(&mut buf) {
+                Ok((len, addr)) => {
+                    debug!("UDP recv: {} bytes from {}", len, addr);
+                    match serde_json::from_slice::<Heartbeat>(&buf[..len]) {
+                    Err(e) => {
+                        let raw = String::from_utf8_lossy(&buf[..len.min(200)]);
+                        warn!("JSON parse error: {}, raw: {}", e, raw);
+                    }
+                    Ok(hb) => {
+                        if hb.id == my_node_id {
+                            debug!("Ignoring own heartbeat");
+                            continue;
+                        }
+                        debug!("Heartbeat from {:x} @ {}: state={}, secs_to_break={}, peers={}", hb.id, addr, hb.state, hb.secs_to_break, hb.peers);
+
+                        let is_breaking = hb.state == "breaking";
+                        LAN_QUEUE.lock().unwrap().push_back(hb);
+
+                        // break 事件立即 dispatch 到主线程处理
+                        if is_breaking {
+                            dispatch_async_main(|| process_lan_queue());
+                        }
+                    }
+                    }
+                }
+                Err(e) => {
+                    warn!("UDP recv error: {}", e);
+                }
+            }
+        }
+    });
+
+    Ok(())
 }
 
 fn main() {
@@ -791,9 +1198,23 @@ fn main() {
     }
     info!("Registered NSWorkspaceDidWakeNotification handler");
 
+    // 启动 LAN sync
+    if !args.solo {
+        match start_lan_sync(args.port) {
+            Ok(()) => {
+                start_heartbeat_timer();
+            }
+            Err(e) => {
+                warn!("Failed to start LAN sync: {}, running solo", e);
+            }
+        }
+    } else {
+        info!("Solo mode, LAN sync disabled");
+    }
+
     info!(
-        "Standup running: work={:.1}m, break={:.1}m, wake={:.1}m",
-        args.work, args.brk, args.wake
+        "Standup running: work={:.1}m, break={:.1}m, wake={:.1}m, solo={}",
+        args.work, args.brk, args.wake, args.solo
     );
 
     app.run();

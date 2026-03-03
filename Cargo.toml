@@ -126,9 +126,11 @@ objc2-core-graphics = { version = "0.3.2", features = [
 ] }
 objc2-vision = { version = "0.3.2", features = [
     "VNRecognizeTextRequest",
+    "VNDetectBarcodesRequest",
     "VNRequestHandler",
     "VNRequest",
     "VNObservation",
+    "VNTypes",
     "objc2-core-graphics",
 ] }
 objc2-avf-audio = { version = "0.3.2", features = [
@@ -170,3 +172,4 @@ regex = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["local-time", "env-filter"] }
 time = { version = "0.3", features = ["local-offset", "formatting", "macros"] }
+rand = "0.8"

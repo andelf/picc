@@ -553,11 +553,20 @@ fn clone_step(step: &LocatorStep) -> LocatorStep {
         LocatorStep::DomId(id) => LocatorStep::DomId(id.clone()),
         LocatorStep::DomClass(c) => LocatorStep::DomClass(c.clone()),
         LocatorStep::Query(q) => LocatorStep::Query(q.clone()),
-        LocatorStep::Filter(_) => {
-            // FilterCriteria contains Box<Locator> and fn pointers; skip in clone.
-            // This is only used for has/has_not sub-locator re-rooting, where the
-            // filter step itself won't contain nested filters in practice.
-            LocatorStep::Filter(FilterCriteria::new())
+        LocatorStep::Filter(criteria) => {
+            LocatorStep::Filter(FilterCriteria {
+                has_text: criteria.has_text.clone(),
+                has_not_text: criteria.has_not_text.clone(),
+                has: criteria.has.as_ref().map(|loc| Box::new(Locator {
+                    root: loc.root.clone(),
+                    steps: loc.steps.iter().map(clone_step).collect(),
+                })),
+                has_not: criteria.has_not.as_ref().map(|loc| Box::new(Locator {
+                    root: loc.root.clone(),
+                    steps: loc.steps.iter().map(clone_step).collect(),
+                })),
+                predicate: criteria.predicate,
+            })
         }
         LocatorStep::Nth(n) => LocatorStep::Nth(*n),
         LocatorStep::First => LocatorStep::First,
@@ -574,5 +583,145 @@ impl std::fmt::Debug for Locator {
         f.debug_struct("Locator")
             .field("steps", &self.steps.len())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use objc2_application_services::AXUIElement;
+    use objc2_core_foundation::CFRetained;
+
+    /// Helper: create a dummy AXUIElement (system-wide) for constructing Locators.
+    fn dummy_element() -> CFRetained<AXUIElement> {
+        unsafe { AXUIElement::new_system_wide() }
+    }
+
+    #[test]
+    fn clone_step_preserves_filter_has_text() {
+        let mut criteria = FilterCriteria::new();
+        criteria.has_text("hello");
+
+        let step = LocatorStep::Filter(criteria);
+        let cloned = clone_step(&step);
+
+        if let LocatorStep::Filter(c) = cloned {
+            assert_eq!(c.has_text.as_deref(), Some("hello"));
+        } else {
+            panic!("expected Filter step");
+        }
+    }
+
+    #[test]
+    fn clone_step_preserves_filter_has_not_text() {
+        let mut criteria = FilterCriteria::new();
+        criteria.has_not_text("world");
+
+        let step = LocatorStep::Filter(criteria);
+        let cloned = clone_step(&step);
+
+        if let LocatorStep::Filter(c) = cloned {
+            assert_eq!(c.has_not_text.as_deref(), Some("world"));
+        } else {
+            panic!("expected Filter step");
+        }
+    }
+
+    #[test]
+    fn clone_step_preserves_nested_has_locator() {
+        let inner_locator = Locator {
+            root: dummy_element(),
+            steps: vec![LocatorStep::Role("AXButton".to_string())],
+        };
+        let mut criteria = FilterCriteria::new();
+        criteria.has(inner_locator);
+
+        let step = LocatorStep::Filter(criteria);
+        let cloned = clone_step(&step);
+
+        if let LocatorStep::Filter(c) = cloned {
+            assert!(c.has.is_some());
+            let inner = c.has.unwrap();
+            assert_eq!(inner.steps.len(), 1);
+            if let LocatorStep::Role(r) = &inner.steps[0] {
+                assert_eq!(r, "AXButton");
+            } else {
+                panic!("expected Role step inside has locator");
+            }
+        } else {
+            panic!("expected Filter step");
+        }
+    }
+
+    #[test]
+    fn clone_step_preserves_nested_has_not_locator() {
+        let inner_locator = Locator {
+            root: dummy_element(),
+            steps: vec![LocatorStep::Text("foo".to_string())],
+        };
+        let mut criteria = FilterCriteria::new();
+        criteria.has_not(inner_locator);
+
+        let step = LocatorStep::Filter(criteria);
+        let cloned = clone_step(&step);
+
+        if let LocatorStep::Filter(c) = cloned {
+            assert!(c.has_not.is_some());
+        } else {
+            panic!("expected Filter step");
+        }
+    }
+
+    #[test]
+    fn clone_step_preserves_predicate() {
+        fn my_pred(_: &AXNode) -> bool { true }
+
+        let mut criteria = FilterCriteria::new();
+        criteria.predicate(my_pred);
+
+        let step = LocatorStep::Filter(criteria);
+        let cloned = clone_step(&step);
+
+        if let LocatorStep::Filter(c) = cloned {
+            assert!(c.predicate.is_some());
+        } else {
+            panic!("expected Filter step");
+        }
+    }
+
+    #[test]
+    fn clone_step_simple_variants() {
+        assert!(matches!(clone_step(&LocatorStep::Nth(5)), LocatorStep::Nth(5)));
+        assert!(matches!(clone_step(&LocatorStep::First), LocatorStep::First));
+        assert!(matches!(clone_step(&LocatorStep::Last), LocatorStep::Last));
+
+        if let LocatorStep::Role(r) = clone_step(&LocatorStep::Role("AXButton".into())) {
+            assert_eq!(r, "AXButton");
+        } else {
+            panic!("expected Role");
+        }
+
+        if let LocatorStep::Text(t) = clone_step(&LocatorStep::Text("hello".into())) {
+            assert_eq!(t, "hello");
+        } else {
+            panic!("expected Text");
+        }
+    }
+
+    #[test]
+    fn clone_step_empty_filter() {
+        let criteria = FilterCriteria::new();
+        let step = LocatorStep::Filter(criteria);
+        let cloned = clone_step(&step);
+
+        if let LocatorStep::Filter(c) = cloned {
+            assert!(c.has_text.is_none());
+            assert!(c.has_not_text.is_none());
+            assert!(c.has.is_none());
+            assert!(c.has_not.is_none());
+            assert!(c.predicate.is_none());
+        } else {
+            panic!("expected Filter step");
+        }
     }
 }

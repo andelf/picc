@@ -1,6 +1,8 @@
 pub mod accessibility;
+pub mod actions;
 pub mod avfaudio;
 pub mod core_graphics;
+pub mod error;
 pub mod input;
 pub mod locator;
 pub mod screenshot;

@@ -233,3 +233,98 @@ pub fn scroll_wheel(x: f64, y: f64, dx: i32, dy: i32) {
         CGEvent::post(CGEventTapLocation::HIDEventTap, Some(ev));
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_single_key_enter() {
+        let (keycode, flags) = parse_key_combo("Enter");
+        assert_eq!(keycode, 36);
+        assert_eq!(flags, 0);
+    }
+
+    #[test]
+    fn parse_single_key_tab() {
+        let (keycode, flags) = parse_key_combo("Tab");
+        assert_eq!(keycode, 48);
+        assert_eq!(flags, 0);
+    }
+
+    #[test]
+    fn parse_single_key_escape() {
+        let (keycode, flags) = parse_key_combo("Escape");
+        assert_eq!(keycode, 53);
+        assert_eq!(flags, 0);
+    }
+
+    #[test]
+    fn parse_control_a() {
+        let (keycode, flags) = parse_key_combo("Control+a");
+        assert_eq!(keycode, 0); // 'a'
+        assert_eq!(flags, 0x40000); // Control
+    }
+
+    #[test]
+    fn parse_command_shift_v() {
+        let (keycode, flags) = parse_key_combo("Command+Shift+v");
+        assert_eq!(keycode, 9); // 'v'
+        assert_eq!(flags, 0x100000 | 0x20000); // Command + Shift
+    }
+
+    #[test]
+    fn parse_command_a() {
+        let (keycode, flags) = parse_key_combo("Command+a");
+        assert_eq!(keycode, 0); // 'a'
+        assert_eq!(flags, 0x100000); // Command
+    }
+
+    #[test]
+    fn parse_alt_option() {
+        let (_keycode, flags) = parse_key_combo("Alt+a");
+        assert_eq!(flags, 0x80000); // Option
+
+        let (_, flags2) = parse_key_combo("Option+a");
+        assert_eq!(flags2, 0x80000);
+    }
+
+    #[test]
+    fn parse_function_keys() {
+        assert_eq!(parse_key_combo("F1").0, 122);
+        assert_eq!(parse_key_combo("F5").0, 96);
+        assert_eq!(parse_key_combo("F12").0, 111);
+    }
+
+    #[test]
+    fn parse_arrow_keys() {
+        assert_eq!(parse_key_combo("Left").0, 123);
+        assert_eq!(parse_key_combo("Right").0, 124);
+        assert_eq!(parse_key_combo("Down").0, 125);
+        assert_eq!(parse_key_combo("Up").0, 126);
+    }
+
+    #[test]
+    fn parse_delete_backspace() {
+        assert_eq!(parse_key_combo("Delete").0, 51);
+        assert_eq!(parse_key_combo("Backspace").0, 51);
+    }
+
+    #[test]
+    fn parse_space() {
+        assert_eq!(parse_key_combo("Space").0, 49);
+    }
+
+    #[test]
+    fn parse_single_letter_keys() {
+        assert_eq!(parse_key_combo("a").0, 0);
+        assert_eq!(parse_key_combo("z").0, 6);
+        assert_eq!(parse_key_combo("q").0, 12);
+    }
+
+    #[test]
+    fn parse_number_keys() {
+        assert_eq!(parse_key_combo("1").0, 18);
+        assert_eq!(parse_key_combo("0").0, 29);
+    }
+}

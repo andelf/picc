@@ -1242,65 +1242,25 @@ fn execute_external_action(
     pid: i32,
     req: ActionRequest,
 ) -> io::Result<()> {
-    use objc2_app_kit::NSRunningApplication;
-    use objc2_core_foundation::CGPoint;
-    use objc2_core_graphics::{
-        CGEvent, CGEventSource, CGEventSourceStateID, CGEventTapLocation, CGEventType,
-        CGMouseButton,
-    };
-
     // Leave alternate screen
     crossterm::execute!(terminal.backend_mut(), LeaveAlternateScreen)?;
     terminal::disable_raw_mode()?;
 
     // Activate target app
-    let ns_app = NSRunningApplication::runningApplicationWithProcessIdentifier(pid);
-    if let Some(ns_app) = ns_app {
-        #[allow(deprecated)]
-        ns_app.activateWithOptions(
-            objc2_app_kit::NSApplicationActivationOptions::ActivateIgnoringOtherApps,
-        );
-    }
+    picc::input::activate_app(pid);
     std::thread::sleep(Duration::from_millis(200));
 
-    let point = match &req {
-        ActionRequest::MoveTo { x, y } | ActionRequest::Click { x, y } => CGPoint { x: *x, y: *y },
+    let (x, y) = match &req {
+        ActionRequest::MoveTo { x, y } | ActionRequest::Click { x, y } => (*x, *y),
     };
 
     // Move mouse
-    let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState);
-    let move_ev = CGEvent::new_mouse_event(
-        source.as_deref(),
-        CGEventType::MouseMoved,
-        point,
-        CGMouseButton::Left,
-    );
-    if let Some(ref ev) = move_ev {
-        CGEvent::post(CGEventTapLocation::HIDEventTap, Some(ev));
-    }
+    picc::input::mouse_move(x, y);
 
     // Click if requested
     if matches!(req, ActionRequest::Click { .. }) {
         std::thread::sleep(Duration::from_millis(50));
-        let down = CGEvent::new_mouse_event(
-            source.as_deref(),
-            CGEventType::LeftMouseDown,
-            point,
-            CGMouseButton::Left,
-        );
-        let up = CGEvent::new_mouse_event(
-            source.as_deref(),
-            CGEventType::LeftMouseUp,
-            point,
-            CGMouseButton::Left,
-        );
-        if let Some(ref ev) = down {
-            CGEvent::post(CGEventTapLocation::HIDEventTap, Some(ev));
-        }
-        std::thread::sleep(Duration::from_millis(50));
-        if let Some(ref ev) = up {
-            CGEvent::post(CGEventTapLocation::HIDEventTap, Some(ev));
-        }
+        picc::input::mouse_click(x, y);
     }
 
     // Let user see the effect
