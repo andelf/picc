@@ -200,6 +200,11 @@ enum Command {
         /// Output file path
         #[arg(short, long)]
         output: Option<String>,
+        /// Run OCR on the captured image (Vision framework, zh-Hans + en-US).
+        /// Note: OCR results may be inaccurate — consider using a multimodal model
+        /// to read the screenshot directly if OCR output is unsatisfactory.
+        #[arg(long)]
+        ocr: bool,
     },
     /// Wait for element or milliseconds
     Wait {
@@ -275,8 +280,8 @@ fn run(cli: Cli) -> Result<(), AxError> {
         Command::Scroll { locator, direction, pixels } => {
             cmd_scroll(&ctx, &locator, &direction, pixels)
         }
-        Command::Screenshot { locator, output } => {
-            cmd_screenshot(&ctx, locator.as_deref(), output.as_deref())
+        Command::Screenshot { locator, output, ocr } => {
+            cmd_screenshot(&ctx, locator.as_deref(), output.as_deref(), ocr)
         }
         Command::Wait { target } => cmd_wait(&ctx, &target),
         Command::Get { attr, locator, all } => cmd_get(&ctx, &attr, &locator, all),
@@ -636,7 +641,7 @@ fn cmd_scroll(ctx: &ExecutionContext, locator: &str, direction: &str, pixels: i3
     Ok(())
 }
 
-fn cmd_screenshot(ctx: &ExecutionContext, locator: Option<&str>, output: Option<&str>) -> Result<(), AxError> {
+fn cmd_screenshot(ctx: &ExecutionContext, locator: Option<&str>, output: Option<&str>, ocr: bool) -> Result<(), AxError> {
     // Bring app to foreground so it's visible for screen capture
     ctx.activate();
     // Extra delay for screenshot
@@ -678,12 +683,39 @@ fn cmd_screenshot(ctx: &ExecutionContext, locator: Option<&str>, output: Option<
 
     let image = screenshot::capture(rect)
         .ok_or_else(|| AxError::ScreenshotFailed("capture failed".to_string()))?;
-    if screenshot::save_png(&image, &path) {
-        eprintln!("Saved: {path}");
-        Ok(())
-    } else {
-        Err(AxError::ScreenshotFailed(format!("failed to save {path}")))
+    if !screenshot::save_png(&image, &path) {
+        return Err(AxError::ScreenshotFailed(format!("failed to save {path}")));
     }
+    eprintln!("Saved: {path}");
+
+    if ocr {
+        use objc2_foundation::{NSArray, NSString};
+        use picc::vision;
+
+        let text_req = vision::VNRecognizeTextRequest::new();
+        let zh = NSString::from_str("zh-Hans");
+        let en = NSString::from_str("en-US");
+        let lang = NSArray::from_slice(&[&*zh, &*en]);
+        text_req.setRecognitionLanguages(&lang);
+
+        let text_req_ref: &vision::VNRequest =
+            unsafe { &*((&*text_req) as *const _ as *const vision::VNRequest) };
+        let reqs = NSArray::from_slice(&[text_req_ref]);
+        let handler = vision::new_handler_with_cgimage(&image);
+        vision::perform_requests(&handler, &reqs)
+            .map_err(|e| AxError::ScreenshotFailed(format!("OCR failed: {e}")))?;
+
+        if let Some(results) = text_req.results() {
+            for item in results.iter() {
+                let candidates = item.topCandidates(1);
+                for candidate in candidates.iter() {
+                    println!("{}", candidate.string());
+                }
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn cmd_wait(ctx: &ExecutionContext, target: &str) -> Result<(), AxError> {

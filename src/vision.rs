@@ -4,13 +4,14 @@
 
 pub use objc2_vision::{
     VNImageRequestHandler, VNRecognizeTextRequest, VNRecognizedText, VNRecognizedTextObservation,
+    VNRequest,
 };
 
 use objc2::rc::Retained;
 use objc2::AnyThread;
 use objc2_core_graphics::CGImage;
 use objc2_foundation::{NSArray, NSError, NSURL};
-use objc2_vision::{VNImageOption, VNRequest};
+use objc2_vision::VNImageOption;
 use objc2::runtime::AnyObject;
 
 pub fn new_handler_with_cgimage(
