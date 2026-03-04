@@ -1080,24 +1080,44 @@ struct AttrBracket<'a> {
 }
 
 /// Parse the content between `[` and `]` into attr, operator, value.
+///
+/// Finds the first unquoted `=` to split attr from value, then checks the
+/// preceding char for a 2-char operator (`*=`, `^=`, `$=`).  This avoids
+/// false matches when operator chars appear inside the quoted value.
 fn parse_attr_bracket(inner: &str) -> Option<AttrBracket<'_>> {
-    // Try 2-char operators first (*=, ^=, $=)
-    for (suffix, op) in [("*=", AttrOp::Contains), ("^=", AttrOp::StartsWith), ("$=", AttrOp::EndsWith)] {
-        if let Some(pos) = inner.find(suffix) {
-            return Some(AttrBracket {
-                attr: &inner[..pos],
-                op,
-                val: inner[pos + 2..].trim_matches('"'),
-            });
+    // Find the first `=` that is NOT inside quotes.
+    let mut in_quote = false;
+    let mut eq_pos = None;
+    for (i, ch) in inner.char_indices() {
+        if ch == '"' {
+            in_quote = !in_quote;
+        } else if ch == '=' && !in_quote {
+            eq_pos = Some(i);
+            break;
         }
     }
-    // Fallback: exact match (single =)
-    let (attr, val_quoted) = inner.split_once('=')?;
-    Some(AttrBracket {
-        attr,
-        op: AttrOp::Exact,
-        val: val_quoted.trim_matches('"'),
-    })
+    let eq_pos = eq_pos?;
+
+    // Determine operator by inspecting the char before `=`.
+    let (attr, op, val_start) = if eq_pos > 0 {
+        match inner.as_bytes()[eq_pos - 1] {
+            b'*' => (&inner[..eq_pos - 1], AttrOp::Contains, eq_pos + 1),
+            b'^' => (&inner[..eq_pos - 1], AttrOp::StartsWith, eq_pos + 1),
+            b'$' => (&inner[..eq_pos - 1], AttrOp::EndsWith, eq_pos + 1),
+            _ => (&inner[..eq_pos], AttrOp::Exact, eq_pos + 1),
+        }
+    } else {
+        // `=` is the first char → empty attr name
+        return None;
+    };
+
+    let attr = attr.trim();
+    if attr.is_empty() {
+        return None;
+    }
+
+    let val = inner[val_start..].trim_matches('"');
+    Some(AttrBracket { attr, op, val })
 }
 
 fn element_matches_base_selector(el: &AXUIElement, selector: &str) -> bool {
@@ -1148,7 +1168,10 @@ fn element_matches_base_selector(el: &AXUIElement, selector: &str) -> bool {
         if !role_matches(&el_role, role) {
             return false;
         }
-        let inner = &selector[bracket_start + 1..selector.len() - 1];
+        let remainder = &selector[bracket_start + 1..];
+        let Some(inner) = remainder.strip_suffix(']') else {
+            return false;
+        };
         if let Some(ab) = parse_attr_bracket(inner) {
             let field = match ab.attr {
                 "title" | "name" => attr_string(el, "AXTitle"),
@@ -1614,5 +1637,82 @@ mod tests {
     fn attr_op_ends_with() {
         assert!(AttrOp::EndsWith.matches("hello world", "world"));
         assert!(!AttrOp::EndsWith.matches("hello world", "hello"));
+    }
+
+    // --- Edge case tests for bracket parser fixes ---
+
+    #[test]
+    fn parse_unclosed_bracket_returns_none() {
+        // Missing closing quote — still parseable as attr content
+        let ab = parse_attr_bracket(r#"title="Send"#);
+        assert!(ab.is_some()); // just strips quotes
+        // But truly missing `=` is None
+        assert!(parse_attr_bracket("title").is_none());
+    }
+
+    #[test]
+    fn parse_empty_attr_returns_none() {
+        // `="val"` has no attribute name
+        assert!(parse_attr_bracket(r#"="val""#).is_none());
+    }
+
+    #[test]
+    fn parse_value_containing_operator_chars() {
+        // Value `a*=b` should be parsed as exact match with val `a*=b`,
+        // NOT as contains-operator with attr `title` and val `b`.
+        let ab = parse_attr_bracket(r#"title="a*=b""#).unwrap();
+        assert_eq!(ab.attr, "title");
+        assert_eq!(ab.op, AttrOp::Exact);
+        assert_eq!(ab.val, "a*=b");
+    }
+
+    #[test]
+    fn parse_value_containing_caret_equals() {
+        let ab = parse_attr_bracket(r#"name="x^=y""#).unwrap();
+        assert_eq!(ab.attr, "name");
+        assert_eq!(ab.op, AttrOp::Exact);
+        assert_eq!(ab.val, "x^=y");
+    }
+
+    #[test]
+    fn parse_value_containing_dollar_equals() {
+        let ab = parse_attr_bracket(r#"desc="a$=b""#).unwrap();
+        assert_eq!(ab.attr, "desc");
+        assert_eq!(ab.op, AttrOp::Exact);
+        assert_eq!(ab.val, "a$=b");
+    }
+
+    #[test]
+    fn parse_empty_value() {
+        let ab = parse_attr_bracket(r#"title="""#).unwrap();
+        assert_eq!(ab.attr, "title");
+        assert_eq!(ab.op, AttrOp::Exact);
+        assert_eq!(ab.val, "");
+    }
+
+    #[test]
+    fn parse_whitespace_around_attr() {
+        let ab = parse_attr_bracket(r#" title ="Send""#).unwrap();
+        assert_eq!(ab.attr, "title");
+        assert_eq!(ab.op, AttrOp::Exact);
+        assert_eq!(ab.val, "Send");
+    }
+
+    #[test]
+    fn parse_contains_with_operator_in_value() {
+        // `name*="a*=b"` — real contains operator, value happens to have `*=`
+        let ab = parse_attr_bracket(r#"name*="a*=b""#).unwrap();
+        assert_eq!(ab.attr, "name");
+        assert_eq!(ab.op, AttrOp::Contains);
+        assert_eq!(ab.val, "a*=b");
+    }
+
+    #[test]
+    fn no_panic_on_various_malformed_inputs() {
+        // None of these should panic
+        let cases = ["", "=", "*=", "^=", "$=", "[", "]", "[]", r#""""#, "a*"];
+        for case in cases {
+            let _ = parse_attr_bracket(case);
+        }
     }
 }
