@@ -42,6 +42,7 @@ Locator syntax:
   Role[attr*=\"val\"]         Contains          e.g. radiobutton[name*=\"Tab Title\"]
   Role[attr^=\"val\"]         Starts with       e.g. AXWindow[title^=\"Chat\"]
   Role[attr$=\"val\"]         Ends with         e.g. text[desc$=\"ago\"]
+  Bracket attrs: title (AXTitle, alias: name), desc (AXDescription), text (AXValue)
   text=VALUE                Exact text       e.g. text=\"Hello\"
   text~=VALUE               Contains text    e.g. text~=\"partial\"
   text=/regex/flags         Regex text       e.g. text=/\\d+条新消息/, text=/Log\\s*in/i
@@ -286,7 +287,10 @@ fn main() {
 
     // list-apps doesn't need --app/--pid
     if matches!(cli.command, Command::ListApps) {
-        cmd_list_apps();
+        if let Err(e) = cmd_list_apps() {
+            eprintln!("error: {e}");
+            std::process::exit(exit_code(&e));
+        }
         return;
     }
 
@@ -336,7 +340,8 @@ fn resolve_app(cli: &Cli) -> Result<(i32, AXNode), AxError> {
         return Ok((pid, AXNode::app(pid)));
     }
     if let Some(ref name) = cli.app {
-        let mtm = objc2::MainThreadMarker::new().expect("must run on main thread");
+        let mtm = objc2::MainThreadMarker::new()
+            .ok_or_else(|| AxError::InvalidArgument("must run on main thread".to_string()))?;
         match accessibility::find_app_by_name(mtm, name) {
             Some((pid, localized)) => {
                 eprintln!("Found app: {localized} (pid={pid})");
@@ -448,14 +453,29 @@ fn is_menu_role(role: &str) -> bool {
     role == "AXMenuItem" || role == "AXMenuBarItem"
 }
 
+/// Try AXFocused, fall back to clicking element center.
+fn ensure_focused(ctx: &ExecutionContext, node: &AXNode) -> Result<(), AxError> {
+    if !node.set_focused(true) {
+        let (cx, cy) = ctx.element_center(node, false)?;
+        eprintln!("AXFocused failed, clicking to focus...");
+        input::mouse_move(cx, cy);
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        input::mouse_click(cx, cy);
+    }
+    std::thread::sleep(std::time::Duration::from_millis(200));
+    Ok(())
+}
+
 // --- Commands ---
 
-fn cmd_list_apps() {
+fn cmd_list_apps() -> Result<(), AxError> {
     use objc2_app_kit::NSRunningApplication;
 
-    let mtm = objc2::MainThreadMarker::new().expect("must run on main thread");
+    let mtm = objc2::MainThreadMarker::new()
+        .ok_or_else(|| AxError::InvalidArgument("must run on main thread".to_string()))?;
     let _ = mtm;
-    let workspace_cls = objc2::runtime::AnyClass::get(c"NSWorkspace").unwrap();
+    let workspace_cls = objc2::runtime::AnyClass::get(c"NSWorkspace")
+        .ok_or_else(|| AxError::InvalidArgument("NSWorkspace class not found".to_string()))?;
     let workspace: objc2::rc::Retained<objc2::runtime::NSObject> =
         unsafe { objc2::msg_send![workspace_cls, sharedWorkspace] };
     let apps: objc2::rc::Retained<objc2_foundation::NSArray<NSRunningApplication>> =
@@ -482,6 +502,7 @@ fn cmd_list_apps() {
         println!("{pid:>6}  {name:<30} {bundle}");
     }
     eprintln!("\n({} apps)", entries.len());
+    Ok(())
 }
 
 fn cmd_snapshot(ctx: &ExecutionContext, locator: Option<&str>, depth: usize, all: bool, max_text_len: usize, simplify: bool) -> Result<(), AxError> {
@@ -564,16 +585,7 @@ fn cmd_input(ctx: &ExecutionContext, locator: &str, text: &str) -> Result<(), Ax
     let node = resolve_one(ctx, locator)?;
 
     ctx.activate();
-
-    // Focus
-    if !node.set_focused(true) {
-        let (cx, cy) = ctx.element_center(&node, false)?;
-        eprintln!("AXFocused failed, clicking to focus...");
-        input::mouse_move(cx, cy);
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        input::mouse_click(cx, cy);
-    }
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    ensure_focused(ctx, &node)?;
 
     eprintln!("Typing: {text:?}");
     input::type_text(text);
@@ -584,16 +596,7 @@ fn cmd_fill(ctx: &ExecutionContext, locator: &str, text: &str) -> Result<(), AxE
     let node = resolve_one(ctx, locator)?;
 
     ctx.activate();
-
-    // Focus
-    if !node.set_focused(true) {
-        let (cx, cy) = ctx.element_center(&node, false)?;
-        eprintln!("AXFocused failed, clicking to focus...");
-        input::mouse_move(cx, cy);
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        input::mouse_click(cx, cy);
-    }
-    std::thread::sleep(std::time::Duration::from_millis(200));
+    ensure_focused(ctx, &node)?;
 
     // Select all + delete
     let (kc_a, fl_a) = input::parse_key_combo("Command+a");
@@ -632,16 +635,8 @@ fn cmd_focus(ctx: &ExecutionContext, locator: &str) -> Result<(), AxError> {
     let node = resolve_one(ctx, locator)?;
 
     ctx.activate();
-
-    if node.set_focused(true) {
-        eprintln!("Focused via AXFocused");
-    } else {
-        let (cx, cy) = ctx.element_center(&node, false)?;
-        eprintln!("AXFocused failed, clicking to focus...");
-        input::mouse_move(cx, cy);
-        std::thread::sleep(std::time::Duration::from_millis(50));
-        input::mouse_click(cx, cy);
-    }
+    ensure_focused(ctx, &node)?;
+    eprintln!("Focused");
     Ok(())
 }
 
@@ -693,7 +688,7 @@ fn cmd_screenshot(ctx: &ExecutionContext, locator: Option<&str>, output: Option<
         .unwrap_or_else(|| {
             let ts = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
+                .unwrap_or_default()
                 .as_secs();
             format!("/tmp/ax_screenshot_{ts}.png")
         });
