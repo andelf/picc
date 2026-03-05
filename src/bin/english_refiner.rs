@@ -1,9 +1,11 @@
-//! English grammar/spelling correction hook for Claude Code UserPromptSubmit.
+//! English grammar/spelling correction & Chinese-to-English translation hook
+//! for Claude Code UserPromptSubmit.
 //!
-//! Uses Kimi API (OpenAI-compatible) for fast, direct HTTP correction.
+//! Uses Kimi API (OpenAI-compatible) for fast, direct HTTP processing.
 //!
 //! Usage:
-//!   echo '{"user_message":"I has went to the store"}' | english-refiner
+//!   echo '{"prompt":"I has went to the store"}' | english-refiner
+//!   echo '{"prompt":"把这个函数重构一下"}' | english-refiner
 //!   KIMI_API_KEY=sk-... english-refiner
 
 use std::io::Write;
@@ -68,18 +70,36 @@ struct ChatResponseMessage {
     content: String,
 }
 
-fn is_english(s: &str) -> bool {
+#[derive(Debug, PartialEq)]
+enum InputKind {
+    English,
+    Chinese,
+    Other,
+}
+
+fn classify(s: &str) -> InputKind {
     if s.contains('\n') {
-        return false;
+        return InputKind::Other;
     }
     let total = s.chars().count();
     if total == 0 {
-        return false;
+        return InputKind::Other;
     }
+
+    // Check Chinese: CJK Unified Ideographs ratio
+    let cjk = s.chars().filter(|c| ('\u{4e00}'..='\u{9fff}').contains(c)).count();
+    if cjk as f64 / total as f64 > 0.3 {
+        return InputKind::Chinese;
+    }
+
     let ascii_letters = s.chars().filter(|c| c.is_ascii_alphabetic()).count();
     let ratio = ascii_letters as f64 / total as f64;
     let word_count = s.split_whitespace().count();
-    ratio > 0.7 && word_count > 3
+    if ratio > 0.7 && word_count > 3 {
+        return InputKind::English;
+    }
+
+    InputKind::Other
 }
 
 fn extract_json(s: &str) -> Option<&str> {
@@ -88,11 +108,15 @@ fn extract_json(s: &str) -> Option<&str> {
     Some(&s[start..end])
 }
 
-const SYSTEM_PROMPT: &str = "You are an English proofreader. Fix grammar and spelling in the user's sentence.\n\
+const REFINE_PROMPT: &str = "You are an English proofreader. Fix grammar and spelling in the user's sentence.\n\
 Return ONLY valid JSON: {\"refined\": \"<corrected sentence>\", \"changes\": [\"<brief description of each change>\"]}\n\
 If no changes needed, return: {\"refined\": \"<original>\", \"changes\": []}";
 
-fn call_kimi(user_input: &str) -> Result<RefinedOutput, String> {
+const TRANSLATE_PROMPT: &str = "Translate the following Chinese text into natural, colloquial English. \
+Use casual, conversational tone as a native speaker would.\n\
+Return ONLY valid JSON: {\"refined\": \"<English translation>\", \"changes\": [\"translated from Chinese\"]}";
+
+fn call_kimi(system_prompt: &str, user_input: &str) -> Result<RefinedOutput, String> {
     let api_key = std::env::var("KIMI_API_KEY")
         .map_err(|_| "KIMI_API_KEY not set".to_string())?;
 
@@ -101,7 +125,7 @@ fn call_kimi(user_input: &str) -> Result<RefinedOutput, String> {
         messages: vec![
             ChatMessage {
                 role: "system".to_string(),
-                content: SYSTEM_PROMPT.to_string(),
+                content: system_prompt.to_string(),
             },
             ChatMessage {
                 role: "user".to_string(),
@@ -151,12 +175,16 @@ fn main() {
         Err(_) => return,
     };
 
-    if !is_english(&input.prompt) {
-        return;
-    }
+    let kind = classify(&input.prompt);
+    let system_prompt = match kind {
+        InputKind::English => REFINE_PROMPT,
+        InputKind::Chinese => TRANSLATE_PROMPT,
+        InputKind::Other => return,
+    };
 
-    match call_kimi(&input.prompt) {
+    match call_kimi(system_prompt, &input.prompt) {
         Ok(refined) if refined.refined != input.prompt => {
+            let is_translate = kind == InputKind::Chinese;
             let output = FinalOutput {
                 original: input.prompt,
                 refined: refined.refined,
@@ -166,14 +194,17 @@ fn main() {
             if cli.json {
                 eprintln!("{json}");
             } else {
-                eprintln!("[english-refiner] \"{}\" → \"{}\"", output.original, output.refined);
+                if is_translate {
+                    eprintln!("[english-refiner] 🔄 {}", output.refined);
+                } else {
+                    eprintln!("[english-refiner] \"{}\" → \"{}\"", output.original, output.refined);
+                }
                 for change in &output.changes {
                     eprintln!("  • {change}");
                 }
             }
             if let Some(home) = std::env::var_os("HOME") {
                 let home = std::path::Path::new(&home);
-                // Append to log
                 let log_path = home.join(".english-refiner.log");
                 if let Ok(mut f) = std::fs::OpenOptions::new()
                     .create(true)
@@ -182,12 +213,17 @@ fn main() {
                 {
                     let _ = writeln!(f, "{json}");
                 }
-                // Write latest for statusLine display
+                // statusLine: translation shows only refined, refine shows both
+                let display = if is_translate {
+                    output.refined.clone()
+                } else {
+                    format!("\"{}\" → \"{}\"", output.original, output.refined)
+                };
                 let latest_path = home.join(".english-refiner-latest");
-                let _ = std::fs::write(latest_path, format!("\"{}\" → \"{}\"", output.original, output.refined));
+                let _ = std::fs::write(latest_path, display);
             }
         }
-        Ok(_) => {} // no changes needed
+        Ok(_) => {}
         Err(e) => eprintln!("[english-refiner] error: {e}"),
     }
 }
