@@ -123,7 +123,8 @@ fn ensure_sensevoice_model(base_dir: &Path) -> String {
         return model_dir.to_string_lossy().into_owned();
     }
 
-    eprintln!("[dictation] SenseVoice model not found, downloading...");
+    eprintln!("[dictation] SenseVoice model not found at {}", model_dir.display());
+    eprintln!("[dictation] first run — downloading model (~250 MB), this may take a few minutes...");
     std::fs::create_dir_all(base_dir).expect("failed to create model directory");
 
     let archive = base_dir.join("sensevoice.tar.bz2");
@@ -132,14 +133,16 @@ fn ensure_sensevoice_model(base_dir: &Path) -> String {
     let resp = reqwest::blocking::Client::new()
         .get(SENSEVOICE_URL)
         .send()
-        .expect("failed to download model");
+        .expect("failed to download model — check your network connection");
     let total = resp.content_length().unwrap_or(0);
+    let total_mb = total as f64 / 1_048_576.0;
     let mut downloaded: u64 = 0;
     let mut file = std::fs::File::create(&archive).expect("failed to create archive file");
     let mut reader = resp;
     let mut buf = [0u8; 65536];
+    let start = std::time::Instant::now();
     loop {
-        let n = reader.read(&mut buf).expect("download read error");
+        let n = reader.read(&mut buf).expect("download error — check your network connection");
         if n == 0 {
             break;
         }
@@ -148,15 +151,19 @@ fn ensure_sensevoice_model(base_dir: &Path) -> String {
         if total > 0 {
             let pct = (downloaded as f64 / total as f64 * 100.0) as u32;
             let mb = downloaded as f64 / 1_048_576.0;
-            let total_mb = total as f64 / 1_048_576.0;
-            eprint!("\r[dictation] downloading: {mb:.1}/{total_mb:.1} MB ({pct}%)");
+            let elapsed = start.elapsed().as_secs_f64();
+            let speed = if elapsed > 0.0 { mb / elapsed } else { 0.0 };
+            let bar_len = 30;
+            let filled = (bar_len as f64 * downloaded as f64 / total as f64) as usize;
+            let bar: String = "█".repeat(filled) + &"░".repeat(bar_len - filled);
+            eprint!("\r[dictation] {bar} {mb:.1}/{total_mb:.1} MB ({pct}%) {speed:.1} MB/s");
         }
     }
     eprintln!();
     drop(file);
 
-    // Extract using system tar
-    eprintln!("[dictation] extracting model...");
+    // Extract
+    eprint!("[dictation] extracting...");
     let status = std::process::Command::new("tar")
         .args(["xjf", &archive.to_string_lossy(), "-C", &base_dir.to_string_lossy()])
         .status()
@@ -164,7 +171,7 @@ fn ensure_sensevoice_model(base_dir: &Path) -> String {
     assert!(status.success(), "tar extraction failed");
     std::fs::remove_file(&archive).ok();
 
-    eprintln!("[dictation] model ready");
+    eprintln!(" done ✓");
     model_dir.to_string_lossy().into_owned()
 }
 
