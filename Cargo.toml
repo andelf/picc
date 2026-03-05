@@ -40,6 +40,10 @@ path = "src/bin/axcli.rs"
 name = "claude_menubar"
 path = "src/bin/claude_menubar.rs"
 
+[[bin]]
+name = "english-refiner"
+path = "src/bin/english_refiner.rs"
+
 [dependencies]
 objc2 = "0.6.3"
 block2 = "0.6.2"
@@ -137,3 +141,4 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["local-time", "env-filter"] }
 time = { version = "0.3", features = ["local-offset", "formatting", "macros"] }
 rand = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "process", "time", "macros", "sync"] }
