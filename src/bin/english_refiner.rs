@@ -22,7 +22,7 @@ struct Cli {
 
 #[derive(Deserialize)]
 struct HookInput {
-    user_message: String,
+    prompt: String,
 }
 
 #[derive(Deserialize)]
@@ -151,14 +151,14 @@ fn main() {
         Err(_) => return,
     };
 
-    if !is_english(&input.user_message) {
+    if !is_english(&input.prompt) {
         return;
     }
 
-    match call_kimi(&input.user_message) {
-        Ok(refined) if refined.refined != input.user_message => {
+    match call_kimi(&input.prompt) {
+        Ok(refined) if refined.refined != input.prompt => {
             let output = FinalOutput {
-                original: input.user_message,
+                original: input.prompt,
                 refined: refined.refined,
                 changes: refined.changes,
             };
