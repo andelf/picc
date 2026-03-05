@@ -44,10 +44,14 @@ path = "src/bin/claude_menubar.rs"
 name = "english-refiner"
 path = "src/bin/english_refiner.rs"
 
+[[bin]]
+name = "dictation"
+path = "src/bin/dictation.rs"
+
 [dependencies]
 objc2 = "0.6.3"
 block2 = "0.6.2"
-objc2-core-foundation = "0.3.2"
+objc2-core-foundation = { version = "0.3.2", features = ["CFRunLoop"] }
 objc2-foundation = { version = "0.3.2", features = [
     "NSArray",
     "NSDictionary",
@@ -141,3 +145,4 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["local-time", "env-filter"] }
 time = { version = "0.3", features = ["local-offset", "formatting", "macros"] }
 rand = "0.8"
+sherpa-rs = { version = "0.6", default-features = false, features = ["download-binaries"] }
