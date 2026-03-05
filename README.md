@@ -61,16 +61,12 @@ Hold right Command key to dictate speech, recognized text is typed at the cursor
 
 ```sh
 # Install
-cargo install --git https://github.com/andelf/picc --bin dictation
+cargo install --git https://github.com/andelf/picc --bin dictation --features sensevoice
 
 # Apple Speech API (default, no setup needed)
 dictation --engine apple
 
-# SenseVoice (offline, requires model download)
-# Download model first:
-#   mkdir -p ~/.local/share/picc && cd ~/.local/share/picc
-#   wget https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17.tar.bz2
-#   tar xjf sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17.tar.bz2
+# SenseVoice (offline, model auto-downloaded on first run ~250MB)
 dictation --engine sensevoice
 ```
 
@@ -80,6 +76,16 @@ Menubar indicator showing Claude Code session status, driven by Claude Code hook
 
 ```sh
 cargo run --bin claude_menubar
+```
+
+## Install
+
+```sh
+# All tools (without dictation, fast build)
+cargo install --git https://github.com/andelf/picc
+
+# All tools including dictation (slower, compiles sherpa-onnx)
+cargo install --git https://github.com/andelf/picc --features sensevoice
 ```
 
 ## Requirements

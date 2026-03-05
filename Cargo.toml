@@ -47,6 +47,7 @@ path = "src/bin/english_refiner.rs"
 [[bin]]
 name = "dictation"
 path = "src/bin/dictation.rs"
+required-features = ["sensevoice"]
 
 [dependencies]
 objc2 = "0.6.3"
@@ -145,4 +146,8 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["local-time", "env-filter"] }
 time = { version = "0.3", features = ["local-offset", "formatting", "macros"] }
 rand = "0.8"
-sherpa-rs = { version = "0.6", default-features = false, features = ["static"] }
+sherpa-rs = { version = "0.6", default-features = false, features = ["static"], optional = true }
+
+[features]
+default = []
+sensevoice = ["sherpa-rs"]
