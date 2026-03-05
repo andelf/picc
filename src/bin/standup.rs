@@ -503,13 +503,9 @@ fn update_menubar_title() {
         }
     };
 
-    let peer_count = get_peer_count();
-    let title_with_peers = if peer_count > 0 {
-        format!(" {} [{}]", time_str, peer_count)
-    } else {
-        format!(" {}", time_str)
-    };
+    let title_with_peers = format!(" {}", time_str);
 
+    let peer_count = get_peer_count();
     let peer_status = if peer_count > 0 {
         format!("Synced with {} peer{}", peer_count, if peer_count > 1 { "s" } else { "" })
     } else if LAN_SYNC.lock().unwrap().is_some() {
