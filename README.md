@@ -55,6 +55,25 @@ Hidden Bar clone — collapse/expand menubar icons by toggling a separator statu
 cargo run --bin hidden
 ```
 
+### dictation — Push-to-Talk Dictation
+
+Hold right Command key to dictate speech, recognized text is typed at the cursor. Supports SenseVoice (offline, via sherpa-onnx) and Apple Speech API engines.
+
+```sh
+# Install
+cargo install --git https://github.com/andelf/picc --bin dictation
+
+# Apple Speech API (default, no setup needed)
+dictation --engine apple
+
+# SenseVoice (offline, requires model download)
+# Download model first:
+#   mkdir -p ~/.local/share/picc && cd ~/.local/share/picc
+#   wget https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17.tar.bz2
+#   tar xjf sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17.tar.bz2
+dictation --engine sensevoice
+```
+
 ### claude_menubar — Claude Code Status Hook
 
 Menubar indicator showing Claude Code session status, driven by Claude Code hooks.
