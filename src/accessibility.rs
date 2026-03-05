@@ -1052,6 +1052,54 @@ fn element_matches_selector(el: &AXUIElement, selector: &str) -> bool {
 }
 
 /// Check if an element matches the base part of a selector (no pseudo-classes).
+/// CSS-style attribute match operator for bracket selectors.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum AttrOp {
+    Exact,      // =
+    Contains,   // *=
+    StartsWith, // ^=
+    EndsWith,   // $=
+}
+
+impl AttrOp {
+    fn matches(self, haystack: &str, needle: &str) -> bool {
+        match self {
+            Self::Exact => haystack == needle,
+            Self::Contains => haystack.contains(needle),
+            Self::StartsWith => haystack.starts_with(needle),
+            Self::EndsWith => haystack.ends_with(needle),
+        }
+    }
+}
+
+/// Parsed `[attr="val"]` / `[attr*="val"]` bracket expression.
+struct AttrBracket<'a> {
+    attr: &'a str,
+    op: AttrOp,
+    val: &'a str,
+}
+
+/// Parse the content between `[` and `]` into attr, operator, value.
+fn parse_attr_bracket(inner: &str) -> Option<AttrBracket<'_>> {
+    // Try 2-char operators first (*=, ^=, $=)
+    for (suffix, op) in [("*=", AttrOp::Contains), ("^=", AttrOp::StartsWith), ("$=", AttrOp::EndsWith)] {
+        if let Some(pos) = inner.find(suffix) {
+            return Some(AttrBracket {
+                attr: &inner[..pos],
+                op,
+                val: inner[pos + 2..].trim_matches('"'),
+            });
+        }
+    }
+    // Fallback: exact match (single =)
+    let (attr, val_quoted) = inner.split_once('=')?;
+    Some(AttrBracket {
+        attr,
+        op: AttrOp::Exact,
+        val: val_quoted.trim_matches('"'),
+    })
+}
+
 fn element_matches_base_selector(el: &AXUIElement, selector: &str) -> bool {
     if selector.starts_with('#') {
         // DOM ID selector
@@ -1093,29 +1141,22 @@ fn element_matches_base_selector(el: &AXUIElement, selector: &str) -> bool {
             .any(|v| v.as_ref().is_some_and(|s| s.contains(val)));
     }
 
-    // Parse role[attr="value"] or Role.class1.class2 or Role:nth(n)
+    // Parse role[attr="value"] or role[attr*="value"] etc.
     if let Some(bracket_start) = selector.find('[') {
         let role = &selector[..bracket_start];
         let el_role = attr_string(el, "AXRole").unwrap_or_default();
         if !role_matches(&el_role, role) {
             return false;
         }
-        // Extract attr=value
         let inner = &selector[bracket_start + 1..selector.len() - 1];
-        if let Some((attr, val_quoted)) = inner.split_once('=') {
-            // Remove quotes from value
-            let val = val_quoted.trim_matches('"');
-            match attr {
-                "title" => attr_string(el, "AXTitle").as_deref() == Some(val),
-                "desc" => attr_string(el, "AXDescription").as_deref() == Some(val),
-                "text" => {
-                    let el_val = attr_string(el, "AXValue")
-                        .map(|v| v.replace('\u{200b}', ""))
-                        .unwrap_or_default();
-                    el_val == val
-                }
-                _ => false,
-            }
+        if let Some(ab) = parse_attr_bracket(inner) {
+            let field = match ab.attr {
+                "title" | "name" => attr_string(el, "AXTitle"),
+                "desc" => attr_string(el, "AXDescription"),
+                "text" => attr_string(el, "AXValue").map(|v| v.replace('\u{200b}', "")),
+                _ => None,
+            };
+            field.as_deref().is_some_and(|f| ab.op.matches(f, ab.val))
         } else {
             false
         }
@@ -1500,5 +1541,78 @@ impl std::fmt::Debug for AXNode {
             .field("role", &self.role())
             .field("title", &self.title())
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_exact_match() {
+        let ab = parse_attr_bracket(r#"title="Send""#).unwrap();
+        assert_eq!(ab.attr, "title");
+        assert_eq!(ab.op, AttrOp::Exact);
+        assert_eq!(ab.val, "Send");
+    }
+
+    #[test]
+    fn parse_contains() {
+        let ab = parse_attr_bracket(r#"name*="Tab Title""#).unwrap();
+        assert_eq!(ab.attr, "name");
+        assert_eq!(ab.op, AttrOp::Contains);
+        assert_eq!(ab.val, "Tab Title");
+    }
+
+    #[test]
+    fn parse_starts_with() {
+        let ab = parse_attr_bracket(r#"title^="Chat""#).unwrap();
+        assert_eq!(ab.attr, "title");
+        assert_eq!(ab.op, AttrOp::StartsWith);
+        assert_eq!(ab.val, "Chat");
+    }
+
+    #[test]
+    fn parse_ends_with() {
+        let ab = parse_attr_bracket(r#"desc$="ago""#).unwrap();
+        assert_eq!(ab.attr, "desc");
+        assert_eq!(ab.op, AttrOp::EndsWith);
+        assert_eq!(ab.val, "ago");
+    }
+
+    #[test]
+    fn parse_no_equals_returns_none() {
+        assert!(parse_attr_bracket("title").is_none());
+    }
+
+    #[test]
+    fn parse_unquoted_value() {
+        let ab = parse_attr_bracket("title=Send").unwrap();
+        assert_eq!(ab.val, "Send");
+        assert_eq!(ab.op, AttrOp::Exact);
+    }
+
+    #[test]
+    fn attr_op_exact() {
+        assert!(AttrOp::Exact.matches("hello", "hello"));
+        assert!(!AttrOp::Exact.matches("hello world", "hello"));
+    }
+
+    #[test]
+    fn attr_op_contains() {
+        assert!(AttrOp::Contains.matches("hello world", "lo wo"));
+        assert!(!AttrOp::Contains.matches("hello", "xyz"));
+    }
+
+    #[test]
+    fn attr_op_starts_with() {
+        assert!(AttrOp::StartsWith.matches("hello world", "hello"));
+        assert!(!AttrOp::StartsWith.matches("hello world", "world"));
+    }
+
+    #[test]
+    fn attr_op_ends_with() {
+        assert!(AttrOp::EndsWith.matches("hello world", "world"));
+        assert!(!AttrOp::EndsWith.matches("hello world", "hello"));
     }
 }

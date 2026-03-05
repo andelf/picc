@@ -27,14 +27,21 @@ use picc::error::{AxError, exit_code};
 use picc::{input, screenshot, tree_fmt};
 
 #[derive(Parser)]
-#[command(name = "axcli", version, about = "macOS Accessibility CLI tool", after_help = "\
+#[command(name = "axcli", version, about = "macOS Accessibility CLI tool", long_about = "\
+macOS Accessibility CLI tool — automate any app via the Accessibility API.
+
+Workflow: snapshot (explore) → get text (read) → click/input (act) → screenshot (verify).
+Run `axcli <command> --help` for per-command tips.", after_help = "\
 Locator syntax:
   #id                       DOM ID           e.g. #root, #modal
   .class                    DOM class        e.g. .SearchButton, .msg-item
   .class1.class2            Multiple classes  e.g. .message-item.message-self
   Role                      AX role          e.g. AXButton, button, textarea
   Role.class                Role + class     e.g. AXGroup.feed-card
-  Role[attr=\"val\"]          Attribute match  e.g. AXButton[title=\"Send\"]
+  Role[attr=\"val\"]          Exact match      e.g. AXButton[title=\"Send\"]
+  Role[attr*=\"val\"]         Contains          e.g. radiobutton[name*=\"Tab Title\"]
+  Role[attr^=\"val\"]         Starts with       e.g. AXWindow[title^=\"Chat\"]
+  Role[attr$=\"val\"]         Ends with         e.g. text[desc$=\"ago\"]
   text=VALUE                Exact text       e.g. text=\"Hello\"
   text~=VALUE               Contains text    e.g. text~=\"partial\"
   text=/regex/flags         Regex text       e.g. text=/\\d+条新消息/, text=/Log\\s*in/i
@@ -133,6 +140,11 @@ impl std::str::FromStr for GetAttr {
 #[derive(Subcommand)]
 enum Command {
     /// Print accessibility tree (shows first match by default, use --all for all)
+    ///
+    /// Works on any element regardless of viewport position.
+    /// Use --depth 4-6 for overview, 10+ for full content extraction.
+    /// Use --max-text-len 0 to show full text without truncation.
+    /// Tip: if you only need text content, `get text` is faster and lighter.
     Snapshot {
         /// Locator selector to focus on
         locator: Option<String>,
@@ -150,6 +162,9 @@ enum Command {
         simplify: bool,
     },
     /// Click element
+    ///
+    /// Uses AXPress action, falls back to mouse click at element center.
+    /// For off-screen elements, call `scroll-to` first.
     Click {
         locator: String,
     },
@@ -157,14 +172,18 @@ enum Command {
     Dblclick {
         locator: String,
     },
-    /// Focus element and type text
+    /// Focus element and type text (appends to existing content)
     Input {
+        /// Target element
         locator: String,
+        /// Text to type
         text: String,
     },
-    /// Clear field and type text (Cmd+A, Delete, type)
+    /// Clear field then type text (Cmd+A, Delete, type)
     Fill {
+        /// Target element
         locator: String,
+        /// Text to type
         text: String,
     },
     /// Press key combo (Enter, Control+a, Command+Shift+v)
@@ -172,6 +191,10 @@ enum Command {
         key: String,
     },
     /// Move mouse to element center
+    ///
+    /// Useful for triggering hover-only UI (e.g. toolbars, tooltips).
+    /// The hover state is lost when the mouse moves away.
+    /// For off-screen elements, call `scroll-to` first.
     Hover {
         locator: String,
     },
@@ -180,10 +203,16 @@ enum Command {
         locator: String,
     },
     /// Scroll element into view (AXScrollToVisible)
+    ///
+    /// Call before hover/click if the element may be off-screen.
+    /// Not needed for snapshot/get — they work regardless of viewport.
     ScrollTo {
         locator: String,
     },
     /// Scroll within an element (up/down/left/right)
+    ///
+    /// After scrolling, lazy-loaded lists may reindex elements.
+    /// Use :has-text() instead of nth= to relocate targets.
     Scroll {
         /// Locator of the scrollable element
         locator: String,
@@ -194,6 +223,10 @@ enum Command {
         pixels: i32,
     },
     /// Capture screenshot
+    ///
+    /// Saves PNG to file. Use --ocr to also extract text via Vision framework.
+    /// Prefer `snapshot` for structured exploration (faster, no file I/O).
+    /// Use screenshot when you need visual context or multimodal analysis.
     Screenshot {
         /// Locator selector (optional, for element screenshot)
         locator: Option<String>,
@@ -207,11 +240,19 @@ enum Command {
         ocr: bool,
     },
     /// Wait for element or milliseconds
+    ///
+    /// Pass a number (e.g. 500) to sleep, or a locator to poll until found.
+    /// Useful after click/scroll to wait for UI transitions or lazy loading.
     Wait {
         /// Milliseconds (number) or locator string
         target: String,
     },
     /// Get element attribute value
+    ///
+    /// Lightest way to read element data. Most useful attributes:
+    ///   text     — subtree plain text with newlines (most common)
+    ///   classes  — CSS class list (for building locators)
+    ///   value    — form field value (input/textarea)
     #[command(after_help = "\
 Known attributes:
   text         Subtree text (with newlines at block boundaries)
