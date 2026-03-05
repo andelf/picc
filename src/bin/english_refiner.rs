@@ -172,7 +172,9 @@ fn main() {
                 }
             }
             if let Some(home) = std::env::var_os("HOME") {
-                let log_path = std::path::Path::new(&home).join(".english-refiner.log");
+                let home = std::path::Path::new(&home);
+                // Append to log
+                let log_path = home.join(".english-refiner.log");
                 if let Ok(mut f) = std::fs::OpenOptions::new()
                     .create(true)
                     .append(true)
@@ -180,6 +182,9 @@ fn main() {
                 {
                     let _ = writeln!(f, "{json}");
                 }
+                // Write latest for statusLine display
+                let latest_path = home.join(".english-refiner-latest");
+                let _ = std::fs::write(latest_path, format!("\"{}\" → \"{}\"", output.original, output.refined));
             }
         }
         Ok(_) => {} // no changes needed
