@@ -8,6 +8,8 @@
 //!   dictation --engine apple
 
 use std::cell::Cell;
+use std::io::{Read as _, Write as _};
+use std::path::Path;
 use std::ptr::{self, NonNull};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -111,6 +113,61 @@ fn set_status_icon(item: &NSStatusItem, recording: bool, mtm: MainThreadMarker) 
     }
 }
 
+const SENSEVOICE_MODEL_DIR: &str = "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17";
+const SENSEVOICE_URL: &str = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17.tar.bz2";
+
+fn ensure_sensevoice_model(base_dir: &Path) -> String {
+    let model_dir = base_dir.join(SENSEVOICE_MODEL_DIR);
+    let model_file = model_dir.join("model.int8.onnx");
+    if model_file.exists() {
+        return model_dir.to_string_lossy().into_owned();
+    }
+
+    eprintln!("[dictation] SenseVoice model not found, downloading...");
+    std::fs::create_dir_all(base_dir).expect("failed to create model directory");
+
+    let archive = base_dir.join("sensevoice.tar.bz2");
+
+    // Download with progress
+    let resp = reqwest::blocking::Client::new()
+        .get(SENSEVOICE_URL)
+        .send()
+        .expect("failed to download model");
+    let total = resp.content_length().unwrap_or(0);
+    let mut downloaded: u64 = 0;
+    let mut file = std::fs::File::create(&archive).expect("failed to create archive file");
+    let mut reader = resp;
+    let mut buf = [0u8; 65536];
+    loop {
+        let n = reader.read(&mut buf).expect("download read error");
+        if n == 0 {
+            break;
+        }
+        file.write_all(&buf[..n]).expect("write error");
+        downloaded += n as u64;
+        if total > 0 {
+            let pct = (downloaded as f64 / total as f64 * 100.0) as u32;
+            let mb = downloaded as f64 / 1_048_576.0;
+            let total_mb = total as f64 / 1_048_576.0;
+            eprint!("\r[dictation] downloading: {mb:.1}/{total_mb:.1} MB ({pct}%)");
+        }
+    }
+    eprintln!();
+    drop(file);
+
+    // Extract using system tar
+    eprintln!("[dictation] extracting model...");
+    let status = std::process::Command::new("tar")
+        .args(["xjf", &archive.to_string_lossy(), "-C", &base_dir.to_string_lossy()])
+        .status()
+        .expect("failed to run tar");
+    assert!(status.success(), "tar extraction failed");
+    std::fs::remove_file(&archive).ok();
+
+    eprintln!("[dictation] model ready");
+    model_dir.to_string_lossy().into_owned()
+}
+
 fn main() {
     let args = Args::parse();
     let use_sensevoice = args.engine == "sensevoice";
@@ -125,7 +182,8 @@ fn main() {
     {
         let model_dir = args.model_dir.unwrap_or_else(|| {
             let home = std::env::var("HOME").unwrap();
-            format!("{home}/.local/share/picc/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17")
+            let base = Path::new(&home).join(".local/share/picc");
+            ensure_sensevoice_model(&base)
         });
         let config = sherpa_rs::sense_voice::SenseVoiceConfig {
             model: format!("{model_dir}/model.int8.onnx"),
