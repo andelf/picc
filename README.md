@@ -70,9 +70,9 @@ dictation --engine apple
 dictation --engine sensevoice
 ```
 
-### dictation-ng — Push-to-Talk Dictation (Fun-ASR-Nano)
+### dictation-ng — Push-to-Talk Dictation (Fun-ASR-Nano) [Not Recommended]
 
-Next-gen dictation tool using Fun-ASR-Nano (0.8B LLM-based ASR). Features real-time preview during recording and tail-only final recognition for low latency.
+Alternative dictation tool using Fun-ASR-Nano (0.8B LLM-based ASR, 31 languages). Inference is significantly slower than SenseVoice due to the larger LLM-based model. Use `dictation --engine sensevoice` instead.
 
 ```sh
 # Build (requires sherpa-onnx v1.12.28 static library at ~/.local/share/picc/sherpa-onnx-v1.12.28/)
