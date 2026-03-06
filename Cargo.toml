@@ -53,9 +53,9 @@ path = "src/bin/dictation.rs"
 required-features = ["sensevoice"]
 
 [dependencies]
-objc2 = "0.6.3"
+objc2 = "0.6.4"
 block2 = "0.6.2"
-objc2-core-foundation = { version = "0.3.2", features = ["CFRunLoop"] }
+objc2-core-foundation = { version = "0.3.2", features = ["CFRunLoop", "CFURL"] }
 objc2-foundation = { version = "0.3.2", features = [
     "NSArray",
     "NSDictionary",
@@ -127,6 +127,10 @@ objc2-speech = { version = "0.3.2", features = [
     "SFTranscription",
     "SFTranscriptionSegment",
     "block2",
+] }
+objc2-image-io = { version = "0.3.2", features = [
+    "CGImageDestination",
+    "objc2-core-graphics",
 ] }
 objc2-application-services = { version = "0.3.2", features = [
     "HIServices",

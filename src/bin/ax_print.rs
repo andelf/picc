@@ -17,11 +17,9 @@
 //!   cargo run --bin ax_print -- --app Lark --locator '.SearchButton' --screenshot
 //!   cargo run --bin ax_print -- --app Lark --locator '.SearchButton' --screenshot /tmp/shot.png
 
-use std::ffi::c_void;
-
-use objc2_core_foundation::{CGPoint, CGRect, CGSize};
+use objc2_core_foundation::{CFString, CFURL, CFURLPathStyle, CGPoint, CGRect, CGSize};
 use objc2_core_graphics::CGImage;
-use objc2_foundation::NSString;
+use objc2_image_io::CGImageDestination;
 use picc::accessibility::{self, AXNode};
 use picc::input;
 
@@ -445,50 +443,21 @@ fn truncate(s: &str, max: usize) -> String {
 }
 
 fn save_cgimage(image: &CGImage, path: &str) {
-    #[link(name = "ImageIO", kind = "framework")]
-    extern "C" {
-        fn CGImageDestinationCreateWithURL(
-            url: *const c_void,
-            ty: *const c_void,
-            count: usize,
-            options: *const c_void,
-        ) -> *mut c_void;
-        fn CGImageDestinationAddImage(
-            dest: *mut c_void,
-            image: *const c_void,
-            properties: *const c_void,
-        );
-        fn CGImageDestinationFinalize(dest: *mut c_void) -> bool;
-    }
-
-    #[link(name = "CoreFoundation", kind = "framework")]
-    extern "C" {
-        fn CFURLCreateWithFileSystemPath(
-            allocator: *const c_void,
-            path: *const c_void,
-            style: i32,
-            is_dir: bool,
-        ) -> *const c_void;
-    }
-
+    let cf_path = CFString::from_str(path);
+    let url = CFURL::with_file_system_path(None, Some(&cf_path), CFURLPathStyle::CFURLPOSIXPathStyle, false);
+    let Some(url) = url else {
+        eprintln!("error: failed to create URL for {path}");
+        std::process::exit(1);
+    };
+    let png_type = CFString::from_str("public.png");
+    let dest = unsafe { CGImageDestination::with_url(&url, &png_type, 1, None) };
+    let Some(dest) = dest else {
+        eprintln!("error: failed to create image destination for {path}");
+        std::process::exit(1);
+    };
     unsafe {
-        let ns_path = NSString::from_str(path);
-        let url = CFURLCreateWithFileSystemPath(
-            std::ptr::null(),
-            (&*ns_path as *const NSString).cast(),
-            0, // kCFURLPOSIXPathStyle
-            false,
-        );
-        let png_type = NSString::from_str("public.png");
-        let dest = CGImageDestinationCreateWithURL(
-            url,
-            (&*png_type as *const NSString).cast(),
-            1,
-            std::ptr::null(),
-        );
-        CGImageDestinationAddImage(dest, (image as *const CGImage).cast(), std::ptr::null());
-        let ok = CGImageDestinationFinalize(dest);
-        if ok {
+        dest.add_image(image, None);
+        if dest.finalize() {
             eprintln!("Saved: {path}");
         } else {
             eprintln!("error: failed to save {path}");

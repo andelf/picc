@@ -1,5 +1,4 @@
 use std::cell::Cell;
-use std::ffi::c_void;
 use std::ptr::NonNull;
 
 use block2::RcBlock;
@@ -13,8 +12,9 @@ use objc2_app_kit::{
     NSPanel, NSResponder, NSScreen, NSView, NSWindow, NSWindowCollectionBehavior,
     NSWindowStyleMask,
 };
-use objc2_core_foundation::{CGPoint, CGRect, CGSize};
+use objc2_core_foundation::{CFString, CFURL, CFURLPathStyle, CGPoint, CGRect, CGSize};
 use objc2_core_graphics::CGImage;
+use objc2_image_io::CGImageDestination;
 use objc2_foundation::{NSArray, NSDate, NSPoint, NSRect, NSRunLoop, NSSize, NSString};
 use picc::vision;
 
@@ -82,49 +82,21 @@ fn hide_all_overlays() {
 /// 保存 CGImage 到 PNG 文件
 #[allow(dead_code)]
 fn save_cgimage(image: &CGImage, path: &str) {
-    #[link(name = "ImageIO", kind = "framework")]
-    extern "C" {
-        fn CGImageDestinationCreateWithURL(
-            url: *const c_void,
-            ty: *const c_void,
-            count: usize,
-            options: *const c_void,
-        ) -> *mut c_void;
-        fn CGImageDestinationAddImage(
-            dest: *mut c_void,
-            image: *const c_void,
-            properties: *const c_void,
-        );
-        fn CGImageDestinationFinalize(dest: *mut c_void) -> bool;
-    }
-
-    #[link(name = "CoreFoundation", kind = "framework")]
-    extern "C" {
-        fn CFURLCreateWithFileSystemPath(
-            allocator: *const c_void,
-            path: *const c_void,
-            style: i32,
-            is_dir: bool,
-        ) -> *const c_void;
-    }
-
+    let cf_path = CFString::from_str(path);
+    let url = CFURL::with_file_system_path(None, Some(&cf_path), CFURLPathStyle::CFURLPOSIXPathStyle, false);
+    let Some(url) = url else {
+        println!("save_cgimage({}) => false (bad url)", path);
+        return;
+    };
+    let png_type = CFString::from_str("public.png");
+    let dest = unsafe { CGImageDestination::with_url(&url, &png_type, 1, None) };
+    let Some(dest) = dest else {
+        println!("save_cgimage({}) => false (no dest)", path);
+        return;
+    };
     unsafe {
-        let ns_path = NSString::from_str(path);
-        let url = CFURLCreateWithFileSystemPath(
-            std::ptr::null(),
-            (&*ns_path as *const NSString).cast(),
-            0, // kCFURLPOSIXPathStyle
-            false,
-        );
-        let png_type = NSString::from_str("public.png");
-        let dest = CGImageDestinationCreateWithURL(
-            url,
-            (&*png_type as *const NSString).cast(),
-            1,
-            std::ptr::null(),
-        );
-        CGImageDestinationAddImage(dest, (image as *const CGImage).cast(), std::ptr::null());
-        let ok = CGImageDestinationFinalize(dest);
+        dest.add_image(image, None);
+        let ok = dest.finalize();
         println!("save_cgimage({}) => {}", path, ok);
     }
 }
