@@ -406,6 +406,7 @@ fn main() {
 
             // --- STOP recording ---
             if SHOULD_STOP.swap(false, Ordering::Relaxed) && is_recording.get() {
+                let stop_t0 = std::time::Instant::now();
                 eprintln!("[dictation] recording stopped");
                 is_recording.set(false);
                 set_status_icon(&status_item, false, mtm);
@@ -445,10 +446,16 @@ fn main() {
                             samples_16k.len() as f64 / 16000.0
                         );
                         if let Some(mut recognizer) = sv_recognizer.take() {
+                            let t0 = std::time::Instant::now();
                             let result = recognizer.transcribe(16000, &samples_16k);
+                            let inference_ms = t0.elapsed().as_secs_f64() * 1000.0;
                             if !result.text.is_empty() {
-                                eprintln!("[dictation] result: {}", result.text);
                                 type_text(&result.text);
+                                let total_ms = stop_t0.elapsed().as_secs_f64() * 1000.0;
+                                eprintln!(
+                                    "[dictation] result: {} (inference={:.0}ms, total={:.0}ms)",
+                                    result.text, inference_ms, total_ms
+                                );
                             }
                             sv_recognizer.set(Some(recognizer));
                         }

@@ -70,6 +70,17 @@ dictation --engine apple
 dictation --engine sensevoice
 ```
 
+### dictation-ng — Push-to-Talk Dictation (Fun-ASR-Nano)
+
+Next-gen dictation tool using Fun-ASR-Nano (0.8B LLM-based ASR). Features real-time preview during recording and tail-only final recognition for low latency.
+
+```sh
+# Build (requires sherpa-onnx v1.12.28 static library at ~/.local/share/picc/sherpa-onnx-v1.12.28/)
+cargo run -p dictation-ng
+
+# Model auto-downloaded on first run (~715MB)
+```
+
 ### claude_menubar — Claude Code Status Hook
 
 Menubar indicator showing Claude Code session status, driven by Claude Code hooks.

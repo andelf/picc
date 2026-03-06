@@ -1,0 +1,52 @@
+[package]
+name = "dictation-ng"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "dictation-ng"
+path = "src/main.rs"
+
+[dependencies]
+picc = { path = "../.." }
+clap = { version = "4", features = ["derive"] }
+objc2 = "0.6.3"
+block2 = "0.6.2"
+objc2-foundation = { version = "0.3.2", features = [
+    "NSString",
+    "NSDate",
+    "NSRunLoop",
+    "NSLocale",
+    "NSObject",
+    "NSTimer",
+] }
+objc2-app-kit = { version = "0.3.2", features = [
+    "NSApplication",
+    "NSImage",
+    "NSStatusBar",
+    "NSStatusItem",
+    "NSStatusBarButton",
+    "NSMenu",
+    "NSMenuItem",
+    "NSResponder",
+    "block2",
+] }
+objc2-core-foundation = { version = "0.3.2", features = ["CFRunLoop"] }
+objc2-core-graphics = { version = "0.3.2", features = [
+    "CGEventTypes",
+    "CGEvent",
+] }
+objc2-avf-audio = { version = "0.3.2", features = [
+    "AVAudioEngine",
+    "AVAudioNode",
+    "AVAudioIONode",
+    "AVAudioFormat",
+    "AVAudioBuffer",
+    "AVAudioTime",
+    "AVAudioTypes",
+    "block2",
+] }
+reqwest = { version = "0.12", features = ["blocking"] }
+
+[build-dependencies]
+bindgen = "0.71"
