@@ -103,6 +103,9 @@ static LAST_TAP_RELEASE_MS: AtomicU64 = AtomicU64::new(0);
 static SESSION_MODE: AtomicU8 = AtomicU8::new(0);
 static RECOGNIZED_TEXT: Mutex<String> = Mutex::new(String::new());
 
+/// LLM result from background thread: Some(Ok(corrected)) or Some(Err(msg))
+static LLM_RESULT: Mutex<Option<Result<String, String>>> = Mutex::new(None);
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -271,13 +274,33 @@ enum AppState {
     Processing,
 }
 
+/// Animated processing icons — cycled every few timer ticks
+const PROCESSING_ICONS: &[&str] = &[
+    "ellipsis.circle",
+    "ellipsis.circle.fill",
+    "ellipsis.circle",
+    "ellipsis",
+];
+
 fn set_status_icon(item: &NSStatusItem, state: AppState, mtm: MainThreadMarker) {
     let name = match state {
         AppState::Idle => "wand.and.stars",
         AppState::Recording => "mic.fill",
         AppState::Correcting => "mic.badge.plus",
-        AppState::Processing => "ellipsis.circle",
+        AppState::Processing => "ellipsis.circle", // initial, animated by timer
     };
+    if let Some(button) = item.button(mtm) {
+        if let Some(image) = NSImage::imageWithSystemSymbolName_accessibilityDescription(
+            &NSString::from_str(name),
+            Some(&NSString::from_str("Voice Correct")),
+        ) {
+            image.setTemplate(true);
+            button.setImage(Some(&image));
+        }
+    }
+}
+
+fn set_status_icon_name(item: &NSStatusItem, name: &str, mtm: MainThreadMarker) {
     if let Some(button) = item.button(mtm) {
         if let Some(image) = NSImage::imageWithSystemSymbolName_accessibilityDescription(
             &NSString::from_str(name),
@@ -621,7 +644,11 @@ fn main() {
 
     // --- State ---
     let is_recording = Cell::new(false);
+    let is_processing = Cell::new(false);
+    let processing_tick: Cell<u32> = Cell::new(0);
     let current_mode: Cell<u8> = Cell::new(0);
+    // Original text saved when LLM correction is dispatched
+    let correction_original: Cell<Option<String>> = Cell::new(None);
     let apple_request: Cell<Option<Retained<SFSpeechAudioBufferRecognitionRequest>>> =
         Cell::new(None);
     let accumulated_samples: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
@@ -635,6 +662,43 @@ fn main() {
         let samples_ref = accumulated_samples.clone();
 
         let block = RcBlock::new(move |_timer: NonNull<NSTimer>| {
+            // --- Animate processing icon (cycle every ~250ms = 5 ticks) ---
+            if is_processing.get() {
+                let tick = processing_tick.get() + 1;
+                processing_tick.set(tick);
+                if tick % 5 == 0 {
+                    let frame = (tick / 5) as usize % PROCESSING_ICONS.len();
+                    set_status_icon_name(&status_item, PROCESSING_ICONS[frame], mtm);
+                }
+
+                // Check if LLM result has arrived
+                if let Ok(mut r) = LLM_RESULT.try_lock() {
+                    if let Some(result) = r.take() {
+                        is_processing.set(false);
+                        let original = correction_original.take().unwrap_or_default();
+                        match result {
+                            Ok(corrected) if corrected != original => {
+                                // Re-read focused element for writing
+                                if let Some((element, _)) = read_focused_text() {
+                                    write_corrected_text(&element, &corrected);
+                                } else {
+                                    // Field lost focus — use clipboard fallback
+                                    replace_via_clipboard(&corrected);
+                                }
+                            }
+                            Ok(_) => {
+                                eprintln!("[voice-correct] no change needed");
+                            }
+                            Err(e) => {
+                                eprintln!("[voice-correct] LLM error: {}", e);
+                                play_error_sound();
+                            }
+                        }
+                        set_status_icon(&status_item, AppState::Idle, mtm);
+                    }
+                }
+            }
+
             // --- CANCEL recording (short tap) ---
             if SHOULD_CANCEL.swap(false, Ordering::Relaxed) && is_recording.get() {
                 eprintln!("[voice-correct] tap detected, cancelled");
@@ -881,38 +945,42 @@ fn main() {
                     set_status_icon(&status_item, AppState::Idle, mtm);
                 } else {
                     // --- Correction mode ---
-                    set_status_icon(&status_item, AppState::Processing, mtm);
-
                     let app_name = frontmost_bundle_id()
                         .unwrap_or_else(|| "unknown".to_string());
                     eprintln!("[voice-correct] app: {}", app_name);
 
                     match read_focused_text() {
-                        Some((element, original_text)) => {
-                            // Has text → LLM correct
+                        Some((_element, original_text)) => {
                             eprintln!(
                                 "[voice-correct] correcting: \"{}\" with instruction: \"{}\"",
                                 original_text, spoken
                             );
-                            let t0 = std::time::Instant::now();
-                            match call_llm(&original_text, &spoken) {
-                                Ok(corrected) => {
-                                    let elapsed = t0.elapsed().as_secs_f64() * 1000.0;
-                                    eprintln!(
+                            // Save original for comparison when result arrives
+                            correction_original.set(Some(original_text.clone()));
+
+                            // Start animated processing icon
+                            set_status_icon(&status_item, AppState::Processing, mtm);
+                            is_processing.set(true);
+                            processing_tick.set(0);
+
+                            // Dispatch LLM call to background thread
+                            let orig = original_text.clone();
+                            let instr = spoken.clone();
+                            std::thread::spawn(move || {
+                                let t0 = std::time::Instant::now();
+                                let result = call_llm(&orig, &instr);
+                                let elapsed = t0.elapsed().as_secs_f64() * 1000.0;
+                                match &result {
+                                    Ok(text) => eprintln!(
                                         "[voice-correct] result: \"{}\" ({:.0}ms)",
-                                        corrected, elapsed
-                                    );
-                                    if corrected != original_text {
-                                        write_corrected_text(&element, &corrected);
-                                    } else {
-                                        eprintln!("[voice-correct] no change needed");
-                                    }
+                                        text, elapsed
+                                    ),
+                                    Err(e) => eprintln!("[voice-correct] LLM error: {} ({:.0}ms)", e, elapsed),
                                 }
-                                Err(e) => {
-                                    eprintln!("[voice-correct] LLM error: {}", e);
-                                    play_error_sound();
+                                if let Ok(mut r) = LLM_RESULT.lock() {
+                                    *r = Some(result);
                                 }
-                            }
+                            });
                         }
                         None => {
                             // Empty field → fall back to typing (no LLM call)
@@ -921,10 +989,9 @@ fn main() {
                                 spoken
                             );
                             type_text(&spoken);
+                            set_status_icon(&status_item, AppState::Idle, mtm);
                         }
                     }
-
-                    set_status_icon(&status_item, AppState::Idle, mtm);
                 }
             }
         });
