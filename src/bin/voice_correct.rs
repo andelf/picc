@@ -470,6 +470,8 @@ fn call_llm(original_text: &str, instruction: &str) -> Result<String, String> {
     let api_key =
         std::env::var("KIMI_API_KEY").map_err(|_| "KIMI_API_KEY not set".to_string())?;
 
+    let original_text = original_text.trim();
+    let instruction = instruction.trim();
     let user_msg = format!("已输入文本：{original_text}\n纠错指令：{instruction}");
 
     let request = ChatRequest {
@@ -945,6 +947,13 @@ fn main() {
                     set_status_icon(&status_item, AppState::Idle, mtm);
                 } else {
                     // --- Correction mode ---
+                    // Skip if a previous LLM call is still in flight
+                    if is_processing.get() {
+                        eprintln!("[voice-correct] still processing previous correction, skipping");
+                        set_status_icon(&status_item, AppState::Idle, mtm);
+                        return;
+                    }
+
                     let app_name = frontmost_bundle_id()
                         .unwrap_or_else(|| "unknown".to_string());
                     eprintln!("[voice-correct] app: {}", app_name);
