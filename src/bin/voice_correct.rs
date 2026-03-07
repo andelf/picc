@@ -43,6 +43,7 @@ use objc2_speech::{
 use objc2_application_services::AXUIElement;
 use picc::accessibility;
 use picc::input::{parse_key_combo, press_key_combo, type_text};
+use tracing::{debug, info, warn};
 
 use serde::{Deserialize, Serialize};
 
@@ -133,22 +134,31 @@ unsafe extern "C-unwind" fn event_tap_callback(
             let now = now_ms();
             PRESS_MS.store(now, Ordering::Relaxed);
 
-            if !IS_RECORDING.load(Ordering::Relaxed) {
+            let is_rec = IS_RECORDING.load(Ordering::Relaxed);
+            let cancel_pending = SHOULD_CANCEL.load(Ordering::Relaxed);
+
+            // Allow new press if not recording, or if cancel is pending
+            // (recording is about to be cancelled by timer)
+            if !is_rec || cancel_pending {
                 let last_tap = LAST_TAP_RELEASE_MS.load(Ordering::Relaxed);
-                if (now - last_tap) < 300 {
-                    // Press shortly after a tap → double-tap → correction mode
+                let gap = now - last_tap;
+                if gap < 300 {
                     SESSION_MODE.store(MODE_CORRECT, Ordering::Relaxed);
+                    debug!(t = now, gap, "press → CORRECT");
                 } else {
-                    // Normal press → dictation mode
                     SESSION_MODE.store(MODE_DICTATION, Ordering::Relaxed);
+                    debug!(t = now, gap, "press → DICTATION");
                 }
                 SHOULD_START.store(true, Ordering::Relaxed);
+            } else {
+                debug!(t = now, "press (already recording, ignored)");
             }
         } else if !right_cmd_pressed && was_down {
             // Release
             WAS_DOWN.store(false, Ordering::Relaxed);
             let now = now_ms();
             let hold = now - PRESS_MS.load(Ordering::Relaxed);
+            let is_rec = IS_RECORDING.load(Ordering::Relaxed);
 
             // Short tap → always record as tap for double-tap detection,
             // regardless of whether timer has started recording yet.
@@ -156,17 +166,21 @@ unsafe extern "C-unwind" fn event_tap_callback(
                 LAST_TAP_RELEASE_MS.store(now, Ordering::Relaxed);
             }
 
-            if IS_RECORDING.load(Ordering::Relaxed) {
+            if is_rec {
                 if hold < 300 && SESSION_MODE.load(Ordering::Relaxed) == MODE_DICTATION {
-                    // Short tap in dictation mode → cancel recording
                     SHOULD_CANCEL.store(true, Ordering::Relaxed);
+                    debug!(t = now, hold, rec = true, "release → CANCEL");
                 } else {
-                    // Long hold or correction mode → stop and process
                     SHOULD_STOP.store(true, Ordering::Relaxed);
+                    debug!(t = now, hold, rec = true, "release → STOP");
                 }
-            } else if hold < 300 {
-                // Timer hasn't started recording yet → cancel pending start
-                SHOULD_START.store(false, Ordering::Relaxed);
+            } else {
+                if hold < 300 {
+                    SHOULD_START.store(false, Ordering::Relaxed);
+                    debug!(t = now, hold, rec = false, "release → CLEAR_START");
+                } else {
+                    debug!(t = now, hold, rec = false, "release → noop");
+                }
             }
         }
     }
@@ -523,6 +537,15 @@ fn call_llm(original_text: &str, instruction: &str) -> Result<String, String> {
 // --- Main ---
 
 fn main() {
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::from_default_env()
+                .add_directive("voice_correct=debug".parse().unwrap()),
+        )
+        .with_target(false)
+        .without_time()
+        .init();
+
     let args = Args::parse();
     let use_sensevoice = args.engine == "sensevoice";
 
@@ -705,7 +728,7 @@ fn main() {
 
             // --- CANCEL recording (short tap) ---
             if SHOULD_CANCEL.swap(false, Ordering::Relaxed) && is_recording.get() {
-                eprintln!("[voice-correct] tap detected, cancelled");
+                debug!(t = now_ms(), "timer → cancel");
                 is_recording.set(false);
                 IS_RECORDING.store(false, Ordering::Relaxed);
 
@@ -738,7 +761,7 @@ fn main() {
                 } else {
                     "dictate"
                 };
-                eprintln!("[voice-correct] recording started (mode: {mode_name})");
+                debug!(t = now_ms(), mode = mode_name, "timer → start");
 
                 is_recording.set(true);
                 IS_RECORDING.store(true, Ordering::Relaxed);
@@ -937,28 +960,28 @@ fn main() {
 
                 // Empty speech → skip entirely
                 if spoken.is_empty() {
-                    eprintln!("[voice-correct] no speech recognized, skipping");
+                    debug!("no speech recognized, skipping");
                     set_status_icon(&status_item, AppState::Idle, mtm);
                     return;
                 }
 
                 if mode == MODE_DICTATION {
                     // --- Dictation mode: just type ---
-                    eprintln!("[voice-correct] typing: {}", spoken);
+                    info!(text = %spoken, "typing");
                     type_text(&spoken);
                     set_status_icon(&status_item, AppState::Idle, mtm);
                 } else {
                     // --- Correction mode ---
                     // Skip if a previous LLM call is still in flight
                     if is_processing.get() {
-                        eprintln!("[voice-correct] still processing previous correction, skipping");
+                        warn!("still processing previous correction, skipping");
                         set_status_icon(&status_item, AppState::Idle, mtm);
                         return;
                     }
 
                     let app_name = frontmost_bundle_id()
                         .unwrap_or_else(|| "unknown".to_string());
-                    eprintln!("[voice-correct] app: {}", app_name);
+                    info!(app = %app_name, "correction mode");
 
                     match read_focused_text() {
                         Some((_element, original_text)) => {
