@@ -150,21 +150,23 @@ unsafe extern "C-unwind" fn event_tap_callback(
             let now = now_ms();
             let hold = now - PRESS_MS.load(Ordering::Relaxed);
 
+            // Short tap → always record as tap for double-tap detection,
+            // regardless of whether timer has started recording yet.
+            if hold < 300 {
+                LAST_TAP_RELEASE_MS.store(now, Ordering::Relaxed);
+            }
+
             if IS_RECORDING.load(Ordering::Relaxed) {
                 if hold < 300 && SESSION_MODE.load(Ordering::Relaxed) == MODE_DICTATION {
-                    // Short tap in dictation mode → cancel recording, mark as tap
+                    // Short tap in dictation mode → cancel recording
                     SHOULD_CANCEL.store(true, Ordering::Relaxed);
-                    LAST_TAP_RELEASE_MS.store(now, Ordering::Relaxed);
                 } else {
                     // Long hold or correction mode → stop and process
                     SHOULD_STOP.store(true, Ordering::Relaxed);
                 }
-            } else {
+            } else if hold < 300 {
                 // Timer hasn't started recording yet → cancel pending start
-                if hold < 300 {
-                    SHOULD_START.store(false, Ordering::Relaxed);
-                    LAST_TAP_RELEASE_MS.store(now, Ordering::Relaxed);
-                }
+                SHOULD_START.store(false, Ordering::Relaxed);
             }
         }
     }
