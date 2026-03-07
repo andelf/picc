@@ -347,6 +347,20 @@ fn read_focused_text() -> Option<(CFRetained<AXUIElement>, String)> {
 
 /// Bundle IDs of apps where AXValue set doesn't work (browsers, Electron apps).
 /// For these, always use clipboard paste fallback.
+/// Apps where AXValue returns the entire buffer (terminals).
+/// Correction mode skips text reading and falls back to typing.
+const SKIP_AX_READ_BUNDLES: &[&str] = &[
+    "com.apple.Terminal",
+    "com.googlecode.iterm2",
+    "io.alacritty",
+    "com.mitchellh.ghostty",
+    "dev.warp.Warp-Stable",
+    "co.zeit.hyper",
+    "net.kovidgoyal.kitty",
+];
+
+/// Apps where AXValue set doesn't work (browsers, Electron apps).
+/// Text replacement uses clipboard paste instead.
 const CLIPBOARD_ONLY_BUNDLES: &[&str] = &[
     "com.google.Chrome",
     "org.chromium.Chromium",
@@ -371,19 +385,21 @@ fn frontmost_bundle_id() -> Option<String> {
     app.and_then(|a| a.bundleIdentifier().map(|b| b.to_string()))
 }
 
+fn matches_bundle_list(bundle: &str, list: &[&str]) -> bool {
+    list.iter().any(|b| {
+        if b.ends_with('.') {
+            bundle.starts_with(b)
+        } else {
+            bundle == *b
+        }
+    })
+}
+
 /// Check if the frontmost app should use clipboard-only strategy.
 fn should_use_clipboard() -> bool {
-    if let Some(bundle) = frontmost_bundle_id() {
-        CLIPBOARD_ONLY_BUNDLES.iter().any(|b| {
-            if b.ends_with('.') {
-                bundle.starts_with(b)
-            } else {
-                bundle == *b
-            }
-        })
-    } else {
-        false
-    }
+    frontmost_bundle_id()
+        .map(|b| matches_bundle_list(&b, CLIPBOARD_ONLY_BUNDLES))
+        .unwrap_or(false)
 }
 
 /// Replace text in the focused field.
@@ -964,9 +980,25 @@ fn main() {
                         .unwrap_or_else(|| "unknown".to_string());
                     info!(app = %app_name, "correction mode");
 
+                    // Terminals: AXValue returns entire buffer, skip reading
+                    if matches_bundle_list(&app_name, SKIP_AX_READ_BUNDLES) {
+                        info!(text = %spoken, "terminal app, typing instead");
+                        type_text(&spoken);
+                        set_status_icon(&status_item, AppState::Idle, mtm);
+                        return;
+                    }
+
                     match read_focused_text() {
                         Some((_element, original_text)) => {
-                            info!(original = %original_text.trim(), instruction = %spoken, "correcting");
+                            // Limit text length to avoid sending huge payloads to LLM
+                            let trimmed = original_text.trim();
+                            if trimmed.chars().count() > 250 {
+                                warn!(len = trimmed.chars().count(), "text too long (>250 chars), typing instead");
+                                type_text(&spoken);
+                                set_status_icon(&status_item, AppState::Idle, mtm);
+                                return;
+                            }
+                            info!(original = %trimmed, instruction = %spoken, "correcting");
                             // Save original for comparison when result arrives
                             correction_original.set(Some(original_text.clone()));
 
