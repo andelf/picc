@@ -52,6 +52,10 @@ name = "dictation"
 path = "src/bin/dictation.rs"
 required-features = ["sensevoice"]
 
+[[bin]]
+name = "voice-correct"
+path = "src/bin/voice_correct.rs"
+
 [dependencies]
 objc2 = "0.6.4"
 block2 = "0.6.2"
@@ -89,6 +93,7 @@ objc2-app-kit = { version = "0.3.2", features = [
     "NSMenuItem",
     "NSButton",
     "NSControl",
+    "NSPasteboard",
     "block2",
 ] }
 objc2-core-graphics = { version = "0.3.2", features = [

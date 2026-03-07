@@ -81,6 +81,25 @@ cargo run -p dictation-ng
 # Model auto-downloaded on first run (~715MB)
 ```
 
+### voice-correct — Voice Dictation + Correction
+
+Hold right Command to dictate speech; tap then hold to voice-correct existing text using LLM. Combines push-to-talk dictation with voice-driven text correction powered by Kimi API.
+
+- **Hold right Cmd**: dictation mode — speak and text is typed at cursor
+- **Tap + hold right Cmd**: correction mode — speak a correction instruction (e.g. "put a period at the end"), LLM modifies the focused text field
+- Audio feedback (system sounds) for start/stop/error
+- Menubar status icon: idle / recording / correcting / processing
+- Smart text replacement: AX API for native apps, clipboard paste for browsers/Electron/Lark
+- Supports both Apple Speech API and SenseVoice (offline) engines
+
+```sh
+# Apple Speech (default)
+KIMI_API_KEY=sk-... cargo run --bin voice-correct
+
+# SenseVoice (offline)
+KIMI_API_KEY=sk-... cargo run --bin voice-correct --features sensevoice -- --engine sensevoice
+```
+
 ### claude_menubar — Claude Code Status Hook
 
 Menubar indicator showing Claude Code session status, driven by Claude Code hooks.
