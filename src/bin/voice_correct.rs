@@ -43,7 +43,7 @@ use objc2_speech::{
 use objc2_application_services::AXUIElement;
 use picc::accessibility;
 use picc::input::{parse_key_combo, press_key_combo, type_text};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use serde::{Deserialize, Serialize};
 
@@ -144,14 +144,14 @@ unsafe extern "C-unwind" fn event_tap_callback(
                 let gap = now - last_tap;
                 if gap < 300 {
                     SESSION_MODE.store(MODE_CORRECT, Ordering::Relaxed);
-                    debug!(t = now, gap, "press → CORRECT");
+                    debug!(gap, "press → CORRECT");
                 } else {
                     SESSION_MODE.store(MODE_DICTATION, Ordering::Relaxed);
-                    debug!(t = now, gap, "press → DICTATION");
+                    debug!(gap, "press → DICTATION");
                 }
                 SHOULD_START.store(true, Ordering::Relaxed);
             } else {
-                debug!(t = now, "press (already recording, ignored)");
+                debug!("press (already recording, ignored)");
             }
         } else if !right_cmd_pressed && was_down {
             // Release
@@ -169,17 +169,17 @@ unsafe extern "C-unwind" fn event_tap_callback(
             if is_rec {
                 if hold < 300 && SESSION_MODE.load(Ordering::Relaxed) == MODE_DICTATION {
                     SHOULD_CANCEL.store(true, Ordering::Relaxed);
-                    debug!(t = now, hold, rec = true, "release → CANCEL");
+                    debug!(hold, "release → CANCEL");
                 } else {
                     SHOULD_STOP.store(true, Ordering::Relaxed);
-                    debug!(t = now, hold, rec = true, "release → STOP");
+                    debug!(hold, "release → STOP");
                 }
             } else {
                 if hold < 300 {
                     SHOULD_START.store(false, Ordering::Relaxed);
-                    debug!(t = now, hold, rec = false, "release → CLEAR_START");
+                    debug!(hold, "release → CLEAR_START");
                 } else {
-                    debug!(t = now, hold, rec = false, "release → noop");
+                    debug!(hold, "release → noop");
                 }
             }
         }
@@ -204,11 +204,7 @@ fn ensure_sensevoice_model(base_dir: &Path) -> String {
         return model_dir.to_string_lossy().into_owned();
     }
 
-    eprintln!(
-        "[voice-correct] SenseVoice model not found at {}",
-        model_dir.display()
-    );
-    eprintln!("[voice-correct] first run — downloading model (~250 MB), this may take a few minutes...");
+    info!(path = %model_dir.display(), "SenseVoice model not found, downloading (~250 MB)...");
     std::fs::create_dir_all(base_dir).expect("failed to create model directory");
 
     let archive = base_dir.join("sensevoice.tar.bz2");
@@ -396,7 +392,7 @@ fn should_use_clipboard() -> bool {
 fn write_corrected_text(element: &AXUIElement, text: &str) -> bool {
     // Browsers & Electron: skip AX, go straight to clipboard
     if should_use_clipboard() {
-        eprintln!("[voice-correct] using clipboard paste for this app");
+        info!("using clipboard paste for this app");
         return replace_via_clipboard(text);
     }
 
@@ -409,7 +405,7 @@ fn write_corrected_text(element: &AXUIElement, text: &str) -> bool {
                 return true;
             }
         }
-        eprintln!("[voice-correct] AXValue set didn't take effect, using clipboard fallback");
+        info!("AXValue set didn't take effect, using clipboard fallback");
     }
 
     replace_via_clipboard(text)
@@ -543,7 +539,6 @@ fn main() {
                 .add_directive("voice_correct=debug".parse().unwrap()),
         )
         .with_target(false)
-        .without_time()
         .init();
 
     let args = Args::parse();
@@ -551,8 +546,8 @@ fn main() {
 
     #[cfg(not(feature = "sensevoice"))]
     if use_sensevoice {
-        eprintln!("[voice-correct] ERROR: sensevoice engine requires --features sensevoice");
-        eprintln!("[voice-correct] cargo run --bin voice-correct --features sensevoice -- --engine sensevoice");
+        error!("sensevoice engine requires --features sensevoice");
+        error!("cargo run --bin voice-correct --features sensevoice -- --engine sensevoice");
         std::process::exit(1);
     }
 
@@ -562,10 +557,10 @@ fn main() {
     app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
 
     if !accessibility::is_trusted() {
-        eprintln!("[voice-correct] WARNING: accessibility not trusted — text read/write may fail");
+        warn!("accessibility not trusted — text read/write may fail");
     }
     if std::env::var("KIMI_API_KEY").is_err() {
-        eprintln!("[voice-correct] WARNING: KIMI_API_KEY not set — correction mode will fail");
+        warn!("KIMI_API_KEY not set — correction mode will fail");
     }
 
     // --- SenseVoice recognizer (if needed) ---
@@ -584,10 +579,10 @@ fn main() {
                 use_itn: true,
                 ..Default::default()
             };
-            eprintln!("[voice-correct] loading SenseVoice model from {model_dir}...");
+            info!(path = %model_dir, "loading SenseVoice model");
             let recognizer = sherpa_rs::sense_voice::SenseVoiceRecognizer::new(config)
                 .expect("failed to init SenseVoice — check --model-dir");
-            eprintln!("[voice-correct] SenseVoice model loaded");
+            info!("SenseVoice model loaded");
             Cell::new(Some(recognizer))
         } else {
             Cell::new(None)
@@ -602,12 +597,9 @@ fn main() {
         unsafe {
             let handler = RcBlock::new(|status: SFSpeechRecognizerAuthorizationStatus| {
                 if status == SFSpeechRecognizerAuthorizationStatus::Authorized {
-                    eprintln!("[voice-correct] speech recognition authorized");
+                    info!("speech recognition authorized");
                 } else {
-                    eprintln!(
-                        "[voice-correct] speech recognition not authorized: {:?}",
-                        status
-                    );
+                    warn!(?status, "speech recognition not authorized");
                 }
             });
             SFSpeechRecognizer::requestAuthorization(&handler);
@@ -665,9 +657,7 @@ fn main() {
     } else {
         "Apple Speech"
     };
-    eprintln!(
-        "[voice-correct] ready ({engine_name}) — hold right Cmd: dictate | tap+hold: correct"
-    );
+    info!(engine = engine_name, "ready — hold right Cmd: dictate | tap+hold: correct");
 
     // --- State ---
     let is_recording = Cell::new(false);
@@ -714,10 +704,10 @@ fn main() {
                                 }
                             }
                             Ok(_) => {
-                                eprintln!("[voice-correct] no change needed");
+                                info!("no change needed");
                             }
                             Err(e) => {
-                                eprintln!("[voice-correct] LLM error: {}", e);
+                                error!(err = %e, "LLM error");
                                 play_error_sound();
                             }
                         }
@@ -728,7 +718,7 @@ fn main() {
 
             // --- CANCEL recording (short tap) ---
             if SHOULD_CANCEL.swap(false, Ordering::Relaxed) && is_recording.get() {
-                debug!(t = now_ms(), "timer → cancel");
+                debug!("timer → cancel");
                 is_recording.set(false);
                 IS_RECORDING.store(false, Ordering::Relaxed);
 
@@ -761,7 +751,7 @@ fn main() {
                 } else {
                     "dictate"
                 };
-                debug!(t = now_ms(), mode = mode_name, "timer → start");
+                debug!(mode = mode_name, "timer → start");
 
                 is_recording.set(true);
                 IS_RECORDING.store(true, Ordering::Relaxed);
@@ -837,17 +827,14 @@ fn main() {
                          error: *mut objc2_foundation::NSError| {
                             if !error.is_null() {
                                 let error = &*error;
-                                eprintln!(
-                                    "[voice-correct] recognition error: {:?}",
-                                    error.localizedDescription()
-                                );
+                                warn!("recognition error: {:?}", error.localizedDescription());
                             } else if !result.is_null() {
                                 let result = &*result;
                                 let text = result
                                     .bestTranscription()
                                     .formattedString()
                                     .to_string();
-                                eprintln!("[voice-correct] partial: {}", text);
+                                debug!(text = %text, "partial");
                                 if let Ok(mut stored) = RECOGNIZED_TEXT.lock() {
                                     *stored = text;
                                 }
@@ -864,7 +851,7 @@ fn main() {
 
                 audio_engine.prepare();
                 if let Err(e) = audio_engine.startAndReturnError() {
-                    eprintln!("[voice-correct] audio engine start error: {:?}", e);
+                    error!(?e, "audio engine start error");
                     is_recording.set(false);
                     IS_RECORDING.store(false, Ordering::Relaxed);
                     set_status_icon(&status_item, AppState::Idle, mtm);
@@ -893,7 +880,7 @@ fn main() {
                     {
                         let raw_samples = samples_ref.lock().unwrap();
                         if raw_samples.is_empty() {
-                            eprintln!("[voice-correct] no audio captured");
+                            warn!("no audio captured");
                             set_status_icon(&status_item, AppState::Idle, mtm);
                             return;
                         }
@@ -918,18 +905,12 @@ fn main() {
                         };
                         drop(raw_samples);
 
-                        eprintln!(
-                            "[voice-correct] transcribing {:.1}s of audio...",
-                            samples_16k.len() as f64 / 16000.0
-                        );
+                        info!(duration_s = format_args!("{:.1}", samples_16k.len() as f64 / 16000.0), "transcribing audio");
                         if let Some(mut recognizer) = sv_recognizer.take() {
                             let t0 = std::time::Instant::now();
                             let result = recognizer.transcribe(16000, &samples_16k);
                             let ms = t0.elapsed().as_secs_f64() * 1000.0;
-                            eprintln!(
-                                "[voice-correct] ASR: \"{}\" ({:.0}ms)",
-                                result.text, ms
-                            );
+                            info!(text = %result.text, elapsed_ms = format_args!("{:.0}", ms), "ASR result");
                             spoken = result.text;
                             sv_recognizer.set(Some(recognizer));
                         } else {
@@ -985,10 +966,7 @@ fn main() {
 
                     match read_focused_text() {
                         Some((_element, original_text)) => {
-                            eprintln!(
-                                "[voice-correct] correcting: \"{}\" with instruction: \"{}\"",
-                                original_text, spoken
-                            );
+                            info!(original = %original_text.trim(), instruction = %spoken, "correcting");
                             // Save original for comparison when result arrives
                             correction_original.set(Some(original_text.clone()));
 
@@ -1005,11 +983,8 @@ fn main() {
                                 let result = call_llm(&orig, &instr);
                                 let elapsed = t0.elapsed().as_secs_f64() * 1000.0;
                                 match &result {
-                                    Ok(text) => eprintln!(
-                                        "[voice-correct] result: \"{}\" ({:.0}ms)",
-                                        text, elapsed
-                                    ),
-                                    Err(e) => eprintln!("[voice-correct] LLM error: {} ({:.0}ms)", e, elapsed),
+                                    Ok(text) => info!(text = %text, elapsed_ms = format_args!("{:.0}", elapsed), "LLM result"),
+                                    Err(e) => error!(err = %e, elapsed_ms = format_args!("{:.0}", elapsed), "LLM error"),
                                 }
                                 if let Ok(mut r) = LLM_RESULT.lock() {
                                     *r = Some(result);
@@ -1018,10 +993,7 @@ fn main() {
                         }
                         None => {
                             // Empty field → fall back to typing (no LLM call)
-                            eprintln!(
-                                "[voice-correct] field empty, typing instead: {}",
-                                spoken
-                            );
+                            info!(text = %spoken, "field empty, typing instead");
                             type_text(&spoken);
                             set_status_icon(&status_item, AppState::Idle, mtm);
                         }
