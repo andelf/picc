@@ -85,11 +85,12 @@ cargo run -p dictation-ng
 
 Hold right Command to dictate speech; tap then hold to voice-correct existing text using LLM. Combines push-to-talk dictation with voice-driven text correction powered by Kimi API.
 
-- **Hold right Cmd**: dictation mode — speak and text is typed at cursor
+- **Hold right Cmd**: dictation mode — speak and text is typed at cursor (zero-latency recording)
 - **Tap + hold right Cmd**: correction mode — speak a correction instruction (e.g. "put a period at the end"), LLM modifies the focused text field
 - Audio feedback (system sounds) for start/stop/error
-- Menubar status icon: idle / recording / correcting / processing
+- Animated menubar status icon: idle / recording / correcting / processing
 - Smart text replacement: AX API for native apps, clipboard paste for browsers/Electron/Lark
+- Terminal-aware: skips AX text reading for Terminal, iTerm2, Alacritty, Ghostty, etc.
 - Supports both Apple Speech API and SenseVoice (offline) engines
 
 ```sh
