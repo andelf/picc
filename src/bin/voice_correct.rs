@@ -92,11 +92,11 @@ const NX_DEVICERCMDKEYMASK: u64 = 0x10;
 
 static SHOULD_START: AtomicBool = AtomicBool::new(false);
 static SHOULD_STOP: AtomicBool = AtomicBool::new(false);
+/// Cancel current recording without processing (short tap)
+static SHOULD_CANCEL: AtomicBool = AtomicBool::new(false);
 static IS_RECORDING: AtomicBool = AtomicBool::new(false);
-/// A press is pending — waiting to see if it's a tap or a hold
-static PENDING_START: AtomicBool = AtomicBool::new(false);
-/// When the pending press happened (ms)
-static PENDING_PRESS_MS: AtomicU64 = AtomicU64::new(0);
+/// When the current press happened (ms)
+static PRESS_MS: AtomicU64 = AtomicU64::new(0);
 /// Last short-tap release timestamp (ms) — for double-tap detection
 static LAST_TAP_RELEASE_MS: AtomicU64 = AtomicU64::new(0);
 /// Current session mode: 0=none, 1=dictation, 2=correct
@@ -125,34 +125,43 @@ unsafe extern "C-unwind" fn event_tap_callback(
         let was_down = WAS_DOWN.load(Ordering::Relaxed);
 
         if right_cmd_pressed && !was_down {
-            // Press
+            // Press → always start recording immediately
             WAS_DOWN.store(true, Ordering::Relaxed);
             let now = now_ms();
+            PRESS_MS.store(now, Ordering::Relaxed);
 
             if !IS_RECORDING.load(Ordering::Relaxed) {
                 let last_tap = LAST_TAP_RELEASE_MS.load(Ordering::Relaxed);
                 if (now - last_tap) < 300 {
-                    // Press shortly after a tap → double-tap! Start correction immediately
+                    // Press shortly after a tap → double-tap → correction mode
                     SESSION_MODE.store(MODE_CORRECT, Ordering::Relaxed);
-                    PENDING_START.store(false, Ordering::Relaxed);
-                    SHOULD_START.store(true, Ordering::Relaxed);
                 } else {
-                    // Normal press → pending, wait 300ms to confirm it's a hold
-                    PENDING_START.store(true, Ordering::Relaxed);
-                    PENDING_PRESS_MS.store(now, Ordering::Relaxed);
+                    // Normal press → dictation mode
+                    SESSION_MODE.store(MODE_DICTATION, Ordering::Relaxed);
                 }
+                SHOULD_START.store(true, Ordering::Relaxed);
             }
         } else if !right_cmd_pressed && was_down {
             // Release
             WAS_DOWN.store(false, Ordering::Relaxed);
+            let now = now_ms();
+            let hold = now - PRESS_MS.load(Ordering::Relaxed);
 
             if IS_RECORDING.load(Ordering::Relaxed) {
-                // Was recording → stop
-                SHOULD_STOP.store(true, Ordering::Relaxed);
-            } else if PENDING_START.load(Ordering::Relaxed) {
-                // Was pending (short tap before 300ms hold threshold) → record as tap
-                PENDING_START.store(false, Ordering::Relaxed);
-                LAST_TAP_RELEASE_MS.store(now_ms(), Ordering::Relaxed);
+                if hold < 300 && SESSION_MODE.load(Ordering::Relaxed) == MODE_DICTATION {
+                    // Short tap in dictation mode → cancel recording, mark as tap
+                    SHOULD_CANCEL.store(true, Ordering::Relaxed);
+                    LAST_TAP_RELEASE_MS.store(now, Ordering::Relaxed);
+                } else {
+                    // Long hold or correction mode → stop and process
+                    SHOULD_STOP.store(true, Ordering::Relaxed);
+                }
+            } else {
+                // Timer hasn't started recording yet → cancel pending start
+                if hold < 300 {
+                    SHOULD_START.store(false, Ordering::Relaxed);
+                    LAST_TAP_RELEASE_MS.store(now, Ordering::Relaxed);
+                }
             }
         }
     }
@@ -313,6 +322,7 @@ const CLIPBOARD_ONLY_BUNDLES: &[&str] = &[
     "com.electron.",           // prefix match for Electron apps
     "us.zoom.xos",
     "com.larksuite.Lark",
+    "com.larksuite.larkApp",
     "com.bytedance.lark.Feishu",
 ];
 
@@ -625,14 +635,29 @@ fn main() {
         let samples_ref = accumulated_samples.clone();
 
         let block = RcBlock::new(move |_timer: NonNull<NSTimer>| {
-            // --- PENDING → DICTATION promotion (held 300ms without release) ---
-            if PENDING_START.load(Ordering::Relaxed)
-                && !is_recording.get()
-                && (now_ms() - PENDING_PRESS_MS.load(Ordering::Relaxed)) >= 300
-            {
-                PENDING_START.store(false, Ordering::Relaxed);
-                SESSION_MODE.store(MODE_DICTATION, Ordering::Relaxed);
-                SHOULD_START.store(true, Ordering::Relaxed);
+            // --- CANCEL recording (short tap) ---
+            if SHOULD_CANCEL.swap(false, Ordering::Relaxed) && is_recording.get() {
+                eprintln!("[voice-correct] tap detected, cancelled");
+                is_recording.set(false);
+                IS_RECORDING.store(false, Ordering::Relaxed);
+
+                let microphone = audio_engine.inputNode();
+                microphone.removeTapOnBus(0);
+                audio_engine.stop();
+
+                if use_sensevoice {
+                    if let Ok(mut s) = samples_ref.lock() {
+                        s.clear();
+                    }
+                } else {
+                    if let Some(req) = apple_request.take() {
+                        req.endAudio();
+                    }
+                    if let Ok(mut t) = RECOGNIZED_TEXT.lock() {
+                        t.clear();
+                    }
+                }
+                set_status_icon(&status_item, AppState::Idle, mtm);
             }
 
             // --- START recording ---
