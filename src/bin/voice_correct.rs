@@ -9,7 +9,7 @@
 //!   KIMI_API_KEY=sk-... cargo run --bin voice-correct
 //!   KIMI_API_KEY=sk-... cargo run --bin voice-correct --features sensevoice -- --engine sensevoice
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 #[cfg(feature = "sensevoice")]
 use std::path::Path;
 use std::ptr::{self, NonNull};
@@ -21,7 +21,7 @@ use block2::RcBlock;
 use clap::Parser;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject};
-use objc2::{define_class, sel, AnyThread, MainThreadMarker, MainThreadOnly};
+use objc2::{define_class, sel, AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSImage, NSMenu, NSMenuItem, NSStatusBar,
     NSStatusItem,
@@ -107,10 +107,27 @@ static RECOGNIZED_TEXT: Mutex<String> = Mutex::new(String::new());
 /// LLM result from background thread: Some(Ok(corrected)) or Some(Err(msg))
 static LLM_RESULT: Mutex<Option<Result<String, String>>> = Mutex::new(None);
 
-// --- Dictation post-processing toggles ---
-static FULLWIDTH_TO_HALFWIDTH: AtomicBool = AtomicBool::new(false);
-static AUTO_INSERT_SPACES: AtomicBool = AtomicBool::new(false);
-static STRIP_TRAILING_PUNCT: AtomicBool = AtomicBool::new(false);
+// --- Dictation post-processing options ---
+
+#[derive(Debug, Clone, Copy, Default)]
+struct DictationOptions {
+    fullwidth_to_halfwidth: bool,
+    auto_insert_spaces: bool,
+    strip_trailing_punct: bool,
+}
+
+struct MenuDelegateIvars {
+    options: Cell<DictationOptions>,
+    spaces_item: RefCell<Option<Retained<NSMenuItem>>>,
+}
+
+impl std::fmt::Debug for MenuDelegateIvars {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MenuDelegateIvars")
+            .field("options", &self.options)
+            .finish_non_exhaustive()
+    }
+}
 
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -266,16 +283,16 @@ fn ensure_sensevoice_model(base_dir: &Path) -> String {
 
 // --- Dictation post-processing ---
 
-fn apply_dictation_transforms(text: &str) -> String {
+fn apply_dictation_transforms(text: &str, opts: DictationOptions) -> String {
     let mut result = text.to_string();
 
-    if FULLWIDTH_TO_HALFWIDTH.load(Ordering::Relaxed) {
+    if opts.fullwidth_to_halfwidth {
         result = fullwidth_to_halfwidth(&result);
-        if AUTO_INSERT_SPACES.load(Ordering::Relaxed) {
+        if opts.auto_insert_spaces {
             result = insert_spaces_around_punctuation(&result);
         }
     }
-    if STRIP_TRAILING_PUNCT.load(Ordering::Relaxed) {
+    if opts.strip_trailing_punct {
         result = strip_trailing_punctuation(&result);
     }
 
@@ -362,6 +379,7 @@ define_class!(
     #[unsafe(super(NSObject))]
     #[thread_kind = MainThreadOnly]
     #[name = "VoiceCorrectMenuDelegate"]
+    #[ivars = MenuDelegateIvars]
     #[derive(Debug, PartialEq)]
     struct MenuDelegate;
 
@@ -374,29 +392,48 @@ define_class!(
 
         #[unsafe(method(toggleFullwidthToHalfwidth:))]
         fn toggle_fullwidth_to_halfwidth(&self, sender: &AnyObject) {
-            let prev = FULLWIDTH_TO_HALFWIDTH.fetch_xor(true, Ordering::Relaxed);
-            let new_state = !prev;
+            let mut opts = self.ivars().options.get();
+            opts.fullwidth_to_halfwidth = !opts.fullwidth_to_halfwidth;
+            self.ivars().options.set(opts);
+
             let item: &NSMenuItem = unsafe { &*(sender as *const AnyObject as *const NSMenuItem) };
-            item.setState(if new_state { 1 } else { 0 });
-            info!(enabled = new_state, "fullwidth→halfwidth");
+            item.setState(if opts.fullwidth_to_halfwidth { 1 } else { 0 });
+
+            // Enable/disable the spaces sub-option
+            if let Some(spaces) = self.ivars().spaces_item.borrow().as_ref() {
+                if opts.fullwidth_to_halfwidth {
+                    spaces.setEnabled(true);
+                } else {
+                    // Turn off and uncheck spaces when fullwidth is disabled
+                    opts.auto_insert_spaces = false;
+                    self.ivars().options.set(opts);
+                    spaces.setEnabled(false);
+                    spaces.setState(0);
+                }
+            }
+            info!(enabled = opts.fullwidth_to_halfwidth, "fullwidth→halfwidth");
         }
 
         #[unsafe(method(toggleAutoInsertSpaces:))]
         fn toggle_auto_insert_spaces(&self, sender: &AnyObject) {
-            let prev = AUTO_INSERT_SPACES.fetch_xor(true, Ordering::Relaxed);
-            let new_state = !prev;
+            let mut opts = self.ivars().options.get();
+            opts.auto_insert_spaces = !opts.auto_insert_spaces;
+            self.ivars().options.set(opts);
+
             let item: &NSMenuItem = unsafe { &*(sender as *const AnyObject as *const NSMenuItem) };
-            item.setState(if new_state { 1 } else { 0 });
-            info!(enabled = new_state, "auto insert spaces");
+            item.setState(if opts.auto_insert_spaces { 1 } else { 0 });
+            info!(enabled = opts.auto_insert_spaces, "auto insert spaces");
         }
 
         #[unsafe(method(toggleStripTrailingPunct:))]
         fn toggle_strip_trailing_punct(&self, sender: &AnyObject) {
-            let prev = STRIP_TRAILING_PUNCT.fetch_xor(true, Ordering::Relaxed);
-            let new_state = !prev;
+            let mut opts = self.ivars().options.get();
+            opts.strip_trailing_punct = !opts.strip_trailing_punct;
+            self.ivars().options.set(opts);
+
             let item: &NSMenuItem = unsafe { &*(sender as *const AnyObject as *const NSMenuItem) };
-            item.setState(if new_state { 1 } else { 0 });
-            info!(enabled = new_state, "strip trailing punctuation");
+            item.setState(if opts.strip_trailing_punct { 1 } else { 0 });
+            info!(enabled = opts.strip_trailing_punct, "strip trailing punctuation");
         }
     }
 );
@@ -777,9 +814,15 @@ fn main() {
     let status_item = status_bar.statusItemWithLength(-1.0);
     set_status_icon(&status_item, AppState::Idle, mtm);
 
-    let delegate: Retained<MenuDelegate> =
-        unsafe { objc2::msg_send![MenuDelegate::alloc(mtm), init] };
+    let delegate: Retained<MenuDelegate> = {
+        let this = MenuDelegate::alloc(mtm).set_ivars(MenuDelegateIvars {
+            options: Cell::new(DictationOptions::default()),
+            spaces_item: RefCell::new(None),
+        });
+        unsafe { objc2::msg_send![super(this), init] }
+    };
     let menu = NSMenu::new(mtm);
+    menu.setAutoenablesItems(false);
     let quit_item = unsafe {
         NSMenuItem::initWithTitle_action_keyEquivalent(
             NSMenuItem::alloc(mtm),
@@ -811,6 +854,8 @@ fn main() {
         )
     };
     unsafe { spaces_item.setTarget(Some(&delegate)) };
+    spaces_item.setEnabled(false); // disabled until fullwidth is turned on
+    *delegate.ivars().spaces_item.borrow_mut() = Some(spaces_item.clone());
 
     // Toggle: strip trailing punctuation
     let strip_item = unsafe {
@@ -855,6 +900,7 @@ fn main() {
     // --- Timer (50ms polling) ---
     let _timer = unsafe {
         let samples_ref = accumulated_samples.clone();
+        let delegate = delegate.clone();
 
         let block = RcBlock::new(move |_timer: NonNull<NSTimer>| {
             // --- Animate processing icon (cycle every ~250ms = 5 ticks) ---
@@ -1126,7 +1172,7 @@ fn main() {
 
                 if mode == MODE_DICTATION {
                     // --- Dictation mode: just type ---
-                    let spoken = apply_dictation_transforms(&spoken);
+                    let spoken = apply_dictation_transforms(&spoken, delegate.ivars().options.get());
                     info!(text = %spoken, "typing");
                     type_text(&spoken);
                     set_status_icon(&status_item, AppState::Idle, mtm);
