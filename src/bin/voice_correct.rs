@@ -107,6 +107,11 @@ static RECOGNIZED_TEXT: Mutex<String> = Mutex::new(String::new());
 /// LLM result from background thread: Some(Ok(corrected)) or Some(Err(msg))
 static LLM_RESULT: Mutex<Option<Result<String, String>>> = Mutex::new(None);
 
+// --- Dictation post-processing toggles ---
+static FULLWIDTH_TO_HALFWIDTH: AtomicBool = AtomicBool::new(false);
+static AUTO_INSERT_SPACES: AtomicBool = AtomicBool::new(false);
+static STRIP_TRAILING_PUNCT: AtomicBool = AtomicBool::new(false);
+
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -259,6 +264,98 @@ fn ensure_sensevoice_model(base_dir: &Path) -> String {
     model_dir.to_string_lossy().into_owned()
 }
 
+// --- Dictation post-processing ---
+
+fn apply_dictation_transforms(text: &str) -> String {
+    let mut result = text.to_string();
+
+    if FULLWIDTH_TO_HALFWIDTH.load(Ordering::Relaxed) {
+        result = fullwidth_to_halfwidth(&result);
+        if AUTO_INSERT_SPACES.load(Ordering::Relaxed) {
+            result = insert_spaces_around_punctuation(&result);
+        }
+    }
+    if STRIP_TRAILING_PUNCT.load(Ordering::Relaxed) {
+        result = strip_trailing_punctuation(&result);
+    }
+
+    result
+}
+
+fn fullwidth_to_halfwidth(s: &str) -> String {
+    s.chars()
+        .map(|c| match c {
+            // Fullwidth ASCII variants (Ａ→A, ，→, etc.)
+            '\u{FF01}'..='\u{FF5E}' => char::from_u32(c as u32 - 0xFEE0).unwrap_or(c),
+            '\u{3000}' => ' ',  // ideographic space
+            '。' => '.',        // U+3002
+            '、' => ',',        // U+3001
+            '【' => '[',        // U+3010
+            '】' => ']',        // U+3011
+            '「' => '"',        // U+300C
+            '」' => '"',        // U+300D
+            '《' => '<',        // U+300A
+            '》' => '>',        // U+300B
+            '\u{201C}' => '"',  // left double quote
+            '\u{201D}' => '"',  // right double quote
+            '\u{2018}' => '\'', // left single quote
+            '\u{2019}' => '\'', // right single quote
+            _ => c,
+        })
+        .collect()
+}
+
+/// Insert spaces around half-width punctuation so it reads better in CJK text.
+/// - After: , . ! ? : ;
+/// - Before opening / after closing brackets: ( ) [ ] < > " "
+fn insert_spaces_around_punctuation(s: &str) -> String {
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::with_capacity(s.len() + 32);
+
+    for (i, &c) in chars.iter().enumerate() {
+        let prev = if i > 0 { Some(chars[i - 1]) } else { None };
+        let next = chars.get(i + 1).copied();
+
+        match c {
+            // After these, insert a trailing space (unless next is already space/end)
+            ',' | '.' | '!' | '?' | ':' | ';' => {
+                out.push(c);
+                if next.is_some_and(|n| n != ' ' && !n.is_ascii_punctuation()) {
+                    out.push(' ');
+                }
+            }
+            // Closing brackets / quotes: space after
+            ')' | ']' | '>' => {
+                out.push(c);
+                if next.is_some_and(|n| n != ' ' && !n.is_ascii_punctuation()) {
+                    out.push(' ');
+                }
+            }
+            // Opening brackets / quotes: space before
+            '(' | '[' | '<' => {
+                if prev.is_some_and(|p| p != ' ') {
+                    out.push(' ');
+                }
+                out.push(c);
+            }
+            _ => out.push(c),
+        }
+    }
+
+    out
+}
+
+fn strip_trailing_punctuation(s: &str) -> String {
+    s.trim_end_matches(|c: char| {
+        matches!(
+            c,
+            '.' | ',' | '!' | '?' | ';' | ':' | '。' | '，' | '！' | '？' | '；' | '：' | '、'
+                | '…'
+        )
+    })
+    .to_string()
+}
+
 // --- Menubar delegate ---
 
 define_class!(
@@ -273,6 +370,33 @@ define_class!(
         #[unsafe(method(quit:))]
         fn quit(&self, _sender: &AnyObject) {
             std::process::exit(0);
+        }
+
+        #[unsafe(method(toggleFullwidthToHalfwidth:))]
+        fn toggle_fullwidth_to_halfwidth(&self, sender: &AnyObject) {
+            let prev = FULLWIDTH_TO_HALFWIDTH.fetch_xor(true, Ordering::Relaxed);
+            let new_state = !prev;
+            let item: &NSMenuItem = unsafe { &*(sender as *const AnyObject as *const NSMenuItem) };
+            item.setState(if new_state { 1 } else { 0 });
+            info!(enabled = new_state, "fullwidth→halfwidth");
+        }
+
+        #[unsafe(method(toggleAutoInsertSpaces:))]
+        fn toggle_auto_insert_spaces(&self, sender: &AnyObject) {
+            let prev = AUTO_INSERT_SPACES.fetch_xor(true, Ordering::Relaxed);
+            let new_state = !prev;
+            let item: &NSMenuItem = unsafe { &*(sender as *const AnyObject as *const NSMenuItem) };
+            item.setState(if new_state { 1 } else { 0 });
+            info!(enabled = new_state, "auto insert spaces");
+        }
+
+        #[unsafe(method(toggleStripTrailingPunct:))]
+        fn toggle_strip_trailing_punct(&self, sender: &AnyObject) {
+            let prev = STRIP_TRAILING_PUNCT.fetch_xor(true, Ordering::Relaxed);
+            let new_state = !prev;
+            let item: &NSMenuItem = unsafe { &*(sender as *const AnyObject as *const NSMenuItem) };
+            item.setState(if new_state { 1 } else { 0 });
+            info!(enabled = new_state, "strip trailing punctuation");
         }
     }
 );
@@ -665,6 +789,44 @@ fn main() {
         )
     };
     unsafe { quit_item.setTarget(Some(&delegate)) };
+
+    // Toggle: fullwidth → halfwidth
+    let fw_item = unsafe {
+        NSMenuItem::initWithTitle_action_keyEquivalent(
+            NSMenuItem::alloc(mtm),
+            &NSString::from_str("Fullwidth to Halfwidth"),
+            Some(sel!(toggleFullwidthToHalfwidth:)),
+            &NSString::from_str(""),
+        )
+    };
+    unsafe { fw_item.setTarget(Some(&delegate)) };
+
+    // Toggle: auto insert spaces (sub-option of fullwidth→halfwidth)
+    let spaces_item = unsafe {
+        NSMenuItem::initWithTitle_action_keyEquivalent(
+            NSMenuItem::alloc(mtm),
+            &NSString::from_str("  Auto Insert Spaces"),
+            Some(sel!(toggleAutoInsertSpaces:)),
+            &NSString::from_str(""),
+        )
+    };
+    unsafe { spaces_item.setTarget(Some(&delegate)) };
+
+    // Toggle: strip trailing punctuation
+    let strip_item = unsafe {
+        NSMenuItem::initWithTitle_action_keyEquivalent(
+            NSMenuItem::alloc(mtm),
+            &NSString::from_str("Strip Trailing Punctuation"),
+            Some(sel!(toggleStripTrailingPunct:)),
+            &NSString::from_str(""),
+        )
+    };
+    unsafe { strip_item.setTarget(Some(&delegate)) };
+
+    menu.addItem(&fw_item);
+    menu.addItem(&spaces_item);
+    menu.addItem(&strip_item);
+    menu.addItem(&NSMenuItem::separatorItem(mtm));
     menu.addItem(&quit_item);
     status_item.setMenu(Some(&menu));
 
@@ -964,6 +1126,7 @@ fn main() {
 
                 if mode == MODE_DICTATION {
                     // --- Dictation mode: just type ---
+                    let spoken = apply_dictation_transforms(&spoken);
                     info!(text = %spoken, "typing");
                     type_text(&spoken);
                     set_status_icon(&status_item, AppState::Idle, mtm);
