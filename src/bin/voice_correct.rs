@@ -283,6 +283,17 @@ fn ensure_sensevoice_model(base_dir: &Path) -> String {
 
 // --- Dictation post-processing ---
 
+/// Apply user-configured text transforms before text goes on screen.
+///
+/// Used in both paths:
+/// - **Dictation mode**: transform speech recognition output before typing
+/// - **Correction mode**: transform LLM output before writing back to text field
+///
+/// Transforms (each gated by its toggle):
+/// 1. `fullwidth_to_halfwidth` — convert CJK fullwidth punctuation to ASCII halfwidth
+/// 2. `auto_insert_spaces` — insert spaces around punctuation within the text
+///    (requires fullwidth_to_halfwidth to be on)
+/// 3. `strip_trailing_punct` — remove trailing punctuation (speech engines often add "。")
 fn apply_dictation_transforms(text: &str, opts: DictationOptions) -> String {
     let mut result = text.to_string();
 
@@ -486,6 +497,43 @@ fn set_status_icon_name(item: &NSStatusItem, name: &str, mtm: MainThreadMarker) 
 }
 
 // --- AX: read focused element + text ---
+
+/// Punctuation characters after which a space should be inserted before new text.
+const SPACE_AFTER_PUNCT: &[char] = &[',', '.', ';', ':', '!', '?', ')', ']', '}', '"', '\''];
+
+/// Read the character immediately before the cursor in the focused text field.
+/// Returns None if unable to determine (no focused element, empty text, or at position 0).
+fn char_before_cursor() -> Option<char> {
+    let system = unsafe { AXUIElement::new_system_wide() };
+    let focused_cf = accessibility::attr_value(&system, "AXFocusedUIElement")?;
+    let focused: CFRetained<AXUIElement> = unsafe { CFRetained::cast_unchecked(focused_cf) };
+    let text = accessibility::attr_string(&focused, "AXValue")?;
+    if text.is_empty() {
+        return None;
+    }
+    // Try to get cursor position from AXSelectedTextRange
+    let range_cf = accessibility::attr_value(&focused, "AXSelectedTextRange")?;
+    // AXSelectedTextRange is a CFRange wrapped in AXValue — extract via AXValue::value
+    let ax_value: &objc2_application_services::AXValue =
+        unsafe { &*(range_cf.as_ref() as *const CFType as *const objc2_application_services::AXValue) };
+    let mut range = objc2_core_foundation::CFRange { location: 0, length: 0 };
+    let ok = unsafe {
+        ax_value.value(
+            objc2_application_services::AXValueType::CFRange,
+            NonNull::new_unchecked(&mut range as *mut _ as *mut std::ffi::c_void),
+        )
+    };
+    if !ok {
+        // Fallback: assume cursor is at end
+        return text.chars().last();
+    }
+    let pos = range.location as usize;
+    if pos == 0 {
+        return None;
+    }
+    // Get the character just before cursor position
+    text.chars().nth(pos - 1)
+}
 
 fn read_focused_text() -> Option<(CFRetained<AXUIElement>, String)> {
     let system = unsafe { AXUIElement::new_system_wide() };
@@ -919,6 +967,12 @@ fn main() {
                         let original = correction_original.take().unwrap_or_default();
                         match result {
                             Ok(corrected) if corrected != original => {
+                                // Apply dictation transforms to LLM output (e.g. fullwidth→halfwidth)
+                                // so corrected text matches user's punctuation preferences.
+                                let corrected = apply_dictation_transforms(
+                                    &corrected,
+                                    delegate.ivars().options.get(),
+                                );
                                 // Re-read focused element for writing
                                 if let Some((element, _)) = read_focused_text() {
                                     write_corrected_text(&element, &corrected);
@@ -1171,13 +1225,42 @@ fn main() {
                 }
 
                 if mode == MODE_DICTATION {
-                    // --- Dictation mode: just type ---
-                    let spoken = apply_dictation_transforms(&spoken, delegate.ivars().options.get());
+                    // --- Dictation mode: type spoken text at cursor ---
+                    //
+                    // Text processing pipeline:
+                    // 1. apply_dictation_transforms: fullwidth→halfwidth, insert spaces
+                    //    around punctuation within text, strip trailing punctuation
+                    // 2. Context-aware space: if auto_insert_spaces is on and the
+                    //    character before cursor is halfwidth punctuation (e.g. ","),
+                    //    prepend a space so "hello," + "world" → "hello, world"
+                    // 3. type_text: simulate keyboard input at cursor position
+                    let opts = delegate.ivars().options.get();
+                    let mut spoken = apply_dictation_transforms(&spoken, opts);
+                    if opts.auto_insert_spaces && !spoken.starts_with(' ') {
+                        if let Some(prev) = char_before_cursor() {
+                            if SPACE_AFTER_PUNCT.contains(&prev) {
+                                spoken.insert(0, ' ');
+                            }
+                        }
+                    }
                     info!(text = %spoken, "typing");
                     type_text(&spoken);
                     set_status_icon(&status_item, AppState::Idle, mtm);
                 } else {
-                    // --- Correction mode ---
+                    // --- Correction mode: LLM corrects existing text ---
+                    //
+                    // Flow:
+                    // 1. Read focused text field via AX API
+                    // 2. Send (original_text, voice_instruction) to LLM
+                    // 3. When LLM result arrives (checked in timer's is_processing block):
+                    //    a. apply_dictation_transforms on LLM output (fullwidth→halfwidth etc.)
+                    //    b. Write corrected text back via AX API or clipboard fallback
+                    //
+                    // Fallbacks that skip LLM and type spoken text directly:
+                    // - Terminal apps (AXValue returns entire buffer)
+                    // - Text too long (>250 chars)
+                    // - Empty text field (nothing to correct)
+                    //
                     // Skip if a previous LLM call is still in flight
                     if is_processing.get() {
                         warn!("still processing previous correction, skipping");
