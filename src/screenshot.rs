@@ -5,6 +5,16 @@ use objc2_core_foundation::{CFRetained, CFString, CFURL, CFURLPathStyle, CGPoint
 use objc2_core_graphics::{CGImage, CGWindowImageOption, CGWindowListCreateImage, CGWindowListOption};
 use objc2_image_io::CGImageDestination;
 
+extern "C" {
+    fn CGMainDisplayID() -> u32;
+}
+
+/// Ensure the CoreGraphics window server connection is initialized.
+/// Must be called before any CGImage/ImageIO operations in a CLI context.
+pub fn ensure_cg_init() {
+    unsafe { CGMainDisplayID(); }
+}
+
 /// Capture a screenshot of the given screen rectangle.
 #[allow(deprecated)]
 pub fn capture(rect: CGRect) -> Option<CFRetained<CGImage>> {

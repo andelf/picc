@@ -21,6 +21,7 @@
 
 use clap::{Parser, Subcommand};
 use objc2_core_foundation::{CGPoint, CGSize, CGRect};
+use objc2_core_graphics::CGImage;
 use picc::accessibility::{self, AXNode};
 use picc::actions::ExecutionContext;
 use picc::error::{AxError, exit_code};
@@ -223,8 +224,11 @@ enum Command {
         #[arg(default_value = "300")]
         pixels: i32,
     },
-    /// Capture screenshot
+    /// Capture screenshot (background, no need to activate app)
     ///
+    /// Uses ScreenCaptureKit to capture the window in the background — the target
+    /// app does NOT need to be in the foreground, and occluded windows are captured
+    /// correctly. Falls back to legacy CGWindowListCreateImage if SCK is unavailable.
     /// Saves PNG to file. Use --ocr to also extract text via Vision framework.
     /// Prefer `snapshot` for structured exploration (faster, no file I/O).
     /// Use screenshot when you need visual context or multimodal analysis.
@@ -239,6 +243,12 @@ enum Command {
         /// to read the screenshot directly if OCR output is unsatisfactory.
         #[arg(long)]
         ocr: bool,
+        /// Force legacy capture: activate app to foreground + CGWindowListCreateImage.
+        /// Useful when you need to verify what's actually visible on screen (e.g.
+        /// before a click), since SCK captures the window's own content regardless
+        /// of occlusion.
+        #[arg(long)]
+        legacy: bool,
     },
     /// Wait for element or milliseconds
     ///
@@ -325,8 +335,8 @@ fn run(cli: Cli) -> Result<(), AxError> {
         Command::Scroll { locator, direction, pixels } => {
             cmd_scroll(&ctx, &locator, &direction, pixels)
         }
-        Command::Screenshot { locator, output, ocr } => {
-            cmd_screenshot(&ctx, locator.as_deref(), output.as_deref(), ocr)
+        Command::Screenshot { locator, output, ocr, legacy } => {
+            cmd_screenshot(&ctx, locator.as_deref(), output.as_deref(), ocr, legacy)
         }
         Command::Wait { target } => cmd_wait(&ctx, &target),
         Command::Get { attr, locator, all } => cmd_get(&ctx, &attr, &locator, all),
@@ -677,11 +687,36 @@ fn cmd_scroll(ctx: &ExecutionContext, locator: &str, direction: &str, pixels: i3
     Ok(())
 }
 
-fn cmd_screenshot(ctx: &ExecutionContext, locator: Option<&str>, output: Option<&str>, ocr: bool) -> Result<(), AxError> {
-    // Bring app to foreground so it's visible for screen capture
-    ctx.activate();
-    // Extra delay for screenshot
-    std::thread::sleep(std::time::Duration::from_millis(100));
+fn run_ocr(image: &CGImage) -> Result<(), AxError> {
+    use objc2_foundation::{NSArray, NSString};
+    use picc::vision;
+
+    let text_req = vision::VNRecognizeTextRequest::new();
+    let zh = NSString::from_str("zh-Hans");
+    let en = NSString::from_str("en-US");
+    let lang = NSArray::from_slice(&[&*zh, &*en]);
+    text_req.setRecognitionLanguages(&lang);
+
+    let text_req_ref: &vision::VNRequest =
+        unsafe { &*((&*text_req) as *const _ as *const vision::VNRequest) };
+    let reqs = NSArray::from_slice(&[text_req_ref]);
+    let handler = vision::new_handler_with_cgimage(image);
+    vision::perform_requests(&handler, &reqs)
+        .map_err(|e| AxError::ScreenshotFailed(format!("OCR failed: {e}")))?;
+
+    if let Some(results) = text_req.results() {
+        for item in results.iter() {
+            let candidates = item.topCandidates(1);
+            for candidate in candidates.iter() {
+                println!("{}", candidate.string());
+            }
+        }
+    }
+    Ok(())
+}
+
+fn cmd_screenshot(ctx: &ExecutionContext, locator: Option<&str>, output: Option<&str>, ocr: bool, legacy: bool) -> Result<(), AxError> {
+    screenshot::ensure_cg_init();
 
     let path = output
         .map(String::from)
@@ -693,62 +728,122 @@ fn cmd_screenshot(ctx: &ExecutionContext, locator: Option<&str>, output: Option<
             format!("/tmp/ax_screenshot_{ts}.png")
         });
 
-    let rect = if let Some(loc) = locator {
-        validate_locator(loc)?;
-        let node = ctx.resolve_one(loc)?;
-        let (x, y) = node.position().unwrap_or((0.0, 0.0));
-        let (w, h) = node.size().unwrap_or((0.0, 0.0));
-        eprintln!("Capturing {w:.0}x{h:.0} at ({x:.0},{y:.0}) → {path}");
-        CGRect::new(CGPoint::new(x, y), CGSize::new(w, h))
-    } else {
-        let windows = ctx.app.children();
-        let win = windows.iter().find(|w| {
-            w.role().as_deref() == Some("AXWindow")
-                && w.size().map_or(false, |(w, h)| w > 0.0 && h > 0.0)
-        });
-        if let Some(win) = win {
-            let (x, y) = win.position().unwrap_or((0.0, 0.0));
-            let (w, h) = win.size().unwrap_or((0.0, 0.0));
-            eprintln!("Capturing window {w:.0}x{h:.0} at ({x:.0},{y:.0}) → {path}");
+    // Legacy path: activate app to foreground + CGWindowListCreateImage
+    if legacy {
+        ctx.activate();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        let rect = if let Some(loc) = locator {
+            validate_locator(loc)?;
+            let node = ctx.resolve_one(loc)?;
+            let (x, y) = node.position().unwrap_or((0.0, 0.0));
+            let (w, h) = node.size().unwrap_or((0.0, 0.0));
+            eprintln!("Capturing {w:.0}x{h:.0} at ({x:.0},{y:.0}) → {path}");
             CGRect::new(CGPoint::new(x, y), CGSize::new(w, h))
         } else {
-            eprintln!("warning: no visible window found, capturing full screen → {path}");
-            CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(0.0, 0.0))
+            let windows = ctx.app.children();
+            let win = windows.iter().find(|w| {
+                w.role().as_deref() == Some("AXWindow")
+                    && w.size().map_or(false, |(w, h)| w > 0.0 && h > 0.0)
+            });
+            if let Some(win) = win {
+                let (x, y) = win.position().unwrap_or((0.0, 0.0));
+                let (w, h) = win.size().unwrap_or((0.0, 0.0));
+                eprintln!("Capturing window {w:.0}x{h:.0} at ({x:.0},{y:.0}) → {path}");
+                CGRect::new(CGPoint::new(x, y), CGSize::new(w, h))
+            } else {
+                eprintln!("warning: no visible window found, capturing full screen → {path}");
+                CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(0.0, 0.0))
+            }
+        };
+        let image = screenshot::capture(rect)
+            .ok_or_else(|| AxError::ScreenshotFailed("capture failed".to_string()))?;
+        if !screenshot::save_png(&image, &path) {
+            return Err(AxError::ScreenshotFailed(format!("failed to save {path}")));
+        }
+        eprintln!("Saved: {path}");
+        if ocr {
+            run_ocr(&image)?;
+        }
+        return Ok(());
+    }
+
+    // Default: ScreenCaptureKit (no need to activate/foreground the app)
+    let image = if let Some(loc) = locator {
+        validate_locator(loc)?;
+        let node = ctx.resolve_one(loc)?;
+        let (el_x, el_y) = node.position().unwrap_or((0.0, 0.0));
+        let (el_w, el_h) = node.size().unwrap_or((0.0, 0.0));
+
+        // Try SCK whole-window capture + crop
+        if let Some(win_image) = picc::screen_capture::capture_window_by_pid(ctx.pid) {
+            // Get the AX window position to compute relative coords
+            let windows = ctx.app.children();
+            let win = windows.iter().find(|w| {
+                w.role().as_deref() == Some("AXWindow")
+                    && w.size().map_or(false, |(w, h)| w > 0.0 && h > 0.0)
+            });
+            let (win_x, win_y) = win
+                .and_then(|w| w.position())
+                .unwrap_or((0.0, 0.0));
+
+            // Compute element position relative to window, in pixels
+            let img_w = CGImage::width(Some(&win_image));
+            let win_w = win.and_then(|w| w.size()).map_or(1.0, |(w, _)| w);
+            let scale = img_w as f64 / win_w;
+            let crop_rect = CGRect::new(
+                CGPoint::new((el_x - win_x) * scale, (el_y - win_y) * scale),
+                CGSize::new(el_w * scale, el_h * scale),
+            );
+            eprintln!("Capturing element {el_w:.0}x{el_h:.0} at ({el_x:.0},{el_y:.0}) → {path}");
+            CGImage::with_image_in_rect(Some(&win_image), crop_rect)
+                .ok_or_else(|| AxError::ScreenshotFailed("crop failed".to_string()))?
+        } else {
+            // Fallback: activate + CGWindowListCreateImage
+            eprintln!("ScreenCaptureKit unavailable, falling back to legacy capture");
+            ctx.activate();
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let rect = CGRect::new(CGPoint::new(el_x, el_y), CGSize::new(el_w, el_h));
+            eprintln!("Capturing {el_w:.0}x{el_h:.0} at ({el_x:.0},{el_y:.0}) → {path}");
+            screenshot::capture(rect)
+                .ok_or_else(|| AxError::ScreenshotFailed("capture failed".to_string()))?
+        }
+    } else {
+        // Whole window capture
+        if let Some(win_image) = picc::screen_capture::capture_window_by_pid(ctx.pid) {
+            eprintln!("Capturing window → {path}");
+            win_image
+        } else {
+            // Fallback: activate + CGWindowListCreateImage
+            eprintln!("ScreenCaptureKit unavailable, falling back to legacy capture");
+            ctx.activate();
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            let windows = ctx.app.children();
+            let win = windows.iter().find(|w| {
+                w.role().as_deref() == Some("AXWindow")
+                    && w.size().map_or(false, |(w, h)| w > 0.0 && h > 0.0)
+            });
+            let rect = if let Some(win) = win {
+                let (x, y) = win.position().unwrap_or((0.0, 0.0));
+                let (w, h) = win.size().unwrap_or((0.0, 0.0));
+                eprintln!("Capturing window {w:.0}x{h:.0} at ({x:.0},{y:.0}) → {path}");
+                CGRect::new(CGPoint::new(x, y), CGSize::new(w, h))
+            } else {
+                eprintln!("warning: no visible window found, capturing full screen → {path}");
+                CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(0.0, 0.0))
+            };
+            screenshot::capture(rect)
+                .ok_or_else(|| AxError::ScreenshotFailed("capture failed".to_string()))?
         }
     };
 
-    let image = screenshot::capture(rect)
-        .ok_or_else(|| AxError::ScreenshotFailed("capture failed".to_string()))?;
     if !screenshot::save_png(&image, &path) {
         return Err(AxError::ScreenshotFailed(format!("failed to save {path}")));
     }
     eprintln!("Saved: {path}");
 
     if ocr {
-        use objc2_foundation::{NSArray, NSString};
-        use picc::vision;
-
-        let text_req = vision::VNRecognizeTextRequest::new();
-        let zh = NSString::from_str("zh-Hans");
-        let en = NSString::from_str("en-US");
-        let lang = NSArray::from_slice(&[&*zh, &*en]);
-        text_req.setRecognitionLanguages(&lang);
-
-        let text_req_ref: &vision::VNRequest =
-            unsafe { &*((&*text_req) as *const _ as *const vision::VNRequest) };
-        let reqs = NSArray::from_slice(&[text_req_ref]);
-        let handler = vision::new_handler_with_cgimage(&image);
-        vision::perform_requests(&handler, &reqs)
-            .map_err(|e| AxError::ScreenshotFailed(format!("OCR failed: {e}")))?;
-
-        if let Some(results) = text_req.results() {
-            for item in results.iter() {
-                let candidates = item.topCandidates(1);
-                for candidate in candidates.iter() {
-                    println!("{}", candidate.string());
-                }
-            }
-        }
+        run_ocr(&image)?;
     }
 
     Ok(())

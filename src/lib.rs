@@ -5,6 +5,7 @@ pub mod core_graphics;
 pub mod error;
 pub mod input;
 pub mod locator;
+pub mod screen_capture;
 pub mod screenshot;
 pub mod tree_fmt;
 pub mod vision;
