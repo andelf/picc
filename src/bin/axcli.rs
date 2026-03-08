@@ -250,6 +250,8 @@ enum Command {
         #[arg(long)]
         legacy: bool,
     },
+    /// Activate (bring to foreground) the target application
+    Activate,
     /// Wait for element or milliseconds
     ///
     /// Pass a number (e.g. 500) to sleep, or a locator to poll until found.
@@ -337,6 +339,10 @@ fn run(cli: Cli) -> Result<(), AxError> {
         }
         Command::Screenshot { locator, output, ocr, legacy } => {
             cmd_screenshot(&ctx, locator.as_deref(), output.as_deref(), ocr, legacy)
+        }
+        Command::Activate => {
+            ctx.activate();
+            Ok(())
         }
         Command::Wait { target } => cmd_wait(&ctx, &target),
         Command::Get { attr, locator, all } => cmd_get(&ctx, &attr, &locator, all),
