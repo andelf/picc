@@ -692,6 +692,26 @@ fn cmd_scroll(ctx: &ExecutionContext, locator: &str, direction: &str, pixels: i3
     Ok(())
 }
 
+/// Walk up the AX tree from a node to find its owning AXWindow.
+fn find_owning_window(node: &AXNode) -> Option<AXNode> {
+    let mut current = AXNode::new(node.0.clone());
+    for _ in 0..50 {
+        if current.role().as_deref() == Some("AXWindow") {
+            return Some(current);
+        }
+        current = current.parent()?;
+    }
+    None
+}
+
+/// Find the first visible AXWindow of the app.
+fn find_first_ax_window(ctx: &ExecutionContext) -> Option<AXNode> {
+    ctx.app.children().into_iter().find(|w| {
+        w.role().as_deref() == Some("AXWindow")
+            && w.size().map_or(false, |(w, h)| w > 0.0 && h > 0.0)
+    })
+}
+
 fn run_ocr(image: &CGImage) -> Result<(), AxError> {
     use objc2_foundation::{NSArray, NSString};
     use picc::vision;
@@ -780,22 +800,28 @@ fn cmd_screenshot(ctx: &ExecutionContext, locator: Option<&str>, output: Option<
         let (el_x, el_y) = node.position().unwrap_or((0.0, 0.0));
         let (el_w, el_h) = node.size().unwrap_or((0.0, 0.0));
 
-        // Try SCK whole-window capture + crop
-        if let Some(win_image) = picc::screen_capture::capture_window_by_pid(ctx.pid) {
-            // Get the AX window position to compute relative coords
-            let windows = ctx.app.children();
-            let win = windows.iter().find(|w| {
-                w.role().as_deref() == Some("AXWindow")
-                    && w.size().map_or(false, |(w, h)| w > 0.0 && h > 0.0)
-            });
-            let (win_x, win_y) = win
-                .and_then(|w| w.position())
-                .unwrap_or((0.0, 0.0));
+        // Walk up the AX tree to find the owning AXWindow
+        let ax_win = find_owning_window(&node);
+        let (win_x, win_y, win_w, win_h) = ax_win
+            .as_ref()
+            .map(|aw| {
+                let (x, y) = aw.position().unwrap_or((0.0, 0.0));
+                let (w, h) = aw.size().unwrap_or((0.0, 0.0));
+                (x, y, w, h)
+            })
+            .unwrap_or((0.0, 0.0, 0.0, 0.0));
 
+        // Try SCK: capture the specific window that contains this element
+        let win_image = if win_w > 0.0 && win_h > 0.0 {
+            picc::screen_capture::capture_window_by_frame(ctx.pid, win_x, win_y, win_w, win_h)
+        } else {
+            picc::screen_capture::capture_window_by_pid(ctx.pid)
+        };
+
+        if let Some(win_image) = win_image {
             // Compute element position relative to window, in pixels
             let img_w = CGImage::width(Some(&win_image));
-            let win_w = win.and_then(|w| w.size()).map_or(1.0, |(w, _)| w);
-            let scale = img_w as f64 / win_w;
+            let scale = if win_w > 0.0 { img_w as f64 / win_w } else { 1.0 };
             let crop_rect = CGRect::new(
                 CGPoint::new((el_x - win_x) * scale, (el_y - win_y) * scale),
                 CGSize::new(el_w * scale, el_h * scale),
@@ -814,8 +840,18 @@ fn cmd_screenshot(ctx: &ExecutionContext, locator: Option<&str>, output: Option<
                 .ok_or_else(|| AxError::ScreenshotFailed("capture failed".to_string()))?
         }
     } else {
-        // Whole window capture
-        if let Some(win_image) = picc::screen_capture::capture_window_by_pid(ctx.pid) {
+        // Whole window capture: use first AX window's frame to pick the right SCK window
+        let ax_win = find_first_ax_window(ctx);
+        let win_image = if let Some(ref w) = ax_win {
+            let (x, y) = w.position().unwrap_or((0.0, 0.0));
+            let (ww, wh) = w.size().unwrap_or((0.0, 0.0));
+            picc::screen_capture::capture_window_by_frame(ctx.pid, x, y, ww, wh)
+        } else {
+            None
+        };
+        let win_image = win_image.or_else(|| picc::screen_capture::capture_window_by_pid(ctx.pid));
+
+        if let Some(win_image) = win_image {
             eprintln!("Capturing window → {path}");
             win_image
         } else {
@@ -823,16 +859,11 @@ fn cmd_screenshot(ctx: &ExecutionContext, locator: Option<&str>, output: Option<
             eprintln!("ScreenCaptureKit unavailable, falling back to legacy capture");
             ctx.activate();
             std::thread::sleep(std::time::Duration::from_millis(100));
-            let windows = ctx.app.children();
-            let win = windows.iter().find(|w| {
-                w.role().as_deref() == Some("AXWindow")
-                    && w.size().map_or(false, |(w, h)| w > 0.0 && h > 0.0)
-            });
-            let rect = if let Some(win) = win {
-                let (x, y) = win.position().unwrap_or((0.0, 0.0));
-                let (w, h) = win.size().unwrap_or((0.0, 0.0));
-                eprintln!("Capturing window {w:.0}x{h:.0} at ({x:.0},{y:.0}) → {path}");
-                CGRect::new(CGPoint::new(x, y), CGSize::new(w, h))
+            let rect = if let Some(ref w) = ax_win {
+                let (x, y) = w.position().unwrap_or((0.0, 0.0));
+                let (ww, wh) = w.size().unwrap_or((0.0, 0.0));
+                eprintln!("Capturing window {ww:.0}x{wh:.0} at ({x:.0},{y:.0}) → {path}");
+                CGRect::new(CGPoint::new(x, y), CGSize::new(ww, wh))
             } else {
                 eprintln!("warning: no visible window found, capturing full screen → {path}");
                 CGRect::new(CGPoint::new(0.0, 0.0), CGSize::new(0.0, 0.0))
