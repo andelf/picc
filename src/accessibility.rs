@@ -1183,6 +1183,21 @@ fn element_matches_base_selector(el: &AXUIElement, selector: &str) -> bool {
         } else {
             false
         }
+    } else if selector.contains('#') {
+        // role#id — match role + DOM ID (e.g. "AXGroup#root", "group#sidebar")
+        let (role_part, id) = selector.split_once('#').unwrap();
+        if !id.is_empty() {
+            if attr_string(el, "AXDOMIdentifier").as_deref() != Some(id) {
+                return false;
+            }
+        }
+        if !role_part.is_empty() {
+            let el_role = attr_string(el, "AXRole").unwrap_or_default();
+            if !role_matches(&el_role, role_part) {
+                return false;
+            }
+        }
+        true
     } else if selector.contains('.') {
         // Role.class1.class2 or .class1.class2 (role optional)
         // Handle :not() within DOM class selectors
@@ -1714,5 +1729,60 @@ mod tests {
         for case in cases {
             let _ = parse_attr_bracket(case);
         }
+    }
+
+    // --- role_matches tests ---
+
+    #[test]
+    fn role_matches_exact() {
+        assert!(role_matches("AXButton", "AXButton"));
+        assert!(!role_matches("AXButton", "AXGroup"));
+    }
+
+    #[test]
+    fn role_matches_short_name() {
+        assert!(role_matches("AXButton", "button"));
+        assert!(role_matches("AXButton", "Button"));
+        assert!(role_matches("AXStaticText", "statictext"));
+    }
+
+    #[test]
+    fn role_matches_text_alias() {
+        assert!(role_matches("AXStaticText", "text"));
+        assert!(role_matches("AXTextArea", "text"));
+        assert!(role_matches("AXTextField", "text"));
+        assert!(!role_matches("AXButton", "text"));
+    }
+
+    // --- role#id selector parsing ---
+
+    #[test]
+    fn selector_role_hash_id_split() {
+        // Verify the split logic used in element_matches_base_selector
+        let selector = "AXGroup#root";
+        let (role_part, id) = selector.split_once('#').unwrap();
+        assert_eq!(role_part, "AXGroup");
+        assert_eq!(id, "root");
+    }
+
+    #[test]
+    fn selector_role_hash_id_short_role() {
+        let selector = "group#sidebar";
+        let (role_part, id) = selector.split_once('#').unwrap();
+        assert_eq!(role_part, "group");
+        assert_eq!(id, "sidebar");
+        assert!(role_matches("AXGroup", role_part));
+    }
+
+    #[test]
+    fn selector_hash_id_only_handled_early() {
+        // Pure #id starts with '#', handled by the starts_with('#') branch,
+        // not the contains('#') branch.
+        let selector = "#root";
+        assert!(selector.starts_with('#'));
+        // so split_once would give ("", "root") — but this path isn't reached
+        let (role_part, id) = selector.split_once('#').unwrap();
+        assert_eq!(role_part, "");
+        assert_eq!(id, "root");
     }
 }

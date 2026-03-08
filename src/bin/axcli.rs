@@ -424,6 +424,11 @@ fn validate_segment(seg: &str) -> Result<(), String> {
         }
         return Ok(());
     }
+    if s.contains('#') {
+        // role#id — role part is optional, id must be non-empty
+        let (_, id) = s.split_once('#').unwrap();
+        return if !id.is_empty() { Ok(()) } else { Err(format!("empty DOM ID after `#` in `{s}`")) };
+    }
     if s.contains('.') {
         let without_not = s.split(":not(").next().unwrap_or(s);
         let has_class = without_not.split('.').skip(1).any(|c| !c.is_empty());
