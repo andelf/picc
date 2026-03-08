@@ -7,7 +7,7 @@ use std::time::Instant;
 
 use block2::RcBlock;
 use clap::Parser;
-use rand::Rng;
+use rand::RngExt as _;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 use objc2::rc::Retained;
@@ -1082,7 +1082,7 @@ fn create_udp_socket(port: u16) -> Result<UdpSocket, Box<dyn std::error::Error>>
 }
 
 fn start_lan_sync(port: u16) -> Result<(), Box<dyn std::error::Error>> {
-    let node_id: u64 = rand::thread_rng().gen();
+    let node_id: u64 = rand::rng().random();
 
     // 两个独立 socket：recv 绑定目标端口收包，send 用 ephemeral port 发包
     let recv_socket = create_udp_socket(port)?;
