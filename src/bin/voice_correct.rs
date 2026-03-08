@@ -713,7 +713,7 @@ fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("voice_correct=debug".parse().unwrap()),
+                .add_directive("voice_correct=info".parse().unwrap()),
         )
         .with_target(false)
         .init();
