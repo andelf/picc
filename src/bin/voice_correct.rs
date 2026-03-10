@@ -348,7 +348,13 @@ fn insert_spaces_around_punctuation(s: &str) -> String {
             // After these, insert a trailing space (unless next is already space/end)
             ',' | '.' | '!' | '?' | ':' | ';' => {
                 out.push(c);
-                if next.is_some_and(|n| n != ' ' && !n.is_ascii_punctuation()) {
+                // Skip space after '.' when it looks like a decimal point (e.g. "3.14")
+                let is_decimal_dot = c == '.'
+                    && prev.is_some_and(|p| p.is_ascii_digit())
+                    && next.is_some_and(|n| n.is_ascii_digit());
+                if !is_decimal_dot
+                    && next.is_some_and(|n| n != ' ' && !n.is_ascii_punctuation())
+                {
                     out.push(' ');
                 }
             }
