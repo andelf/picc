@@ -507,21 +507,17 @@ fn set_status_icon_name(item: &NSStatusItem, name: &str, mtm: MainThreadMarker) 
 /// Punctuation characters after which a space should be inserted before new text.
 const SPACE_AFTER_PUNCT: &[char] = &[',', '.', ';', ':', '!', '?', ')', ']', '}', '"', '\''];
 
-/// Read the character immediately before the cursor in the focused text field.
-/// Returns None if unable to determine (no focused element, empty text, or at position 0).
-fn char_before_cursor() -> Option<char> {
+/// Get the focused AX UI element.
+fn focused_ax_element() -> Option<CFRetained<AXUIElement>> {
     let system = unsafe { AXUIElement::new_system_wide() };
-    let focused_cf = accessibility::attr_value(&system, "AXFocusedUIElement")?;
-    let focused: CFRetained<AXUIElement> = unsafe { CFRetained::cast_unchecked(focused_cf) };
-    let text = accessibility::attr_string(&focused, "AXValue")?;
-    if text.is_empty() {
-        return None;
-    }
-    // Try to get cursor position from AXSelectedTextRange
-    let range_cf = accessibility::attr_value(&focused, "AXSelectedTextRange")?;
-    // AXSelectedTextRange is a CFRange wrapped in AXValue — extract via AXValue::value
+    let cf = accessibility::attr_value(&system, "AXFocusedUIElement")?;
+    Some(unsafe { CFRetained::cast_unchecked(cf) })
+}
+
+/// Extract a CFRange from an AXValue attribute.
+fn ax_value_as_cfrange(value: &CFRetained<CFType>) -> Option<objc2_core_foundation::CFRange> {
     let ax_value: &objc2_application_services::AXValue =
-        unsafe { &*(range_cf.as_ref() as *const CFType as *const objc2_application_services::AXValue) };
+        unsafe { &*(value.as_ref() as *const CFType as *const objc2_application_services::AXValue) };
     let mut range = objc2_core_foundation::CFRange { location: 0, length: 0 };
     let ok = unsafe {
         ax_value.value(
@@ -529,22 +525,45 @@ fn char_before_cursor() -> Option<char> {
             NonNull::new_unchecked(&mut range as *mut _ as *mut std::ffi::c_void),
         )
     };
-    if !ok {
-        // Fallback: assume cursor is at end
-        return text.chars().last();
+    ok.then_some(range)
+}
+
+/// Read the character immediately before the cursor in the focused text field.
+/// Returns None if unable to determine (no focused element, empty text, or at position 0).
+fn char_before_cursor() -> Option<char> {
+    let focused = focused_ax_element()?;
+    let text = accessibility::attr_string(&focused, "AXValue")?;
+    if text.is_empty() {
+        return None;
     }
-    let pos = range.location as usize;
+    // Try to get cursor position from AXSelectedTextRange
+    let range_cf = accessibility::attr_value(&focused, "AXSelectedTextRange")?;
+    let pos = if let Some(range) = ax_value_as_cfrange(&range_cf) {
+        range.location as usize
+    } else {
+        // Fallback: assume cursor is at end (UTF-16 length)
+        text.encode_utf16().count()
+    };
     if pos == 0 {
         return None;
     }
-    // Get the character just before cursor position
-    text.chars().nth(pos - 1)
+    // CFRange.location is a UTF-16 code unit offset; decode via UTF-16 to get
+    // the correct character even when text contains emoji or supplementary CJK.
+    let utf16: Vec<u16> = text.encode_utf16().collect();
+    if pos > utf16.len() {
+        return text.chars().last();
+    }
+    let unit = utf16[pos - 1];
+    if (0xDC00..=0xDFFF).contains(&unit) && pos >= 2 {
+        // Low surrogate — pair with the preceding high surrogate
+        char::decode_utf16([utf16[pos - 2], unit]).next()?.ok()
+    } else {
+        char::decode_utf16([unit]).next()?.ok()
+    }
 }
 
 fn read_focused_text() -> Option<(CFRetained<AXUIElement>, String)> {
-    let system = unsafe { AXUIElement::new_system_wide() };
-    let focused_cf = accessibility::attr_value(&system, "AXFocusedUIElement")?;
-    let focused: CFRetained<AXUIElement> = unsafe { CFRetained::cast_unchecked(focused_cf) };
+    let focused = focused_ax_element()?;
     let text = accessibility::attr_string(&focused, "AXValue")?;
     if text.is_empty() {
         return None;
@@ -1242,7 +1261,7 @@ fn main() {
                     // 3. type_text: simulate keyboard input at cursor position
                     let opts = delegate.ivars().options.get();
                     let mut spoken = apply_dictation_transforms(&spoken, opts);
-                    if opts.auto_insert_spaces && !spoken.starts_with(' ') {
+                    if opts.fullwidth_to_halfwidth && opts.auto_insert_spaces && !spoken.starts_with(' ') {
                         if let Some(prev) = char_before_cursor() {
                             if SPACE_AFTER_PUNCT.contains(&prev) {
                                 spoken.insert(0, ' ');
