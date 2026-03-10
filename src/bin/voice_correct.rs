@@ -112,13 +112,14 @@ static LLM_RESULT: Mutex<Option<Result<String, String>>> = Mutex::new(None);
 #[derive(Debug, Clone, Copy, Default)]
 struct DictationOptions {
     fullwidth_to_halfwidth: bool,
-    auto_insert_spaces: bool,
+    space_around_punct: bool,
+    space_between_cjk: bool,
     strip_trailing_punct: bool,
 }
 
 struct MenuDelegateIvars {
     options: Cell<DictationOptions>,
-    spaces_item: RefCell<Option<Retained<NSMenuItem>>>,
+    punct_spaces_item: RefCell<Option<Retained<NSMenuItem>>>,
 }
 
 impl std::fmt::Debug for MenuDelegateIvars {
@@ -291,17 +292,18 @@ fn ensure_sensevoice_model(base_dir: &Path) -> String {
 ///
 /// Transforms (each gated by its toggle):
 /// 1. `fullwidth_to_halfwidth` — convert CJK fullwidth punctuation to ASCII halfwidth
-/// 2. `auto_insert_spaces` — insert spaces around punctuation within the text
+/// 2. `space_around_punct` — insert spaces around half-width punctuation
 ///    (requires fullwidth_to_halfwidth to be on)
-/// 3. `strip_trailing_punct` — remove trailing punctuation (speech engines often add "。")
+/// 3. `space_between_cjk` — insert spaces at CJK↔Latin/Digit boundaries (independent)
+/// 4. `strip_trailing_punct` — remove trailing punctuation (speech engines often add "。")
 fn apply_dictation_transforms(text: &str, opts: DictationOptions) -> String {
     let mut result = text.to_string();
 
     if opts.fullwidth_to_halfwidth {
         result = fullwidth_to_halfwidth(&result);
-        if opts.auto_insert_spaces {
-            result = insert_spaces_around_punctuation(&result);
-        }
+    }
+    if opts.space_around_punct || opts.space_between_cjk {
+        result = auto_insert_spaces(&result, opts.space_around_punct, opts.space_between_cjk);
     }
     if opts.strip_trailing_punct {
         result = strip_trailing_punctuation(&result);
@@ -333,47 +335,104 @@ fn fullwidth_to_halfwidth(s: &str) -> String {
         .collect()
 }
 
-/// Insert spaces around half-width punctuation so it reads better in CJK text.
-/// - After: , . ! ? : ;
-/// - Before opening / after closing brackets: ( ) [ ] < > " "
-fn insert_spaces_around_punctuation(s: &str) -> String {
+/// Character category for spacing decisions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CharKind {
+    Cjk,
+    Latin,
+    Digit,
+    OpenBracket,
+    CloseBracket,
+    /// Delimiter punctuation: , . ! ? : ;
+    Delimiter,
+    Space,
+    Other,
+}
+
+fn classify(c: char) -> CharKind {
+    match c {
+        'A'..='Z' | 'a'..='z' => CharKind::Latin,
+        '0'..='9' => CharKind::Digit,
+        '(' | '[' | '<' => CharKind::OpenBracket,
+        ')' | ']' | '>' => CharKind::CloseBracket,
+        ',' | '.' | '!' | '?' | ':' | ';' => CharKind::Delimiter,
+        ' ' => CharKind::Space,
+        c if is_cjk(c) => CharKind::Cjk,
+        _ => CharKind::Other,
+    }
+}
+
+fn is_cjk(c: char) -> bool {
+    matches!(c,
+        '\u{2E80}'..='\u{2EFF}'   // CJK Radicals Supplement
+        | '\u{2F00}'..='\u{2FDF}' // Kangxi Radicals
+        | '\u{3040}'..='\u{309F}' // Hiragana
+        | '\u{30A0}'..='\u{30FF}' // Katakana
+        | '\u{3100}'..='\u{312F}' // Bopomofo
+        | '\u{3200}'..='\u{32FF}' // Enclosed CJK Letters
+        | '\u{3400}'..='\u{4DBF}' // CJK Extension A
+        | '\u{4E00}'..='\u{9FFF}' // CJK Unified Ideographs
+        | '\u{F900}'..='\u{FAFF}' // CJK Compatibility Ideographs
+    )
+}
+
+/// Does this pair require a CJK↔Latin/Digit boundary space?
+fn is_cjk_boundary(left: CharKind, right: CharKind) -> bool {
+    use CharKind::*;
+    matches!(
+        (left, right),
+        (Cjk, Latin) | (Latin, Cjk) | (Cjk, Digit) | (Digit, Cjk)
+    )
+}
+
+/// Does this pair require a punctuation-related space?
+fn is_punct_space(left: CharKind, right: CharKind) -> bool {
+    use CharKind::*;
+    matches!(
+        (left, right),
+        // Delimiter/CloseBracket → content
+        (Delimiter | CloseBracket, Cjk | Latin | Digit | Other) |
+        // content → OpenBracket
+        (Cjk | Latin | Digit | Other, OpenBracket)
+    )
+}
+
+/// Auto-insert spaces based on character classification.
+///
+/// - `punct`: insert spaces around half-width punctuation (delimiters, brackets)
+/// - `cjk`: insert spaces at CJK↔Latin/Digit boundaries
+///
+/// Single-pass: each character is classified into a [`CharKind`], and a space is
+/// inserted between adjacent pairs where the rules apply.
+fn auto_insert_spaces(s: &str, punct: bool, cjk: bool) -> String {
     let chars: Vec<char> = s.chars().collect();
     let mut out = String::with_capacity(s.len() + 32);
 
     for (i, &c) in chars.iter().enumerate() {
-        let prev = if i > 0 { Some(chars[i - 1]) } else { None };
-        let next = chars.get(i + 1).copied();
+        let kind = classify(c);
 
-        match c {
-            // After these, insert a trailing space (unless next is already space/end)
-            ',' | '.' | '!' | '?' | ':' | ';' => {
-                out.push(c);
-                // Skip space after '.' when it looks like a decimal point (e.g. "3.14")
-                let is_decimal_dot = c == '.'
-                    && prev.is_some_and(|p| p.is_ascii_digit())
-                    && next.is_some_and(|n| n.is_ascii_digit());
-                if !is_decimal_dot
-                    && next.is_some_and(|n| n != ' ' && !n.is_ascii_punctuation())
-                {
-                    out.push(' ');
+        // Insert space *before* this character if needed.
+        if i > 0 {
+            let prev = chars[i - 1];
+            let prev_kind = classify(prev);
+
+            if prev_kind != CharKind::Space && kind != CharKind::Space {
+                let want_cjk = cjk && is_cjk_boundary(prev_kind, kind);
+                let want_punct = punct && is_punct_space(prev_kind, kind);
+
+                if want_cjk || want_punct {
+                    // Exception: decimal point — don't space after '.' when digit.digit
+                    let is_decimal_dot = prev == '.' && prev_kind == CharKind::Delimiter
+                        && classify(chars.get(i.wrapping_sub(2)).copied().unwrap_or(' ')) == CharKind::Digit
+                        && kind == CharKind::Digit;
+                    if !is_decimal_dot {
+                        out.push(' ');
+                    }
                 }
             }
-            // Closing brackets / quotes: space after
-            ')' | ']' | '>' => {
-                out.push(c);
-                if next.is_some_and(|n| n != ' ' && !n.is_ascii_punctuation()) {
-                    out.push(' ');
-                }
-            }
-            // Opening brackets / quotes: space before
-            '(' | '[' | '<' => {
-                if prev.is_some_and(|p| p != ' ') {
-                    out.push(' ');
-                }
-                out.push(c);
-            }
-            _ => out.push(c),
         }
+
+        out.push(c);
     }
 
     out
@@ -416,30 +475,41 @@ define_class!(
             let item: &NSMenuItem = unsafe { &*(sender as *const AnyObject as *const NSMenuItem) };
             item.setState(if opts.fullwidth_to_halfwidth { 1 } else { 0 });
 
-            // Enable/disable the spaces sub-option
-            if let Some(spaces) = self.ivars().spaces_item.borrow().as_ref() {
+            // Enable/disable the punct spaces sub-option
+            if let Some(punct_item) = self.ivars().punct_spaces_item.borrow().as_ref() {
                 if opts.fullwidth_to_halfwidth {
-                    spaces.setEnabled(true);
+                    punct_item.setEnabled(true);
                 } else {
-                    // Turn off and uncheck spaces when fullwidth is disabled
-                    opts.auto_insert_spaces = false;
+                    // Turn off and uncheck punct spaces when fullwidth is disabled
+                    opts.space_around_punct = false;
                     self.ivars().options.set(opts);
-                    spaces.setEnabled(false);
-                    spaces.setState(0);
+                    punct_item.setEnabled(false);
+                    punct_item.setState(0);
                 }
             }
             info!(enabled = opts.fullwidth_to_halfwidth, "fullwidth→halfwidth");
         }
 
-        #[unsafe(method(toggleAutoInsertSpaces:))]
-        fn toggle_auto_insert_spaces(&self, sender: &AnyObject) {
+        #[unsafe(method(toggleSpaceAroundPunct:))]
+        fn toggle_space_around_punct(&self, sender: &AnyObject) {
             let mut opts = self.ivars().options.get();
-            opts.auto_insert_spaces = !opts.auto_insert_spaces;
+            opts.space_around_punct = !opts.space_around_punct;
             self.ivars().options.set(opts);
 
             let item: &NSMenuItem = unsafe { &*(sender as *const AnyObject as *const NSMenuItem) };
-            item.setState(if opts.auto_insert_spaces { 1 } else { 0 });
-            info!(enabled = opts.auto_insert_spaces, "auto insert spaces");
+            item.setState(if opts.space_around_punct { 1 } else { 0 });
+            info!(enabled = opts.space_around_punct, "space around punctuation");
+        }
+
+        #[unsafe(method(toggleSpaceBetweenCjk:))]
+        fn toggle_space_between_cjk(&self, sender: &AnyObject) {
+            let mut opts = self.ivars().options.get();
+            opts.space_between_cjk = !opts.space_between_cjk;
+            self.ivars().options.set(opts);
+
+            let item: &NSMenuItem = unsafe { &*(sender as *const AnyObject as *const NSMenuItem) };
+            item.setState(if opts.space_between_cjk { 1 } else { 0 });
+            info!(enabled = opts.space_between_cjk, "space between CJK & Latin");
         }
 
         #[unsafe(method(toggleStripTrailingPunct:))]
@@ -890,7 +960,7 @@ fn main() {
     let delegate: Retained<MenuDelegate> = {
         let this = MenuDelegate::alloc(mtm).set_ivars(MenuDelegateIvars {
             options: Cell::new(DictationOptions::default()),
-            spaces_item: RefCell::new(None),
+            punct_spaces_item: RefCell::new(None),
         });
         unsafe { objc2::msg_send![super(this), init] }
     };
@@ -917,18 +987,29 @@ fn main() {
     };
     unsafe { fw_item.setTarget(Some(&delegate)) };
 
-    // Toggle: auto insert spaces (sub-option of fullwidth→halfwidth)
-    let spaces_item = unsafe {
+    // Toggle: space around punctuation (sub-option of fullwidth→halfwidth)
+    let punct_spaces_item = unsafe {
         NSMenuItem::initWithTitle_action_keyEquivalent(
             NSMenuItem::alloc(mtm),
-            &NSString::from_str("  Auto Insert Spaces"),
-            Some(sel!(toggleAutoInsertSpaces:)),
+            &NSString::from_str("  Space Around Punctuation"),
+            Some(sel!(toggleSpaceAroundPunct:)),
             &NSString::from_str(""),
         )
     };
-    unsafe { spaces_item.setTarget(Some(&delegate)) };
-    spaces_item.setEnabled(false); // disabled until fullwidth is turned on
-    *delegate.ivars().spaces_item.borrow_mut() = Some(spaces_item.clone());
+    unsafe { punct_spaces_item.setTarget(Some(&delegate)) };
+    punct_spaces_item.setEnabled(false); // disabled until fullwidth is turned on
+    *delegate.ivars().punct_spaces_item.borrow_mut() = Some(punct_spaces_item.clone());
+
+    // Toggle: space between CJK & Latin/Digit (independent)
+    let cjk_spaces_item = unsafe {
+        NSMenuItem::initWithTitle_action_keyEquivalent(
+            NSMenuItem::alloc(mtm),
+            &NSString::from_str("Space Between CJK & Latin"),
+            Some(sel!(toggleSpaceBetweenCjk:)),
+            &NSString::from_str(""),
+        )
+    };
+    unsafe { cjk_spaces_item.setTarget(Some(&delegate)) };
 
     // Toggle: strip trailing punctuation
     let strip_item = unsafe {
@@ -942,7 +1023,8 @@ fn main() {
     unsafe { strip_item.setTarget(Some(&delegate)) };
 
     menu.addItem(&fw_item);
-    menu.addItem(&spaces_item);
+    menu.addItem(&punct_spaces_item);
+    menu.addItem(&cjk_spaces_item);
     menu.addItem(&strip_item);
     menu.addItem(&NSMenuItem::separatorItem(mtm));
     menu.addItem(&quit_item);
@@ -1253,15 +1335,15 @@ fn main() {
                     // --- Dictation mode: type spoken text at cursor ---
                     //
                     // Text processing pipeline:
-                    // 1. apply_dictation_transforms: fullwidth→halfwidth, insert spaces
-                    //    around punctuation within text, strip trailing punctuation
-                    // 2. Context-aware space: if auto_insert_spaces is on and the
+                    // 1. apply_dictation_transforms: fullwidth→halfwidth, space around
+                    //    punctuation, space between CJK & Latin, strip trailing punct
+                    // 2. Context-aware space: if space_around_punct is on and the
                     //    character before cursor is halfwidth punctuation (e.g. ","),
                     //    prepend a space so "hello," + "world" → "hello, world"
                     // 3. type_text: simulate keyboard input at cursor position
                     let opts = delegate.ivars().options.get();
                     let mut spoken = apply_dictation_transforms(&spoken, opts);
-                    if opts.fullwidth_to_halfwidth && opts.auto_insert_spaces && !spoken.starts_with(' ') {
+                    if opts.fullwidth_to_halfwidth && opts.space_around_punct && !spoken.starts_with(' ') {
                         if let Some(prev) = char_before_cursor() {
                             if SPACE_AFTER_PUNCT.contains(&prev) {
                                 spoken.insert(0, ' ');
@@ -1355,4 +1437,114 @@ fn main() {
     };
 
     app.run();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{auto_insert_spaces, apply_dictation_transforms, DictationOptions};
+
+    /// Helper: both punct and cjk spacing enabled (the common case).
+    fn spaced(s: &str) -> String {
+        auto_insert_spaces(s, true, true)
+    }
+
+    // --- CJK ↔ Latin/Digit ---
+
+    #[test]
+    fn cjk_latin_spacing() {
+        assert_eq!(auto_insert_spaces("中文abc", false, true), "中文 abc");
+        assert_eq!(auto_insert_spaces("abc中文", false, true), "abc 中文");
+        assert_eq!(auto_insert_spaces("中文abc中文", false, true), "中文 abc 中文");
+    }
+
+    #[test]
+    fn cjk_digit_spacing() {
+        assert_eq!(auto_insert_spaces("第3章", false, true), "第 3 章");
+        assert_eq!(auto_insert_spaces("100个", false, true), "100 个");
+    }
+
+    #[test]
+    fn cjk_only_off_no_effect() {
+        // With cjk=false, CJK↔Latin boundaries are not spaced
+        assert_eq!(auto_insert_spaces("中文abc", true, false), "中文abc");
+    }
+
+    // --- Punctuation ---
+
+    #[test]
+    fn delimiter_spacing() {
+        assert_eq!(auto_insert_spaces("hello,world", true, false), "hello, world");
+        assert_eq!(auto_insert_spaces("a.b", true, false), "a. b");
+        assert_eq!(auto_insert_spaces("ok!nice", true, false), "ok! nice");
+    }
+
+    #[test]
+    fn decimal_point_no_space() {
+        assert_eq!(spaced("3.14"), "3.14");
+        assert_eq!(spaced("价格是9.99元"), "价格是 9.99 元");
+    }
+
+    #[test]
+    fn bracket_spacing() {
+        assert_eq!(auto_insert_spaces("hello(world)test", true, false), "hello (world) test");
+        assert_eq!(spaced("你好(世界)"), "你好 (世界)");
+    }
+
+    #[test]
+    fn consecutive_punctuation() {
+        assert_eq!(spaced("what?!ok"), "what?! ok");
+        assert_eq!(spaced("a...b"), "a... b");
+    }
+
+    #[test]
+    fn punct_only_off_no_effect() {
+        // With punct=false, delimiter spacing is not applied
+        assert_eq!(auto_insert_spaces("hello,world", false, true), "hello,world");
+    }
+
+    // --- Both flags ---
+
+    #[test]
+    fn already_spaced_idempotent() {
+        assert_eq!(spaced("中文 abc 中文"), "中文 abc 中文");
+        assert_eq!(spaced("hello, world"), "hello, world");
+    }
+
+    #[test]
+    fn no_spurious_spaces() {
+        assert_eq!(spaced("你好世界"), "你好世界");
+        assert_eq!(spaced("hello world"), "hello world");
+        assert_eq!(spaced("12345"), "12345");
+    }
+
+    #[test]
+    fn mixed_complex() {
+        assert_eq!(spaced("用Vue3和React开发"), "用 Vue3 和 React 开发");
+        assert_eq!(spaced("这是v2.0版本"), "这是 v2.0 版本");
+    }
+
+    // --- Integration: apply_dictation_transforms ---
+
+    #[test]
+    fn transforms_fullwidth_then_punct_spaces() {
+        let opts = DictationOptions {
+            fullwidth_to_halfwidth: true,
+            space_around_punct: true,
+            space_between_cjk: false,
+            strip_trailing_punct: false,
+        };
+        // ，(fullwidth) → , (halfwidth) → ", " (space after)
+        assert_eq!(apply_dictation_transforms("你好，世界", opts), "你好, 世界");
+    }
+
+    #[test]
+    fn transforms_cjk_spacing_independent() {
+        let opts = DictationOptions {
+            fullwidth_to_halfwidth: false,
+            space_around_punct: false,
+            space_between_cjk: true,
+            strip_trailing_punct: false,
+        };
+        assert_eq!(apply_dictation_transforms("中文abc中文", opts), "中文 abc 中文");
+    }
 }
