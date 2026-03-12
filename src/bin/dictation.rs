@@ -114,39 +114,30 @@ fn set_status_icon(item: &NSStatusItem, recording: bool, mtm: MainThreadMarker) 
 }
 
 const SENSEVOICE_MODEL_DIR: &str = "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17";
-const SENSEVOICE_URL: &str = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17.tar.bz2";
+const SENSEVOICE_HF_BASE: &str = "https://huggingface.co/csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/resolve/main";
+const SENSEVOICE_GITHUB_URL: &str = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17.tar.bz2";
 
-fn ensure_sensevoice_model(base_dir: &Path) -> String {
-    let model_dir = base_dir.join(SENSEVOICE_MODEL_DIR);
-    let model_file = model_dir.join("model.int8.onnx");
-    if model_file.exists() {
-        return model_dir.to_string_lossy().into_owned();
-    }
-
-    eprintln!("[dictation] SenseVoice model not found at {}", model_dir.display());
-    eprintln!("[dictation] first run — downloading model (~250 MB), this may take a few minutes...");
-    std::fs::create_dir_all(base_dir).expect("failed to create model directory");
-
-    let archive = base_dir.join("sensevoice.tar.bz2");
-
-    // Download with progress
+fn download_with_progress(url: &str, dest: &Path, label: &str) -> Result<(), String> {
     let resp = reqwest::blocking::Client::new()
-        .get(SENSEVOICE_URL)
+        .get(url)
         .send()
-        .expect("failed to download model — check your network connection");
+        .map_err(|e| format!("request failed: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("HTTP {}", resp.status()));
+    }
     let total = resp.content_length().unwrap_or(0);
     let total_mb = total as f64 / 1_048_576.0;
     let mut downloaded: u64 = 0;
-    let mut file = std::fs::File::create(&archive).expect("failed to create archive file");
+    let mut file = std::fs::File::create(dest).map_err(|e| format!("create file: {e}"))?;
     let mut reader = resp;
     let mut buf = [0u8; 65536];
     let start = std::time::Instant::now();
     loop {
-        let n = reader.read(&mut buf).expect("download error — check your network connection");
+        let n = reader.read(&mut buf).map_err(|e| format!("read: {e}"))?;
         if n == 0 {
             break;
         }
-        file.write_all(&buf[..n]).expect("write error");
+        file.write_all(&buf[..n]).map_err(|e| format!("write: {e}"))?;
         downloaded += n as u64;
         if total > 0 {
             let pct = (downloaded as f64 / total as f64 * 100.0) as u32;
@@ -156,22 +147,70 @@ fn ensure_sensevoice_model(base_dir: &Path) -> String {
             let bar_len = 30;
             let filled = (bar_len as f64 * downloaded as f64 / total as f64) as usize;
             let bar: String = "█".repeat(filled) + &"░".repeat(bar_len - filled);
-            eprint!("\r[dictation] {bar} {mb:.1}/{total_mb:.1} MB ({pct}%) {speed:.1} MB/s");
+            eprint!("\r[dictation] {label}: {bar} {mb:.1}/{total_mb:.1} MB ({pct}%) {speed:.1} MB/s");
         }
     }
     eprintln!();
-    drop(file);
+    Ok(())
+}
 
-    // Extract
+fn try_download_from_hf(model_dir: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(model_dir).map_err(|e| format!("mkdir: {e}"))?;
+    let files = ["model.int8.onnx", "tokens.txt"];
+    for name in &files {
+        let url = format!("{SENSEVOICE_HF_BASE}/{name}");
+        let dest = model_dir.join(name);
+        eprintln!("[dictation] downloading {name} from HuggingFace...");
+        download_with_progress(&url, &dest, name)?;
+    }
+    Ok(())
+}
+
+fn try_download_from_github(base_dir: &Path) -> Result<(), String> {
+    let archive = base_dir.join("sensevoice.tar.bz2");
+    eprintln!("[dictation] downloading from GitHub releases...");
+    download_with_progress(SENSEVOICE_GITHUB_URL, &archive, "tar.bz2")?;
     eprint!("[dictation] extracting...");
     let status = std::process::Command::new("tar")
         .args(["xjf", &archive.to_string_lossy(), "-C", &base_dir.to_string_lossy()])
         .status()
-        .expect("failed to run tar");
-    assert!(status.success(), "tar extraction failed");
+        .map_err(|e| format!("tar: {e}"))?;
+    if !status.success() {
+        return Err("tar extraction failed".into());
+    }
     std::fs::remove_file(&archive).ok();
+    eprintln!(" done");
+    Ok(())
+}
 
-    eprintln!(" done ✓");
+fn ensure_sensevoice_model(base_dir: &Path) -> String {
+    let model_dir = base_dir.join(SENSEVOICE_MODEL_DIR);
+    let model_file = model_dir.join("model.int8.onnx");
+    if model_file.exists() {
+        return model_dir.to_string_lossy().into_owned();
+    }
+
+    eprintln!("[dictation] SenseVoice model not found at {}", model_dir.display());
+    eprintln!("[dictation] first run — downloading model, this may take a few minutes...");
+    std::fs::create_dir_all(base_dir).expect("failed to create model directory");
+
+    // Try HuggingFace first (single files, ~230 MB total)
+    match try_download_from_hf(&model_dir) {
+        Ok(()) => {
+            eprintln!("[dictation] model ready (from HuggingFace)");
+            return model_dir.to_string_lossy().into_owned();
+        }
+        Err(e) => {
+            eprintln!("[dictation] HuggingFace download failed: {e}");
+            eprintln!("[dictation] falling back to GitHub releases...");
+            // Clean up partial HF download
+            std::fs::remove_dir_all(&model_dir).ok();
+        }
+    }
+
+    // Fallback: GitHub tar.bz2 (~1 GB)
+    try_download_from_github(base_dir).expect("failed to download model from both sources");
+    eprintln!("[dictation] model ready (from GitHub)");
     model_dir.to_string_lossy().into_owned()
 }
 

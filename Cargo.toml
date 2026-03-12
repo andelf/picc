@@ -142,11 +142,20 @@ objc2-screen-capture-kit = { version = "0.3.2", features = [
     "SCScreenshotManager",
     "SCStream",
     "block2",
+    "dispatch2",
     "libc",
     "objc2-core-foundation",
     "objc2-core-graphics",
     "objc2-core-media",
 ] }
+objc2-core-media = { version = "0.3.2", features = [
+    "CMSampleBuffer",
+    "CMBlockBuffer",
+    "CMFormatDescription",
+] }
+dispatch2 = "0.3"
+hound = "3"
+libc = "0.2"
 objc2-image-io = { version = "0.3.2", features = [
     "CGImageDestination",
     "objc2-core-graphics",

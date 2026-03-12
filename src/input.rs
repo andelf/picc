@@ -3,8 +3,9 @@
 use objc2_app_kit::NSRunningApplication;
 use objc2_core_foundation::CGPoint;
 use objc2_core_graphics::{
-    CGEvent, CGEventField, CGEventFlags, CGEventSource, CGEventSourceStateID, CGEventTapLocation,
-    CGEventType, CGMouseButton, CGScrollEventUnit,
+    CGAssociateMouseAndMouseCursorPosition, CGEvent, CGEventField, CGEventFlags, CGEventSource,
+    CGEventSourceStateID, CGEventTapLocation, CGEventType, CGMouseButton, CGScrollEventUnit,
+    CGWarpMouseCursorPosition,
 };
 
 /// Bring an application to the foreground by PID.
@@ -18,10 +19,41 @@ pub fn activate_app(pid: i32) {
     }
 }
 
-/// Move the mouse cursor to (x, y) screen coordinates.
-pub fn mouse_move(x: f64, y: f64) {
+/// Get current mouse cursor position.
+pub fn get_mouse_position() -> (f64, f64) {
     let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState);
+    let event = CGEvent::new(source.as_deref());
+    match event {
+        Some(ref ev) => {
+            let loc = CGEvent::location(Some(ev));
+            (loc.x, loc.y)
+        }
+        None => (0.0, 0.0),
+    }
+}
+
+/// Move the mouse cursor to (x, y) screen coordinates.
+///
+/// Uses CGWarpMouseCursorPosition for reliable cross-screen movement,
+/// followed by a CGEvent MouseMoved to notify the window server.
+/// CGWarp alone doesn't generate mouse events; CGEvent alone can fail
+/// when moving across display boundaries.
+pub fn mouse_move(x: f64, y: f64) {
     let point = CGPoint { x, y };
+
+    // Step 1: Dissociate mouse and cursor so the warp isn't fought by the OS
+    CGAssociateMouseAndMouseCursorPosition(false);
+
+    // Step 2: Warp cursor to the exact position (works reliably across screens)
+    CGWarpMouseCursorPosition(point);
+
+    // Step 3: Re-associate mouse and cursor
+    CGAssociateMouseAndMouseCursorPosition(true);
+
+    // Step 4: Post a MouseMoved event so the app under the cursor gets the
+    // hover/mouseEnter notification.  Small delay lets the warp settle.
+    std::thread::sleep(std::time::Duration::from_millis(10));
+    let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState);
     let event = CGEvent::new_mouse_event(
         source.as_deref(),
         CGEventType::MouseMoved,

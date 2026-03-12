@@ -292,6 +292,12 @@ Known attributes:
     },
     /// List running applications visible to accessibility
     ListApps,
+    /// Debug: print current mouse position and screen info
+    #[command(hide = true, name = "debug")]
+    Debug {
+        /// Debug subcommand (mouse)
+        what: String,
+    },
 }
 
 fn main() {
@@ -300,6 +306,15 @@ fn main() {
     // list-apps doesn't need --app/--pid
     if matches!(cli.command, Command::ListApps) {
         if let Err(e) = cmd_list_apps() {
+            eprintln!("error: {e}");
+            std::process::exit(exit_code(&e));
+        }
+        return;
+    }
+
+    // debug doesn't need --app/--pid
+    if let Command::Debug { ref what } = cli.command {
+        if let Err(e) = cmd_debug(what) {
             eprintln!("error: {e}");
             std::process::exit(exit_code(&e));
         }
@@ -346,6 +361,7 @@ fn run(cli: Cli) -> Result<(), AxError> {
         }
         Command::Wait { target } => cmd_wait(&ctx, &target),
         Command::Get { attr, locator, all } => cmd_get(&ctx, &attr, &locator, all),
+        Command::Debug { .. } => unreachable!(),
     }
 }
 
@@ -526,6 +542,47 @@ fn cmd_list_apps() -> Result<(), AxError> {
     Ok(())
 }
 
+fn cmd_debug(what: &str) -> Result<(), AxError> {
+    match what {
+        "mouse" => {
+            let (mx, my) = input::get_mouse_position();
+            println!("Mouse position: ({mx:.1}, {my:.1})");
+
+            // Show all screens and which one the cursor is on
+            use objc2_app_kit::NSScreen;
+            let mtm = objc2::MainThreadMarker::new()
+                .ok_or_else(|| AxError::InvalidArgument("must run on main thread".to_string()))?;
+            let _ = mtm;
+            // NSScreen uses Cocoa coordinates (origin bottom-left, y up).
+            // CGEvent uses CG coordinates (origin top-left, y down).
+            // Convert: cg_y = primary_height - ns_y - ns_height
+            let screens = NSScreen::screens(mtm);
+            let primary_h = screens.iter().next()
+                .map(|s| NSScreen::frame(&s).size.height)
+                .unwrap_or(0.0);
+            for (i, screen) in screens.iter().enumerate() {
+                let ns_frame = NSScreen::frame(&screen);
+                let name = screen.localizedName();
+                // Convert to CG coordinates
+                let cg_x = ns_frame.origin.x;
+                let cg_y = primary_h - ns_frame.origin.y - ns_frame.size.height;
+                let w = ns_frame.size.width;
+                let h = ns_frame.size.height;
+                let on_screen = mx >= cg_x
+                    && mx < cg_x + w
+                    && my >= cg_y
+                    && my < cg_y + h;
+                println!(
+                    "Screen {i}: \"{name}\" origin=({cg_x:.0},{cg_y:.0}) size={w:.0}x{h:.0}{mark}",
+                    mark = if on_screen { " ← cursor here" } else { "" },
+                );
+            }
+            Ok(())
+        }
+        _ => Err(AxError::InvalidArgument(format!("unknown debug command: {what} (available: mouse)"))),
+    }
+}
+
 fn cmd_snapshot(ctx: &ExecutionContext, locator: Option<&str>, depth: usize, all: bool, max_text_len: usize, simplify: bool) -> Result<(), AxError> {
     let mut printer = tree_fmt::TreePrinter::new();
     printer.max_text_len = max_text_len;
@@ -644,10 +701,10 @@ fn cmd_press(ctx: &ExecutionContext, key: &str) -> Result<(), AxError> {
 fn cmd_hover(ctx: &ExecutionContext, locator: &str) -> Result<(), AxError> {
     let node = resolve_one(ctx, locator)?;
 
-    ctx.activate();
-
     let (cx, cy) = ctx.element_center(&node, false)?;
     eprintln!("Moving mouse to ({cx:.0}, {cy:.0})");
+    // No activate needed — CGEvent mouse move works across all screens
+    // without bringing the app to the foreground.
     input::mouse_move(cx, cy);
     Ok(())
 }
