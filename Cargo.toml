@@ -56,6 +56,10 @@ required-features = ["sensevoice"]
 name = "voice-correct"
 path = "src/bin/voice_correct.rs"
 
+[[bin]]
+name = "clipcopy"
+path = "src/bin/clipcopy.rs"
+
 [dependencies]
 objc2 = "0.6.4"
 block2 = "0.6.2"

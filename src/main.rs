@@ -1,24 +1,44 @@
 use std::cell::Cell;
 use std::ptr::NonNull;
+use std::sync::atomic::{AtomicU8, Ordering};
+
+use clap::Parser;
 
 use block2::RcBlock;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, NSObject};
-use objc2::{define_class, msg_send, DefinedClass, MainThreadMarker, MainThreadOnly};
+use objc2::{define_class, msg_send, AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly};
 
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSBezierPath, NSColor,
     NSCompositingOperation, NSEvent, NSEventMask, NSEventModifierFlags, NSGraphicsContext,
-    NSPanel, NSResponder, NSScreen, NSView, NSWindow, NSWindowCollectionBehavior,
-    NSWindowStyleMask,
+    NSImage, NSPanel, NSPasteboard, NSPasteboardTypePNG, NSPasteboardTypeString, NSResponder,
+    NSScreen, NSView, NSWindow, NSWindowCollectionBehavior, NSWindowStyleMask,
 };
 use objc2_core_foundation::{CFString, CFURL, CFURLPathStyle, CGPoint, CGRect, CGSize};
 use objc2_core_graphics::CGImage;
 use objc2_image_io::CGImageDestination;
-use objc2_foundation::{NSArray, NSDate, NSPoint, NSRect, NSRunLoop, NSSize, NSString};
+use objc2_foundation::{NSArray, NSData, NSDate, NSPoint, NSRect, NSRunLoop, NSSize, NSString};
 use picc::vision;
 
 use std::sync::Mutex;
+
+/// 复制模式：0=不复制, 1=复制OCR文字, 2=复制图片
+static COPY_MODE: AtomicU8 = AtomicU8::new(0);
+const COPY_TEXT: u8 = 1;
+const COPY_IMAGE: u8 = 2;
+
+#[derive(Parser)]
+#[command(name = "picc", about = "Interactive screenshot + OCR tool")]
+struct Cli {
+    /// 截图后复制 OCR 文字到剪贴板
+    #[arg(short = 'c', long = "copy")]
+    copy_text: bool,
+
+    /// 截图后复制图片到剪贴板
+    #[arg(short = 'i', long = "copy-image")]
+    copy_image: bool,
+}
 /// 选区坐标 (x, y, w, h)，AppKit 全局坐标系
 static SEL_RECT: Mutex<[f64; 4]> = Mutex::new([0.0, 0.0, 0.0, 0.0]);
 
@@ -207,9 +227,13 @@ define_class!(
                 CGImage::height(Some(&crop_img)),
             );
 
-            ocr(&crop_img);
+            if COPY_MODE.load(Ordering::Relaxed) == COPY_IMAGE {
+                copy_image_to_clipboard(&crop_img);
+            } else {
+                ocr(&crop_img);
+            }
 
-            // OCR 完成后保持隐藏，重置选区，回到待命状态
+            // 完成后保持隐藏，重置选区，回到待命状态
             *SEL_RECT.lock().unwrap() = [0.0, 0.0, 0.0, 0.0];
         }
 
@@ -370,6 +394,8 @@ fn ocr(img: &CGImage) {
     let reqs = NSArray::from_slice(&[text_req_ref, barcode_req_ref]);
     vision::perform_requests(&handler, &reqs).unwrap();
 
+    let mut all_text = Vec::new();
+
     // 处理二维码结果
     if let Some(results) = unsafe { barcode_req.results() } {
         for item in results.iter() {
@@ -385,10 +411,44 @@ fn ocr(img: &CGImage) {
         for item in results.iter() {
             let candidates = item.topCandidates(1);
             for candidate in candidates.iter() {
-                println!("candidate.string(): {:?}", candidate.string());
+                let s = candidate.string().to_string();
+                println!("candidate.string(): {:?}", s);
+                all_text.push(s);
             }
         }
     }
+
+    // 复制 OCR 文字到剪贴板
+    if COPY_MODE.load(Ordering::Relaxed) == COPY_TEXT && !all_text.is_empty() {
+        let joined = all_text.join("\n");
+        let pb = NSPasteboard::generalPasteboard();
+        pb.clearContents();
+        let ns_str = NSString::from_str(&joined);
+        pb.setString_forType(&ns_str, unsafe { NSPasteboardTypeString });
+        println!("[Copied text to clipboard] {} chars", joined.len());
+    }
+}
+
+/// 复制 CGImage 到系统剪贴板（PNG 格式）
+fn copy_image_to_clipboard(img: &CGImage) {
+    let size = NSSize::new(CGImage::width(Some(img)) as f64, CGImage::height(Some(img)) as f64);
+    let ns_img = NSImage::initWithCGImage_size(NSImage::alloc(), img, size);
+    let tiff_data = ns_img.TIFFRepresentation().expect("failed to get TIFF data");
+    let bitmap_rep: Retained<NSObject> = unsafe {
+        let cls = AnyClass::get(c"NSBitmapImageRep").unwrap();
+        msg_send![cls, imageRepWithData: &*tiff_data]
+    };
+    let png_data: Retained<NSData> = unsafe {
+        // NSPNGFileType = 4
+        let empty_dict: Retained<NSObject> =
+            msg_send![AnyClass::get(c"NSDictionary").unwrap(), new];
+        msg_send![&bitmap_rep, representationUsingType: 4u64, properties: &*empty_dict]
+    };
+
+    let pb = NSPasteboard::generalPasteboard();
+    pb.clearContents();
+    pb.setData_forType(Some(&png_data), unsafe { NSPasteboardTypePNG });
+    println!("[Copied image to clipboard] {}x{}", CGImage::width(Some(img)), CGImage::height(Some(img)));
 }
 
 /// 检测是否为 Ctrl+Cmd+A 快捷键
@@ -448,6 +508,13 @@ fn show_snap_windows() {
 }
 
 fn main() {
+    let cli = Cli::parse();
+    if cli.copy_image {
+        COPY_MODE.store(COPY_IMAGE, Ordering::Relaxed);
+    } else if cli.copy_text {
+        COPY_MODE.store(COPY_TEXT, Ordering::Relaxed);
+    }
+
     let mtm = MainThreadMarker::new().expect("must be on the main thread");
     let app = NSApplication::sharedApplication(mtm);
 
