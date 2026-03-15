@@ -342,7 +342,9 @@ fn main() {
                 is_recording.set(true);
                 set_status_icon(&status_item, true, mtm);
 
+                // Defensive: remove any stale tap from a previous failed start
                 let microphone = audio_engine.inputNode();
+                microphone.removeTapOnBus(0);
 
                 if use_sensevoice {
                     // Clear sample buffer
@@ -437,6 +439,10 @@ fn main() {
                 audio_engine.prepare();
                 if let Err(e) = audio_engine.startAndReturnError() {
                     eprintln!("[dictation] audio engine start error: {:?}", e);
+                    // Clean up the tap we just installed
+                    let microphone = audio_engine.inputNode();
+                    microphone.removeTapOnBus(0);
+                    audio_engine.reset();
                     is_recording.set(false);
                     set_status_icon(&status_item, false, mtm);
                     return;
@@ -453,6 +459,7 @@ fn main() {
                 let microphone = audio_engine.inputNode();
                 microphone.removeTapOnBus(0);
                 audio_engine.stop();
+                audio_engine.reset();
 
                 if use_sensevoice {
                     let raw_samples = samples_ref.lock().unwrap();

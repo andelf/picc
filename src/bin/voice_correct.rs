@@ -159,52 +159,96 @@ unsafe extern "C-unwind" fn event_tap_callback(
 
             let is_rec = IS_RECORDING.load(Ordering::Relaxed);
             let cancel_pending = SHOULD_CANCEL.load(Ordering::Relaxed);
+            let should_start = SHOULD_START.load(Ordering::Relaxed);
+            let should_stop = SHOULD_STOP.load(Ordering::Relaxed);
+            let mode = SESSION_MODE.load(Ordering::Relaxed);
+            let last_tap = LAST_TAP_RELEASE_MS.load(Ordering::Relaxed);
+            let gap = now - last_tap;
+
+            debug!(
+                now,
+                is_rec,
+                cancel_pending,
+                should_start,
+                should_stop,
+                mode,
+                gap,
+                flags = format_args!("0x{:04x}", device_flags),
+                "KEY_DOWN: right cmd pressed"
+            );
 
             // Allow new press if not recording, or if cancel is pending
             // (recording is about to be cancelled by timer)
             if !is_rec || cancel_pending {
-                let last_tap = LAST_TAP_RELEASE_MS.load(Ordering::Relaxed);
-                let gap = now - last_tap;
                 if gap < 300 {
                     SESSION_MODE.store(MODE_CORRECT, Ordering::Relaxed);
-                    debug!(gap, "press → CORRECT");
+                    debug!(gap, "KEY_DOWN → CORRECT mode, set SHOULD_START");
                 } else {
                     SESSION_MODE.store(MODE_DICTATION, Ordering::Relaxed);
-                    debug!(gap, "press → DICTATION");
+                    debug!(gap, "KEY_DOWN → DICTATION mode, set SHOULD_START");
                 }
                 SHOULD_START.store(true, Ordering::Relaxed);
             } else {
-                debug!("press (already recording, ignored)");
+                debug!(is_rec, cancel_pending, "KEY_DOWN → IGNORED (already recording)");
             }
         } else if !right_cmd_pressed && was_down {
             // Release
             WAS_DOWN.store(false, Ordering::Relaxed);
             let now = now_ms();
-            let hold = now - PRESS_MS.load(Ordering::Relaxed);
+            let press_ms = PRESS_MS.load(Ordering::Relaxed);
+            let hold = now - press_ms;
             let is_rec = IS_RECORDING.load(Ordering::Relaxed);
+            let should_start = SHOULD_START.load(Ordering::Relaxed);
+            let should_stop = SHOULD_STOP.load(Ordering::Relaxed);
+            let cancel_pending = SHOULD_CANCEL.load(Ordering::Relaxed);
+            let mode = SESSION_MODE.load(Ordering::Relaxed);
+
+            debug!(
+                now,
+                press_ms,
+                hold,
+                is_rec,
+                should_start,
+                should_stop,
+                cancel_pending,
+                mode,
+                flags = format_args!("0x{:04x}", device_flags),
+                "KEY_UP: right cmd released"
+            );
 
             // Short tap → always record as tap for double-tap detection,
             // regardless of whether timer has started recording yet.
             if hold < 300 {
                 LAST_TAP_RELEASE_MS.store(now, Ordering::Relaxed);
+                debug!(hold, "KEY_UP → short tap, updated LAST_TAP_RELEASE_MS");
             }
 
             if is_rec {
                 if hold < 300 && SESSION_MODE.load(Ordering::Relaxed) == MODE_DICTATION {
                     SHOULD_CANCEL.store(true, Ordering::Relaxed);
-                    debug!(hold, "release → CANCEL");
+                    debug!(hold, "KEY_UP → set SHOULD_CANCEL (short tap in dictation)");
                 } else {
                     SHOULD_STOP.store(true, Ordering::Relaxed);
-                    debug!(hold, "release → STOP");
+                    debug!(hold, mode, "KEY_UP → set SHOULD_STOP");
                 }
             } else {
                 if hold < 300 {
                     SHOULD_START.store(false, Ordering::Relaxed);
-                    debug!(hold, "release → CLEAR_START");
+                    debug!(hold, "KEY_UP → cleared SHOULD_START (short tap, not yet recording)");
                 } else {
-                    debug!(hold, "release → noop");
+                    debug!(hold, is_rec, should_start, "KEY_UP → noop (not recording)");
                 }
             }
+        } else if event_type == CGEventType::FlagsChanged {
+            // Other modifier changes while tracking right cmd
+            let is_rec = IS_RECORDING.load(Ordering::Relaxed);
+            debug!(
+                right_cmd_pressed,
+                was_down,
+                is_rec,
+                flags = format_args!("0x{:04x}", device_flags),
+                "FLAGS_CHANGED: no right cmd transition"
+            );
         }
     }
     event.as_ptr()
@@ -856,7 +900,7 @@ fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("voice_correct=info".parse().unwrap()),
+                .add_directive("voice_correct=debug".parse().unwrap()),
         )
         .with_target(false)
         .init();
@@ -1057,7 +1101,32 @@ fn main() {
         let samples_ref = accumulated_samples.clone();
         let delegate = delegate.clone();
 
+        // Counter for recording heartbeat (logs every ~2s)
+        let heartbeat_tick: Cell<u32> = Cell::new(0);
+
         let block = RcBlock::new(move |_timer: NonNull<NSTimer>| {
+            // --- Heartbeat: log state every ~2s while recording ---
+            if is_recording.get() {
+                let tick = heartbeat_tick.get() + 1;
+                heartbeat_tick.set(tick);
+                if tick % 40 == 0 {
+                    let elapsed_s = tick as f64 * 0.05;
+                    let should_stop = SHOULD_STOP.load(Ordering::Relaxed);
+                    let should_cancel = SHOULD_CANCEL.load(Ordering::Relaxed);
+                    let mode = current_mode.get();
+                    let mode_name = if mode == MODE_CORRECT { "correct" } else { "dictate" };
+                    debug!(
+                        elapsed_s = format_args!("{:.1}", elapsed_s),
+                        mode = mode_name,
+                        should_stop,
+                        should_cancel,
+                        "HEARTBEAT: still recording"
+                    );
+                }
+            } else {
+                heartbeat_tick.set(0);
+            }
+
             // --- Animate processing icon (cycle every ~250ms = 5 ticks) ---
             if is_processing.get() {
                 let tick = processing_tick.get() + 1;
@@ -1103,13 +1172,18 @@ fn main() {
 
             // --- CANCEL recording (short tap) ---
             if SHOULD_CANCEL.swap(false, Ordering::Relaxed) && is_recording.get() {
-                debug!("timer → cancel");
+                debug!(
+                    is_recording = is_recording.get(),
+                    is_processing = is_processing.get(),
+                    "TIMER → CANCEL: stopping recording"
+                );
                 is_recording.set(false);
                 IS_RECORDING.store(false, Ordering::Relaxed);
 
                 let microphone = audio_engine.inputNode();
                 microphone.removeTapOnBus(0);
                 audio_engine.stop();
+                audio_engine.reset();
 
                 if use_sensevoice {
                     if let Ok(mut s) = samples_ref.lock() {
@@ -1136,7 +1210,11 @@ fn main() {
                 } else {
                     "dictate"
                 };
-                debug!(mode = mode_name, "timer → start");
+                debug!(
+                    mode = mode_name,
+                    is_processing = is_processing.get(),
+                    "TIMER → START: beginning recording"
+                );
 
                 is_recording.set(true);
                 IS_RECORDING.store(true, Ordering::Relaxed);
@@ -1147,8 +1225,12 @@ fn main() {
                 };
                 set_status_icon(&status_item, icon, mtm);
                 play_start_sound();
+                debug!("TIMER → START [1/5]: icon set, sound played");
 
+                // Defensive: remove any stale tap from a previous failed start
                 let microphone = audio_engine.inputNode();
+                microphone.removeTapOnBus(0);
+                debug!("TIMER → START [2/5]: stale tap removed");
 
                 if use_sensevoice {
                     // SenseVoice: accumulate raw samples
@@ -1183,14 +1265,17 @@ fn main() {
                         Some(&format),
                         &*tap_block as *const _ as *mut _,
                     );
+                    debug!("TIMER → START [3/5]: sensevoice tap installed");
                 } else {
                     // Apple Speech: streaming recognition
                     if let Ok(mut text) = RECOGNIZED_TEXT.lock() {
                         text.clear();
                     }
+                    debug!("TIMER → START [3a/5]: RECOGNIZED_TEXT cleared");
 
                     let req = SFSpeechAudioBufferRecognitionRequest::new();
                     let format = microphone.outputFormatForBus(0);
+                    debug!("TIMER → START [3b/5]: speech request created, format obtained");
                     {
                         let req_clone = req.clone();
                         let tap_block = RcBlock::new(
@@ -1206,6 +1291,7 @@ fn main() {
                             &*tap_block as *const _ as *mut _,
                         );
                     }
+                    debug!("TIMER → START [3c/5]: audio tap installed");
 
                     let handler = RcBlock::new(
                         |result: *mut SFSpeechRecognitionResult,
@@ -1228,32 +1314,49 @@ fn main() {
                     );
 
                     if let Some(ref recognizer) = apple_recognizer {
+                        debug!("TIMER → START [3d/5]: starting recognition task...");
                         let _task =
                             recognizer.recognitionTaskWithRequest_resultHandler(&req, &*handler);
+                        debug!("TIMER → START [3e/5]: recognition task started");
                     }
                     apple_request.set(Some(req));
                 }
 
+                debug!("TIMER → START [4/5]: calling audio_engine.prepare()");
                 audio_engine.prepare();
+                debug!("TIMER → START [4/5]: prepare() done, calling startAndReturnError()");
                 if let Err(e) = audio_engine.startAndReturnError() {
-                    error!(?e, "audio engine start error");
+                    error!(?e, "TIMER → START: audio engine failed");
+                    // Clean up the tap we just installed — without this,
+                    // the stale tap blocks all subsequent start attempts.
+                    let microphone = audio_engine.inputNode();
+                    microphone.removeTapOnBus(0);
+                    audio_engine.reset();
                     is_recording.set(false);
                     IS_RECORDING.store(false, Ordering::Relaxed);
                     set_status_icon(&status_item, AppState::Idle, mtm);
                     play_error_sound();
                     return;
                 }
+                debug!("TIMER → START [5/5]: audio engine running, recording active");
             }
 
             // --- STOP recording ---
             if SHOULD_STOP.swap(false, Ordering::Relaxed) && is_recording.get() {
                 let mode = current_mode.get();
+                let mode_name = if mode == MODE_CORRECT { "correct" } else { "dictate" };
+                debug!(
+                    mode = mode_name,
+                    is_processing = is_processing.get(),
+                    "TIMER → STOP: stopping recording"
+                );
                 is_recording.set(false);
                 IS_RECORDING.store(false, Ordering::Relaxed);
 
                 let microphone = audio_engine.inputNode();
                 microphone.removeTapOnBus(0);
                 audio_engine.stop();
+                audio_engine.reset();
 
                 play_stop_sound();
 
@@ -1324,9 +1427,11 @@ fn main() {
                     }
                 }
 
+                debug!(spoken = %spoken, "TIMER → STOP: transcription done");
+
                 // Empty speech → skip entirely
                 if spoken.is_empty() {
-                    debug!("no speech recognized, skipping");
+                    debug!("TIMER → STOP: no speech recognized, resetting to idle");
                     set_status_icon(&status_item, AppState::Idle, mtm);
                     return;
                 }
