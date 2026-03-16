@@ -1184,10 +1184,21 @@ fn main() {
                 microphone.removeTapOnBus(0);
                 audio_engine.stop();
                 audio_engine.reset();
+                debug!("TIMER → CANCEL: engine stopped and reset");
 
                 if use_sensevoice {
-                    if let Ok(mut s) = samples_ref.lock() {
-                        s.clear();
+                    // Brief spin to let in-flight callback release the lock
+                    loop {
+                        match samples_ref.try_lock() {
+                            Ok(mut s) => {
+                                s.clear();
+                                break;
+                            }
+                            Err(_) => {
+                                debug!("TIMER → CANCEL: samples lock contention, spinning...");
+                                std::thread::sleep(Duration::from_millis(1));
+                            }
+                        }
                     }
                 } else {
                     if let Some(req) = apple_request.take() {
@@ -1234,13 +1245,30 @@ fn main() {
 
                 if use_sensevoice {
                     // SenseVoice: accumulate raw samples
-                    if let Ok(mut s) = samples_ref.lock() {
-                        s.clear();
+                    // Use try_lock to avoid deadlocking the timer if an
+                    // in-flight audio callback still holds the lock.
+                    debug!("TIMER → START [2.1/5]: acquiring samples lock...");
+                    match samples_ref.try_lock() {
+                        Ok(mut s) => {
+                            s.clear();
+                            debug!("TIMER → START [2.2/5]: samples cleared");
+                        }
+                        Err(_) => {
+                            warn!("TIMER → START: samples lock contention! Retrying next tick");
+                            // Undo state so next tick retries START
+                            is_recording.set(false);
+                            IS_RECORDING.store(false, Ordering::Relaxed);
+                            SHOULD_START.store(true, Ordering::Relaxed);
+                            set_status_icon(&status_item, AppState::Idle, mtm);
+                            return;
+                        }
                     }
 
+                    debug!("TIMER → START [2.3/5]: getting output format...");
                     let format = microphone.outputFormatForBus(0);
                     let sr = format.sampleRate() as u32;
                     native_sample_rate.set(sr);
+                    debug!(sample_rate = sr, "TIMER → START [2.4/5]: format obtained");
 
                     let samples_tap = samples_ref.clone();
                     let tap_block = RcBlock::new(
@@ -1259,6 +1287,7 @@ fn main() {
                             }
                         },
                     );
+                    debug!("TIMER → START [2.5/5]: installing audio tap...");
                     microphone.installTapOnBus_bufferSize_format_block(
                         0,
                         4096,
@@ -1355,8 +1384,11 @@ fn main() {
 
                 let microphone = audio_engine.inputNode();
                 microphone.removeTapOnBus(0);
+                debug!("TIMER → STOP [1]: tap removed");
                 audio_engine.stop();
+                debug!("TIMER → STOP [2]: engine stopped");
                 audio_engine.reset();
+                debug!("TIMER → STOP [3]: engine reset");
 
                 play_stop_sound();
 
@@ -1366,7 +1398,22 @@ fn main() {
                 if use_sensevoice {
                     #[cfg(feature = "sensevoice")]
                     {
-                        let raw_samples = samples_ref.lock().unwrap();
+                        // Brief spin-wait for the lock — an in-flight audio
+                        // callback may still hold it for a few ms after stop().
+                        debug!("TIMER → STOP [4]: acquiring samples lock...");
+                        let raw_samples = loop {
+                            match samples_ref.try_lock() {
+                                Ok(guard) => break guard,
+                                Err(_) => {
+                                    debug!("TIMER → STOP [4]: lock contention, spinning...");
+                                    std::thread::sleep(Duration::from_millis(1));
+                                }
+                            }
+                        };
+                        debug!(
+                            n_samples = raw_samples.len(),
+                            "TIMER → STOP [5]: samples lock acquired"
+                        );
                         if raw_samples.is_empty() {
                             warn!("no audio captured");
                             set_status_icon(&status_item, AppState::Idle, mtm);
