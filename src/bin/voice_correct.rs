@@ -1308,9 +1308,8 @@ fn main() {
                         audio_engine.reset();
                     }
 
-                    // SenseVoice: keep tap installed across recordings.
-                    // Original call order is critical: inputNode() MUST be
-                    // called before prepare() to trigger HW init.
+                    // Call order: inputNode → installTap → prepare → start.
+                    // Apple requires tap to be installed BEFORE engine start.
                     let microphone = audio_engine.inputNode();
 
                     // Clear samples
@@ -1326,33 +1325,12 @@ fn main() {
                         }
                     }
 
-                    // prepare + start (inputNode already called above)
-                    debug!("TIMER → START [2]: prepare + start");
-                    audio_engine.prepare();
-                    if let Err(e) = audio_engine.startAndReturnError() {
-                        error!(?e, "TIMER → START: engine failed, resetting for device change");
-                        // Audio device changed (e.g. earphone plugged in) — reset
-                        // engine and tap so next attempt re-initializes with new format.
-                        if sv_tap_installed.get() {
-                            let mic = audio_engine.inputNode();
-                            mic.removeTapOnBus(0);
-                            sv_tap_installed.set(false);
-                        }
-                        audio_engine.reset();
-                        is_recording.set(false);
-                        IS_RECORDING.store(false, Ordering::Relaxed);
-                        // Re-arm so the timer retries on next tick while key is held
-                        SHOULD_START.store(true, Ordering::Relaxed);
-                        set_status_icon(&status_item, AppState::Idle, mtm);
-                        return;
-                    }
-
-                    // Install tap ONCE — reuse across recordings via COLLECTING gate
+                    // Install tap BEFORE prepare/start (Apple requirement)
                     if !sv_tap_installed.get() {
                         let format = microphone.outputFormatForBus(0);
                         let sr = format.sampleRate() as u32;
                         native_sample_rate.set(sr);
-                        debug!(sample_rate = sr, "TIMER → START [3]: installing tap (first time)");
+                        debug!(sample_rate = sr, "TIMER → START [2]: installing tap");
 
                         let samples_tap = samples_ref.clone();
                         let tap_block = RcBlock::new(
@@ -1381,9 +1359,27 @@ fn main() {
                             &*tap_block as *const _ as *mut _,
                         );
                         sv_tap_installed.set(true);
-                        debug!("TIMER → START [3]: tap installed");
+                        debug!("TIMER → START [2]: tap installed");
                     } else {
-                        debug!("TIMER → START [3]: tap reused");
+                        debug!("TIMER → START [2]: tap reused");
+                    }
+
+                    // prepare + start (tap already installed above)
+                    debug!("TIMER → START [3]: prepare + start");
+                    audio_engine.prepare();
+                    if let Err(e) = audio_engine.startAndReturnError() {
+                        error!(?e, "TIMER → START: engine failed, resetting for device change");
+                        if sv_tap_installed.get() {
+                            let mic = audio_engine.inputNode();
+                            mic.removeTapOnBus(0);
+                            sv_tap_installed.set(false);
+                        }
+                        audio_engine.reset();
+                        is_recording.set(false);
+                        IS_RECORDING.store(false, Ordering::Relaxed);
+                        SHOULD_START.store(true, Ordering::Relaxed);
+                        set_status_icon(&status_item, AppState::Idle, mtm);
+                        return;
                     }
 
                     COLLECTING.store(true, Ordering::Relaxed);
