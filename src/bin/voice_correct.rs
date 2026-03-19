@@ -26,7 +26,9 @@ use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSImage, NSMenu, NSMenuItem, NSStatusBar,
     NSStatusItem,
 };
-use objc2_avf_audio::{AVAudioEngine, AVAudioPCMBuffer, AVAudioTime};
+use objc2_avf_audio::{
+    AVAudioEngine, AVAudioEngineConfigurationChangeNotification, AVAudioPCMBuffer, AVAudioTime,
+};
 use objc2_core_foundation::{
     CFMachPort, CFRetained, CFRunLoop, CFString, CFType, kCFRunLoopCommonModes,
 };
@@ -34,7 +36,9 @@ use objc2_core_graphics::{
     CGEvent, CGEventMask, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement,
     CGEventTapProxy, CGEventType,
 };
-use objc2_foundation::{ns_string, NSDate, NSLocale, NSRunLoop, NSString, NSTimer};
+use objc2_foundation::{
+    ns_string, NSDate, NSLocale, NSNotification, NSNotificationCenter, NSRunLoop, NSString, NSTimer,
+};
 use objc2_speech::{
     SFSpeechAudioBufferRecognitionRequest, SFSpeechRecognitionResult, SFSpeechRecognizer,
     SFSpeechRecognizerAuthorizationStatus,
@@ -112,6 +116,10 @@ static EVENT_TAP_PTR: AtomicPtr<std::ffi::c_void> = AtomicPtr::new(ptr::null_mut
 
 /// Gate for the audio tap callback — only accumulate samples when true.
 static COLLECTING: AtomicBool = AtomicBool::new(false);
+
+/// Set by AVAudioEngineConfigurationChangeNotification — signals the timer
+/// loop to reset engine and tap before next start.
+static AUDIO_CONFIG_CHANGED: AtomicBool = AtomicBool::new(false);
 
 /// Audio engine state machine (sensevoice path, managed by background thread).
 static AUDIO_STATE: AtomicU8 = AtomicU8::new(0);
@@ -1015,6 +1023,20 @@ fn main() {
 
     let audio_engine = unsafe { AVAudioEngine::new() };
 
+    // Listen for audio device changes (earphone plug/unplug, default device switch)
+    let _config_observer = unsafe {
+        let notification_block = RcBlock::new(|_notif: NonNull<NSNotification>| {
+            warn!("audio device configuration changed — will reset engine on next start");
+            AUDIO_CONFIG_CHANGED.store(true, Ordering::Relaxed);
+        });
+        NSNotificationCenter::defaultCenter().addObserverForName_object_queue_usingBlock(
+            Some(AVAudioEngineConfigurationChangeNotification),
+            Some(&audio_engine),
+            None,
+            &*notification_block,
+        )
+    };
+
     // --- CGEventTap ---
     let event_mask: CGEventMask = 1 << CGEventType::FlagsChanged.0;
     let tap = unsafe {
@@ -1274,6 +1296,18 @@ fn main() {
                 debug!("TIMER → START [1]: icon set, sound played");
 
                 if use_sensevoice {
+                    // Proactively reset engine if audio device changed (earphone plug/unplug)
+                    if AUDIO_CONFIG_CHANGED.swap(false, Ordering::Relaxed) {
+                        info!("TIMER → START: audio config changed, resetting engine and tap");
+                        if sv_tap_installed.get() {
+                            let mic = audio_engine.inputNode();
+                            mic.removeTapOnBus(0);
+                            sv_tap_installed.set(false);
+                        }
+                        audio_engine.stop();
+                        audio_engine.reset();
+                    }
+
                     // SenseVoice: keep tap installed across recordings.
                     // Original call order is critical: inputNode() MUST be
                     // called before prepare() to trigger HW init.
@@ -1354,7 +1388,8 @@ fn main() {
 
                     COLLECTING.store(true, Ordering::Relaxed);
                 } else {
-                    // Apple Speech path (main thread — only used when !sensevoice)
+                    // Apple Speech path — always reinstalls tap, so just drain the flag
+                    AUDIO_CONFIG_CHANGED.store(false, Ordering::Relaxed);
                     let microphone = audio_engine.inputNode();
                     microphone.removeTapOnBus(0);
                     audio_engine.prepare();

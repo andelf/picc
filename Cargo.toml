@@ -76,6 +76,8 @@ objc2-foundation = { version = "0.3.2", features = [
     "NSObject",
     "NSValue",
     "NSTimer",
+    "NSNotification",
+    "NSOperation",
 ] }
 objc2-app-kit = { version = "0.3.2", features = [
     "NSApplication",
