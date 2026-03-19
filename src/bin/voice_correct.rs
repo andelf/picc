@@ -1307,8 +1307,9 @@ fn main() {
                         audio_engine.reset();
                         is_recording.set(false);
                         IS_RECORDING.store(false, Ordering::Relaxed);
+                        // Re-arm so the timer retries on next tick while key is held
+                        SHOULD_START.store(true, Ordering::Relaxed);
                         set_status_icon(&status_item, AppState::Idle, mtm);
-                        play_error_sound();
                         return;
                     }
 
