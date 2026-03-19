@@ -13,7 +13,7 @@ use std::cell::{Cell, RefCell};
 #[cfg(feature = "sensevoice")]
 use std::path::Path;
 use std::ptr::{self, NonNull};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -107,6 +107,29 @@ static RECOGNIZED_TEXT: Mutex<String> = Mutex::new(String::new());
 /// LLM result from background thread: Some(Ok(corrected)) or Some(Err(msg))
 static LLM_RESULT: Mutex<Option<Result<String, String>>> = Mutex::new(None);
 
+/// Pointer to the CGEvent tap CFMachPort — used to re-enable on timeout.
+static EVENT_TAP_PTR: AtomicPtr<std::ffi::c_void> = AtomicPtr::new(ptr::null_mut());
+
+/// Gate for the audio tap callback — only accumulate samples when true.
+static COLLECTING: AtomicBool = AtomicBool::new(false);
+
+/// Audio engine state machine (sensevoice path, managed by background thread).
+static AUDIO_STATE: AtomicU8 = AtomicU8::new(0);
+const AUDIO_IDLE: u8 = 0;
+const AUDIO_STARTING: u8 = 1;
+const AUDIO_RUNNING: u8 = 2;
+const AUDIO_STOPPING: u8 = 3;
+const AUDIO_STOPPED: u8 = 4;
+const AUDIO_ERROR: u8 = 5;
+
+/// Sample rate discovered by the audio thread — read by main thread for resampling.
+static NATIVE_SAMPLE_RATE: AtomicU32 = AtomicU32::new(16000);
+
+/// Commands sent to the audio management thread.
+const CMD_START: u8 = 1;
+const CMD_STOP: u8 = 2;
+const CMD_CANCEL: u8 = 3;
+
 // --- Dictation post-processing options ---
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -143,6 +166,23 @@ unsafe extern "C-unwind" fn event_tap_callback(
     event: NonNull<CGEvent>,
     _user_info: *mut std::ffi::c_void,
 ) -> *mut CGEvent {
+    // macOS disables the tap if our callback takes too long or if the user
+    // switches to a secure input context.  Re-enable it immediately.
+    if event_type == CGEventType::TapDisabledByTimeout
+        || event_type == CGEventType::TapDisabledByUserInput
+    {
+        warn!(
+            event_type = ?event_type,
+            "CGEvent tap was disabled — re-enabling"
+        );
+        let tap_ptr = EVENT_TAP_PTR.load(Ordering::Relaxed);
+        if !tap_ptr.is_null() {
+            let tap = &*(tap_ptr as *const CFMachPort);
+            CGEvent::tap_enable(tap, true);
+        }
+        return event.as_ptr();
+    }
+
     if event_type == CGEventType::FlagsChanged {
         let flags = CGEvent::flags(Some(event.as_ref()));
         let device_flags = flags.0 & 0xFFFF;
@@ -989,6 +1029,9 @@ fn main() {
     }
     .expect("failed to create event tap — grant Accessibility permission");
 
+    // Store tap pointer so the callback can re-enable it on timeout.
+    EVENT_TAP_PTR.store(&*tap as *const CFMachPort as *mut std::ffi::c_void, Ordering::Relaxed);
+
     let run_loop_source = CFMachPort::new_run_loop_source(None, Some(&tap), 0)
         .expect("failed to create run loop source");
     unsafe {
@@ -1103,6 +1146,8 @@ fn main() {
 
         // Counter for recording heartbeat (logs every ~2s)
         let heartbeat_tick: Cell<u32> = Cell::new(0);
+        // Whether the SenseVoice audio tap has been installed (only done once)
+        let sv_tap_installed: Cell<bool> = Cell::new(false);
 
         let block = RcBlock::new(move |_timer: NonNull<NSTimer>| {
             // --- Heartbeat: log state every ~2s while recording ---
@@ -1180,27 +1225,17 @@ fn main() {
                 is_recording.set(false);
                 IS_RECORDING.store(false, Ordering::Relaxed);
 
-                let microphone = audio_engine.inputNode();
-                microphone.removeTapOnBus(0);
-                audio_engine.stop();
-                audio_engine.reset();
-                debug!("TIMER → CANCEL: engine stopped and reset");
-
                 if use_sensevoice {
-                    // Brief spin to let in-flight callback release the lock
-                    loop {
-                        match samples_ref.try_lock() {
-                            Ok(mut s) => {
-                                s.clear();
-                                break;
-                            }
-                            Err(_) => {
-                                debug!("TIMER → CANCEL: samples lock contention, spinning...");
-                                std::thread::sleep(Duration::from_millis(1));
-                            }
-                        }
-                    }
+                    COLLECTING.store(false, Ordering::Relaxed);
+                    audio_engine.stop();
+                    if let Ok(mut s) = samples_ref.lock() { s.clear(); }
+                    debug!("TIMER → CANCEL: engine stopped (tap kept)");
                 } else {
+                    let microphone = audio_engine.inputNode();
+                    microphone.removeTapOnBus(0);
+                    audio_engine.stop();
+                    audio_engine.reset();
+                    debug!("TIMER → CANCEL: engine stopped and reset");
                     if let Some(req) = apple_request.take() {
                         req.endAudio();
                     }
@@ -1236,26 +1271,19 @@ fn main() {
                 };
                 set_status_icon(&status_item, icon, mtm);
                 play_start_sound();
-                debug!("TIMER → START [1/5]: icon set, sound played");
-
-                // Defensive: remove any stale tap from a previous failed start
-                let microphone = audio_engine.inputNode();
-                microphone.removeTapOnBus(0);
-                debug!("TIMER → START [2/5]: stale tap removed");
+                debug!("TIMER → START [1]: icon set, sound played");
 
                 if use_sensevoice {
-                    // SenseVoice: accumulate raw samples
-                    // Use try_lock to avoid deadlocking the timer if an
-                    // in-flight audio callback still holds the lock.
-                    debug!("TIMER → START [2.1/5]: acquiring samples lock...");
+                    // SenseVoice: keep tap installed across recordings.
+                    // Original call order is critical: inputNode() MUST be
+                    // called before prepare() to trigger HW init.
+                    let microphone = audio_engine.inputNode();
+
+                    // Clear samples
                     match samples_ref.try_lock() {
-                        Ok(mut s) => {
-                            s.clear();
-                            debug!("TIMER → START [2.2/5]: samples cleared");
-                        }
+                        Ok(mut s) => s.clear(),
                         Err(_) => {
-                            warn!("TIMER → START: samples lock contention! Retrying next tick");
-                            // Undo state so next tick retries START
+                            warn!("TIMER → START: samples lock contention, retry");
                             is_recording.set(false);
                             IS_RECORDING.store(false, Ordering::Relaxed);
                             SHOULD_START.store(true, Ordering::Relaxed);
@@ -1264,47 +1292,87 @@ fn main() {
                         }
                     }
 
-                    debug!("TIMER → START [2.3/5]: getting output format...");
-                    let format = microphone.outputFormatForBus(0);
-                    let sr = format.sampleRate() as u32;
-                    native_sample_rate.set(sr);
-                    debug!(sample_rate = sr, "TIMER → START [2.4/5]: format obtained");
+                    // prepare + start (inputNode already called above)
+                    debug!("TIMER → START [2]: prepare + start");
+                    audio_engine.prepare();
+                    if let Err(e) = audio_engine.startAndReturnError() {
+                        error!(?e, "TIMER → START: engine failed, resetting for device change");
+                        // Audio device changed (e.g. earphone plugged in) — reset
+                        // engine and tap so next attempt re-initializes with new format.
+                        if sv_tap_installed.get() {
+                            let mic = audio_engine.inputNode();
+                            mic.removeTapOnBus(0);
+                            sv_tap_installed.set(false);
+                        }
+                        audio_engine.reset();
+                        is_recording.set(false);
+                        IS_RECORDING.store(false, Ordering::Relaxed);
+                        set_status_icon(&status_item, AppState::Idle, mtm);
+                        play_error_sound();
+                        return;
+                    }
 
-                    let samples_tap = samples_ref.clone();
-                    let tap_block = RcBlock::new(
-                        move |buffer: NonNull<AVAudioPCMBuffer>,
-                              _time: NonNull<AVAudioTime>| {
-                            let buf = buffer.as_ref();
-                            let float_data = buf.floatChannelData();
-                            let frame_length = buf.frameLength();
-                            if !float_data.is_null() && frame_length > 0 {
-                                let channel0 = (*float_data).as_ptr();
-                                let slice =
-                                    std::slice::from_raw_parts(channel0, frame_length as usize);
-                                if let Ok(mut samples) = samples_tap.lock() {
-                                    samples.extend_from_slice(slice);
+                    // Install tap ONCE — reuse across recordings via COLLECTING gate
+                    if !sv_tap_installed.get() {
+                        let format = microphone.outputFormatForBus(0);
+                        let sr = format.sampleRate() as u32;
+                        native_sample_rate.set(sr);
+                        debug!(sample_rate = sr, "TIMER → START [3]: installing tap (first time)");
+
+                        let samples_tap = samples_ref.clone();
+                        let tap_block = RcBlock::new(
+                            move |buffer: NonNull<AVAudioPCMBuffer>,
+                                  _time: NonNull<AVAudioTime>| {
+                                if !COLLECTING.load(Ordering::Relaxed) {
+                                    return;
                                 }
-                            }
-                        },
-                    );
-                    debug!("TIMER → START [2.5/5]: installing audio tap...");
-                    microphone.installTapOnBus_bufferSize_format_block(
-                        0,
-                        4096,
-                        Some(&format),
-                        &*tap_block as *const _ as *mut _,
-                    );
-                    debug!("TIMER → START [3/5]: sensevoice tap installed");
+                                let buf = buffer.as_ref();
+                                let float_data = buf.floatChannelData();
+                                let frame_length = buf.frameLength();
+                                if !float_data.is_null() && frame_length > 0 {
+                                    let channel0 = (*float_data).as_ptr();
+                                    let slice =
+                                        std::slice::from_raw_parts(channel0, frame_length as usize);
+                                    if let Ok(mut samples) = samples_tap.lock() {
+                                        samples.extend_from_slice(slice);
+                                    }
+                                }
+                            },
+                        );
+                        microphone.installTapOnBus_bufferSize_format_block(
+                            0,
+                            4096,
+                            Some(&format),
+                            &*tap_block as *const _ as *mut _,
+                        );
+                        sv_tap_installed.set(true);
+                        debug!("TIMER → START [3]: tap installed");
+                    } else {
+                        debug!("TIMER → START [3]: tap reused");
+                    }
+
+                    COLLECTING.store(true, Ordering::Relaxed);
                 } else {
-                    // Apple Speech: streaming recognition
+                    // Apple Speech path (main thread — only used when !sensevoice)
+                    let microphone = audio_engine.inputNode();
+                    microphone.removeTapOnBus(0);
+                    audio_engine.prepare();
+                    if let Err(e) = audio_engine.startAndReturnError() {
+                        error!(?e, "TIMER → START: audio engine failed");
+                        audio_engine.reset();
+                        is_recording.set(false);
+                        IS_RECORDING.store(false, Ordering::Relaxed);
+                        set_status_icon(&status_item, AppState::Idle, mtm);
+                        play_error_sound();
+                        return;
+                    }
+
                     if let Ok(mut text) = RECOGNIZED_TEXT.lock() {
                         text.clear();
                     }
-                    debug!("TIMER → START [3a/5]: RECOGNIZED_TEXT cleared");
 
                     let req = SFSpeechAudioBufferRecognitionRequest::new();
                     let format = microphone.outputFormatForBus(0);
-                    debug!("TIMER → START [3b/5]: speech request created, format obtained");
                     {
                         let req_clone = req.clone();
                         let tap_block = RcBlock::new(
@@ -1320,7 +1388,6 @@ fn main() {
                             &*tap_block as *const _ as *mut _,
                         );
                     }
-                    debug!("TIMER → START [3c/5]: audio tap installed");
 
                     let handler = RcBlock::new(
                         |result: *mut SFSpeechRecognitionResult,
@@ -1343,31 +1410,13 @@ fn main() {
                     );
 
                     if let Some(ref recognizer) = apple_recognizer {
-                        debug!("TIMER → START [3d/5]: starting recognition task...");
                         let _task =
                             recognizer.recognitionTaskWithRequest_resultHandler(&req, &*handler);
-                        debug!("TIMER → START [3e/5]: recognition task started");
                     }
                     apple_request.set(Some(req));
                 }
 
-                debug!("TIMER → START [4/5]: calling audio_engine.prepare()");
-                audio_engine.prepare();
-                debug!("TIMER → START [4/5]: prepare() done, calling startAndReturnError()");
-                if let Err(e) = audio_engine.startAndReturnError() {
-                    error!(?e, "TIMER → START: audio engine failed");
-                    // Clean up the tap we just installed — without this,
-                    // the stale tap blocks all subsequent start attempts.
-                    let microphone = audio_engine.inputNode();
-                    microphone.removeTapOnBus(0);
-                    audio_engine.reset();
-                    is_recording.set(false);
-                    IS_RECORDING.store(false, Ordering::Relaxed);
-                    set_status_icon(&status_item, AppState::Idle, mtm);
-                    play_error_sound();
-                    return;
-                }
-                debug!("TIMER → START [5/5]: audio engine running, recording active");
+                debug!("TIMER → START: done");
             }
 
             // --- STOP recording ---
@@ -1382,45 +1431,28 @@ fn main() {
                 is_recording.set(false);
                 IS_RECORDING.store(false, Ordering::Relaxed);
 
-                let microphone = audio_engine.inputNode();
-                microphone.removeTapOnBus(0);
-                debug!("TIMER → STOP [1]: tap removed");
-                audio_engine.stop();
-                debug!("TIMER → STOP [2]: engine stopped");
-                audio_engine.reset();
-                debug!("TIMER → STOP [3]: engine reset");
-
-                play_stop_sound();
-
-                // --- Get transcription ---
                 let spoken: String;
 
                 if use_sensevoice {
+                    COLLECTING.store(false, Ordering::Relaxed);
+                    audio_engine.stop();
+                    debug!("TIMER → STOP: engine stopped (tap kept)");
+                    play_stop_sound();
+
                     #[cfg(feature = "sensevoice")]
                     {
-                        // Brief spin-wait for the lock — an in-flight audio
-                        // callback may still hold it for a few ms after stop().
-                        debug!("TIMER → STOP [4]: acquiring samples lock...");
                         let raw_samples = loop {
                             match samples_ref.try_lock() {
                                 Ok(guard) => break guard,
-                                Err(_) => {
-                                    debug!("TIMER → STOP [4]: lock contention, spinning...");
-                                    std::thread::sleep(Duration::from_millis(1));
-                                }
+                                Err(_) => std::thread::sleep(Duration::from_millis(1)),
                             }
                         };
-                        debug!(
-                            n_samples = raw_samples.len(),
-                            "TIMER → STOP [5]: samples lock acquired"
-                        );
                         if raw_samples.is_empty() {
                             warn!("no audio captured");
                             set_status_icon(&status_item, AppState::Idle, mtm);
                             return;
                         }
                         let sr = native_sample_rate.get();
-                        // Downsample to 16kHz if needed
                         let samples_16k = if sr == 16000 {
                             raw_samples.clone()
                         } else {
@@ -1432,14 +1464,12 @@ fn main() {
                                     let idx = src as usize;
                                     let frac = src - idx as f64;
                                     let a = raw_samples[idx];
-                                    let b =
-                                        raw_samples.get(idx + 1).copied().unwrap_or(a);
+                                    let b = raw_samples.get(idx + 1).copied().unwrap_or(a);
                                     a + (b - a) * frac as f32
                                 })
                                 .collect::<Vec<f32>>()
                         };
                         drop(raw_samples);
-
                         info!(duration_s = format_args!("{:.1}", samples_16k.len() as f64 / 16000.0), "transcribing audio");
                         if let Some(mut recognizer) = sv_recognizer.take() {
                             let t0 = std::time::Instant::now();
@@ -1457,18 +1487,22 @@ fn main() {
                         spoken = String::new();
                     }
                 } else {
+                    // Apple Speech path
+                    let microphone = audio_engine.inputNode();
+                    microphone.removeTapOnBus(0);
+                    audio_engine.stop();
+                    audio_engine.reset();
+                    play_stop_sound();
+
                     if let Some(req) = apple_request.take() {
                         req.endAudio();
                     }
-                    // Wait for Apple Speech to finalize
                     NSRunLoop::currentRunLoop()
                         .runUntilDate(&NSDate::dateWithTimeIntervalSinceNow(0.5));
-
                     spoken = RECOGNIZED_TEXT
                         .lock()
                         .map(|t| t.clone())
                         .unwrap_or_default();
-
                     if let Ok(mut t) = RECOGNIZED_TEXT.lock() {
                         t.clear();
                     }
@@ -1583,6 +1617,7 @@ fn main() {
                     }
                 }
             }
+
         });
 
         NSTimer::scheduledTimerWithTimeInterval_repeats_block(0.05, true, &block)
