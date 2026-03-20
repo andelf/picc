@@ -1168,6 +1168,8 @@ fn main() {
 
         // Counter for recording heartbeat (logs every ~2s)
         let heartbeat_tick: Cell<u32> = Cell::new(0);
+        // Cooldown ticks after audio device change (wait for HAL to settle)
+        let config_change_cooldown: Cell<u32> = Cell::new(0);
         let block = RcBlock::new(move |_timer: NonNull<NSTimer>| {
             // --- Heartbeat: log state every ~2s while recording ---
             if is_recording.get() {
@@ -1297,13 +1299,29 @@ fn main() {
                 debug!("TIMER → START [1]: icon set, sound played");
 
                 if use_sensevoice {
-                    // Drain device-change flag — engine auto-reconfigures on prepare/start.
+                    // Device changed: wait for audio HAL to settle before touching engine.
+                    // Set cooldown of ~500ms (10 ticks × 50ms) to let the system stabilize.
                     if AUDIO_CONFIG_CHANGED.swap(false, Ordering::Relaxed) {
-                        info!("TIMER → START: audio config changed (will use new device)");
+                        info!("TIMER → START: audio config changed, waiting 500ms for HAL to settle");
+                        config_change_cooldown.set(10);
+                        // Stop + reset to fully release old device config
+                        audio_engine.stop();
+                        audio_engine.reset();
+                        debug!("TIMER → START: engine reset for device change");
+                    }
+                    if config_change_cooldown.get() > 0 {
+                        let remaining = config_change_cooldown.get() - 1;
+                        config_change_cooldown.set(remaining);
+                        debug!(remaining, "TIMER → START: cooldown tick");
+                        is_recording.set(false);
+                        IS_RECORDING.store(false, Ordering::Relaxed);
+                        SHOULD_START.store(true, Ordering::Relaxed);
+                        set_status_icon(&status_item, AppState::Idle, mtm);
+                        return;
                     }
 
                     // Each recording cycle: inputNode → installTap → prepare → start.
-                    // Engine is stopped (not reset) — keeps audio device acquired.
+                    debug!("TIMER → START [2a]: getting inputNode");
                     let microphone = audio_engine.inputNode();
 
                     // Clear samples
@@ -1319,12 +1337,8 @@ fn main() {
                         }
                     }
 
-                    // Install tap on fresh engine (always — tap was removed on previous stop)
-                    let format = microphone.outputFormatForBus(0);
-                    let sr = format.sampleRate() as u32;
-                    native_sample_rate.set(sr);
-                    debug!(sample_rate = sr, "TIMER → START [2]: installing tap");
-
+                    // Install tap (pass None for format to let system pick current device format)
+                    debug!("TIMER → START [2b]: calling installTapOnBus");
                     let samples_tap = samples_ref.clone();
                     let tap_block = RcBlock::new(
                         move |buffer: NonNull<AVAudioPCMBuffer>,
@@ -1348,12 +1362,17 @@ fn main() {
                     microphone.installTapOnBus_bufferSize_format_block(
                         0,
                         4096,
-                        Some(&format),
+                        None, // Let system pick format for current device
                         &*tap_block as *const _ as *mut _,
                     );
-                    debug!("TIMER → START [2]: tap installed");
+                    debug!("TIMER → START [2c]: tap installed");
 
-                    // prepare + start (tap already installed above)
+                    // Read actual sample rate from the tap's format
+                    let sr = microphone.outputFormatForBus(0).sampleRate() as u32;
+                    native_sample_rate.set(sr);
+                    debug!(sample_rate = sr, "TIMER → START [2d]: sample rate");
+
+                    // prepare + start
                     debug!("TIMER → START [3]: prepare + start");
                     audio_engine.prepare();
                     if let Err(e) = audio_engine.startAndReturnError() {
