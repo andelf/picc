@@ -1249,9 +1249,10 @@ fn main() {
                     let mic = audio_engine.inputNode();
                     mic.removeTapOnBus(0);
                     audio_engine.stop();
-                    audio_engine.reset();
+                    // No reset() — keep audio device acquired to avoid
+                    // installTapOnBus deadlock on next start after device change.
                     if let Ok(mut s) = samples_ref.lock() { s.clear(); }
-                    debug!("TIMER → CANCEL: engine stopped and reset");
+                    debug!("TIMER → CANCEL: engine stopped");
                 } else {
                     let microphone = audio_engine.inputNode();
                     microphone.removeTapOnBus(0);
@@ -1296,13 +1297,13 @@ fn main() {
                 debug!("TIMER → START [1]: icon set, sound played");
 
                 if use_sensevoice {
-                    // Drain device-change flag (already handled by full reset on each stop)
+                    // Drain device-change flag — engine auto-reconfigures on prepare/start.
                     if AUDIO_CONFIG_CHANGED.swap(false, Ordering::Relaxed) {
                         info!("TIMER → START: audio config changed (will use new device)");
                     }
 
                     // Each recording cycle: inputNode → installTap → prepare → start.
-                    // Engine was reset on previous stop, so we always reinstall tap.
+                    // Engine is stopped (not reset) — keeps audio device acquired.
                     let microphone = audio_engine.inputNode();
 
                     // Clear samples
@@ -1455,8 +1456,8 @@ fn main() {
                     let mic = audio_engine.inputNode();
                     mic.removeTapOnBus(0);
                     audio_engine.stop();
-                    audio_engine.reset();
-                    debug!("TIMER → STOP: engine stopped and reset");
+                    // No reset() — keep audio device acquired.
+                    debug!("TIMER → STOP: engine stopped");
                     play_stop_sound();
 
                     #[cfg(feature = "sensevoice")]
