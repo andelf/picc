@@ -1168,9 +1168,6 @@ fn main() {
 
         // Counter for recording heartbeat (logs every ~2s)
         let heartbeat_tick: Cell<u32> = Cell::new(0);
-        // Whether the SenseVoice audio tap has been installed (only done once)
-        let sv_tap_installed: Cell<bool> = Cell::new(false);
-
         let block = RcBlock::new(move |_timer: NonNull<NSTimer>| {
             // --- Heartbeat: log state every ~2s while recording ---
             if is_recording.get() {
@@ -1249,9 +1246,12 @@ fn main() {
 
                 if use_sensevoice {
                     COLLECTING.store(false, Ordering::Relaxed);
+                    let mic = audio_engine.inputNode();
+                    mic.removeTapOnBus(0);
                     audio_engine.stop();
+                    audio_engine.reset();
                     if let Ok(mut s) = samples_ref.lock() { s.clear(); }
-                    debug!("TIMER → CANCEL: engine stopped (tap kept)");
+                    debug!("TIMER → CANCEL: engine stopped and reset");
                 } else {
                     let microphone = audio_engine.inputNode();
                     microphone.removeTapOnBus(0);
@@ -1296,20 +1296,13 @@ fn main() {
                 debug!("TIMER → START [1]: icon set, sound played");
 
                 if use_sensevoice {
-                    // Proactively reset engine if audio device changed (earphone plug/unplug)
+                    // Drain device-change flag (already handled by full reset on each stop)
                     if AUDIO_CONFIG_CHANGED.swap(false, Ordering::Relaxed) {
-                        info!("TIMER → START: audio config changed, resetting engine and tap");
-                        if sv_tap_installed.get() {
-                            let mic = audio_engine.inputNode();
-                            mic.removeTapOnBus(0);
-                            sv_tap_installed.set(false);
-                        }
-                        audio_engine.stop();
-                        audio_engine.reset();
+                        info!("TIMER → START: audio config changed (will use new device)");
                     }
 
-                    // Call order: inputNode → installTap → prepare → start.
-                    // Apple requires tap to be installed BEFORE engine start.
+                    // Each recording cycle: inputNode → installTap → prepare → start.
+                    // Engine was reset on previous stop, so we always reinstall tap.
                     let microphone = audio_engine.inputNode();
 
                     // Clear samples
@@ -1325,55 +1318,47 @@ fn main() {
                         }
                     }
 
-                    // Install tap BEFORE prepare/start (Apple requirement)
-                    if !sv_tap_installed.get() {
-                        let format = microphone.outputFormatForBus(0);
-                        let sr = format.sampleRate() as u32;
-                        native_sample_rate.set(sr);
-                        debug!(sample_rate = sr, "TIMER → START [2]: installing tap");
+                    // Install tap on fresh engine (always — tap was removed on previous stop)
+                    let format = microphone.outputFormatForBus(0);
+                    let sr = format.sampleRate() as u32;
+                    native_sample_rate.set(sr);
+                    debug!(sample_rate = sr, "TIMER → START [2]: installing tap");
 
-                        let samples_tap = samples_ref.clone();
-                        let tap_block = RcBlock::new(
-                            move |buffer: NonNull<AVAudioPCMBuffer>,
-                                  _time: NonNull<AVAudioTime>| {
-                                if !COLLECTING.load(Ordering::Relaxed) {
-                                    return;
+                    let samples_tap = samples_ref.clone();
+                    let tap_block = RcBlock::new(
+                        move |buffer: NonNull<AVAudioPCMBuffer>,
+                              _time: NonNull<AVAudioTime>| {
+                            if !COLLECTING.load(Ordering::Relaxed) {
+                                return;
+                            }
+                            let buf = buffer.as_ref();
+                            let float_data = buf.floatChannelData();
+                            let frame_length = buf.frameLength();
+                            if !float_data.is_null() && frame_length > 0 {
+                                let channel0 = (*float_data).as_ptr();
+                                let slice =
+                                    std::slice::from_raw_parts(channel0, frame_length as usize);
+                                if let Ok(mut samples) = samples_tap.lock() {
+                                    samples.extend_from_slice(slice);
                                 }
-                                let buf = buffer.as_ref();
-                                let float_data = buf.floatChannelData();
-                                let frame_length = buf.frameLength();
-                                if !float_data.is_null() && frame_length > 0 {
-                                    let channel0 = (*float_data).as_ptr();
-                                    let slice =
-                                        std::slice::from_raw_parts(channel0, frame_length as usize);
-                                    if let Ok(mut samples) = samples_tap.lock() {
-                                        samples.extend_from_slice(slice);
-                                    }
-                                }
-                            },
-                        );
-                        microphone.installTapOnBus_bufferSize_format_block(
-                            0,
-                            4096,
-                            Some(&format),
-                            &*tap_block as *const _ as *mut _,
-                        );
-                        sv_tap_installed.set(true);
-                        debug!("TIMER → START [2]: tap installed");
-                    } else {
-                        debug!("TIMER → START [2]: tap reused");
-                    }
+                            }
+                        },
+                    );
+                    microphone.installTapOnBus_bufferSize_format_block(
+                        0,
+                        4096,
+                        Some(&format),
+                        &*tap_block as *const _ as *mut _,
+                    );
+                    debug!("TIMER → START [2]: tap installed");
 
                     // prepare + start (tap already installed above)
                     debug!("TIMER → START [3]: prepare + start");
                     audio_engine.prepare();
                     if let Err(e) = audio_engine.startAndReturnError() {
-                        error!(?e, "TIMER → START: engine failed, resetting for device change");
-                        if sv_tap_installed.get() {
-                            let mic = audio_engine.inputNode();
-                            mic.removeTapOnBus(0);
-                            sv_tap_installed.set(false);
-                        }
+                        error!(?e, "TIMER → START: engine failed");
+                        let mic = audio_engine.inputNode();
+                        mic.removeTapOnBus(0);
                         audio_engine.reset();
                         is_recording.set(false);
                         IS_RECORDING.store(false, Ordering::Relaxed);
@@ -1467,8 +1452,11 @@ fn main() {
 
                 if use_sensevoice {
                     COLLECTING.store(false, Ordering::Relaxed);
+                    let mic = audio_engine.inputNode();
+                    mic.removeTapOnBus(0);
                     audio_engine.stop();
-                    debug!("TIMER → STOP: engine stopped (tap kept)");
+                    audio_engine.reset();
+                    debug!("TIMER → STOP: engine stopped and reset");
                     play_stop_sound();
 
                     #[cfg(feature = "sensevoice")]
