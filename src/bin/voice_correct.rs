@@ -1021,17 +1021,19 @@ fn main() {
         None
     };
 
-    let audio_engine = unsafe { AVAudioEngine::new() };
+    let audio_engine = RefCell::new(unsafe { AVAudioEngine::new() });
 
-    // Listen for audio device changes (earphone plug/unplug, default device switch)
+    // Listen for audio device changes (earphone plug/unplug, default device switch).
+    // Use object: None to observe ANY engine instance — this way we don't need to
+    // re-register when we recreate the engine after a device change.
     let _config_observer = unsafe {
         let notification_block = RcBlock::new(|_notif: NonNull<NSNotification>| {
-            warn!("audio device configuration changed — will reset engine on next start");
+            warn!("audio device configuration changed — will recreate engine on next start");
             AUDIO_CONFIG_CHANGED.store(true, Ordering::Relaxed);
         });
         NSNotificationCenter::defaultCenter().addObserverForName_object_queue_usingBlock(
             Some(AVAudioEngineConfigurationChangeNotification),
-            Some(&audio_engine),
+            None,
             None,
             &*notification_block,
         )
@@ -1170,6 +1172,8 @@ fn main() {
         let heartbeat_tick: Cell<u32> = Cell::new(0);
         // Cooldown ticks after audio device change (wait for HAL to settle)
         let config_change_cooldown: Cell<u32> = Cell::new(0);
+        // Retry counter for engine start failures
+        let start_retry_count: Cell<u32> = Cell::new(0);
         let block = RcBlock::new(move |_timer: NonNull<NSTimer>| {
             // --- Heartbeat: log state every ~2s while recording ---
             if is_recording.get() {
@@ -1248,18 +1252,22 @@ fn main() {
 
                 if use_sensevoice {
                     COLLECTING.store(false, Ordering::Relaxed);
-                    let mic = audio_engine.inputNode();
-                    mic.removeTapOnBus(0);
-                    audio_engine.stop();
-                    // No reset() — keep audio device acquired to avoid
-                    // installTapOnBus deadlock on next start after device change.
+                    {
+                        let engine = audio_engine.borrow();
+                        let mic = engine.inputNode();
+                        mic.removeTapOnBus(0);
+                        engine.stop();
+                    }
                     if let Ok(mut s) = samples_ref.lock() { s.clear(); }
                     debug!("TIMER → CANCEL: engine stopped");
                 } else {
-                    let microphone = audio_engine.inputNode();
-                    microphone.removeTapOnBus(0);
-                    audio_engine.stop();
-                    audio_engine.reset();
+                    {
+                        let engine = audio_engine.borrow();
+                        let microphone = engine.inputNode();
+                        microphone.removeTapOnBus(0);
+                        engine.stop();
+                        engine.reset();
+                    }
                     debug!("TIMER → CANCEL: engine stopped and reset");
                     if let Some(req) = apple_request.take() {
                         req.endAudio();
@@ -1299,20 +1307,26 @@ fn main() {
                 debug!("TIMER → START [1]: icon set, sound played");
 
                 if use_sensevoice {
-                    // Device changed: wait for audio HAL to settle before touching engine.
-                    // Set cooldown of ~500ms (10 ticks × 50ms) to let the system stabilize.
+                    // Device changed: recreate the entire AVAudioEngine.
+                    // The old engine's inputNode caches stale format info that causes -10868.
+                    // reset() is not enough — it causes progressive deadlocks.
                     if AUDIO_CONFIG_CHANGED.swap(false, Ordering::Relaxed) {
-                        info!("TIMER → START: audio config changed, waiting 500ms for HAL to settle");
-                        config_change_cooldown.set(10);
-                        // Stop + reset to fully release old device config
-                        audio_engine.stop();
-                        audio_engine.reset();
-                        debug!("TIMER → START: engine reset for device change");
+                        info!("TIMER → START: audio config changed, recreating engine");
+                        {
+                            let engine = audio_engine.borrow();
+                            engine.stop();
+                        }
+                        let new_engine = AVAudioEngine::new();
+                        audio_engine.replace(new_engine);
+                        // Wait ~1s (20 ticks) for audio HAL to settle with new device
+                        config_change_cooldown.set(20);
                     }
                     if config_change_cooldown.get() > 0 {
                         let remaining = config_change_cooldown.get() - 1;
                         config_change_cooldown.set(remaining);
-                        debug!(remaining, "TIMER → START: cooldown tick");
+                        if remaining % 5 == 0 {
+                            debug!(remaining, "TIMER → START: cooldown tick");
+                        }
                         is_recording.set(false);
                         IS_RECORDING.store(false, Ordering::Relaxed);
                         SHOULD_START.store(true, Ordering::Relaxed);
@@ -1320,9 +1334,11 @@ fn main() {
                         return;
                     }
 
+                    let engine = audio_engine.borrow();
+
                     // Each recording cycle: inputNode → installTap → prepare → start.
                     debug!("TIMER → START [2a]: getting inputNode");
-                    let microphone = audio_engine.inputNode();
+                    let microphone = engine.inputNode();
 
                     // Clear samples
                     match samples_ref.try_lock() {
@@ -1337,7 +1353,7 @@ fn main() {
                         }
                     }
 
-                    // Install tap (pass None for format to let system pick current device format)
+                    // Install tap (pass None for format — let system pick current device format)
                     debug!("TIMER → START [2b]: calling installTapOnBus");
                     let samples_tap = samples_ref.clone();
                     let tap_block = RcBlock::new(
@@ -1362,7 +1378,7 @@ fn main() {
                     microphone.installTapOnBus_bufferSize_format_block(
                         0,
                         4096,
-                        None, // Let system pick format for current device
+                        None,
                         &*tap_block as *const _ as *mut _,
                     );
                     debug!("TIMER → START [2c]: tap installed");
@@ -1374,29 +1390,53 @@ fn main() {
 
                     // prepare + start
                     debug!("TIMER → START [3]: prepare + start");
-                    audio_engine.prepare();
-                    if let Err(e) = audio_engine.startAndReturnError() {
-                        error!(?e, "TIMER → START: engine failed");
-                        let mic = audio_engine.inputNode();
+                    engine.prepare();
+                    if let Err(e) = engine.startAndReturnError() {
+                        error!(?e, "TIMER → START: engine start failed, will retry with new engine");
+                        let mic = engine.inputNode();
                         mic.removeTapOnBus(0);
-                        audio_engine.reset();
+                        engine.stop();
+                        drop(engine);
+                        // Don't call reset() — recreate engine instead
+                        let start_retries = start_retry_count.get() + 1;
+                        start_retry_count.set(start_retries);
+                        if start_retries >= 3 {
+                            error!("TIMER → START: giving up after {} retries", start_retries);
+                            start_retry_count.set(0);
+                            is_recording.set(false);
+                            IS_RECORDING.store(false, Ordering::Relaxed);
+                            set_status_icon(&status_item, AppState::Idle, mtm);
+                            play_error_sound();
+                            return;
+                        }
+                        // Recreate engine and try again with cooldown
+                        info!(retry = start_retries, "TIMER → START: recreating engine for retry");
+                        let new_engine = AVAudioEngine::new();
+                        audio_engine.replace(new_engine);
+                        config_change_cooldown.set(20); // 1s cooldown before retry
                         is_recording.set(false);
                         IS_RECORDING.store(false, Ordering::Relaxed);
                         SHOULD_START.store(true, Ordering::Relaxed);
                         set_status_icon(&status_item, AppState::Idle, mtm);
                         return;
                     }
+                    start_retry_count.set(0);
 
                     COLLECTING.store(true, Ordering::Relaxed);
                 } else {
                     // Apple Speech path — always reinstalls tap, so just drain the flag
-                    AUDIO_CONFIG_CHANGED.store(false, Ordering::Relaxed);
-                    let microphone = audio_engine.inputNode();
+                    if AUDIO_CONFIG_CHANGED.swap(false, Ordering::Relaxed) {
+                        info!("TIMER → START: audio config changed, recreating engine (apple speech)");
+                        { audio_engine.borrow().stop(); }
+                        audio_engine.replace(AVAudioEngine::new());
+                    }
+                    let engine = audio_engine.borrow();
+                    let microphone = engine.inputNode();
                     microphone.removeTapOnBus(0);
-                    audio_engine.prepare();
-                    if let Err(e) = audio_engine.startAndReturnError() {
+                    engine.prepare();
+                    if let Err(e) = engine.startAndReturnError() {
                         error!(?e, "TIMER → START: audio engine failed");
-                        audio_engine.reset();
+                        engine.reset();
                         is_recording.set(false);
                         IS_RECORDING.store(false, Ordering::Relaxed);
                         set_status_icon(&status_item, AppState::Idle, mtm);
@@ -1472,10 +1512,12 @@ fn main() {
 
                 if use_sensevoice {
                     COLLECTING.store(false, Ordering::Relaxed);
-                    let mic = audio_engine.inputNode();
-                    mic.removeTapOnBus(0);
-                    audio_engine.stop();
-                    // No reset() — keep audio device acquired.
+                    {
+                        let engine = audio_engine.borrow();
+                        let mic = engine.inputNode();
+                        mic.removeTapOnBus(0);
+                        engine.stop();
+                    }
                     debug!("TIMER → STOP: engine stopped");
                     play_stop_sound();
 
@@ -1528,10 +1570,13 @@ fn main() {
                     }
                 } else {
                     // Apple Speech path
-                    let microphone = audio_engine.inputNode();
-                    microphone.removeTapOnBus(0);
-                    audio_engine.stop();
-                    audio_engine.reset();
+                    {
+                        let engine = audio_engine.borrow();
+                        let microphone = engine.inputNode();
+                        microphone.removeTapOnBus(0);
+                        engine.stop();
+                        engine.reset();
+                    }
                     play_stop_sound();
 
                     if let Some(req) = apple_request.take() {
