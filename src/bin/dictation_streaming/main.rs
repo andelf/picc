@@ -25,7 +25,7 @@ struct Args {
 
 fn default_model_dir() -> String {
     let home = std::env::var("HOME").unwrap_or_default();
-    format!("{home}/.local/share/picc/sherpa-onnx-streaming-zipformer-zh-xlarge-2024-11-19")
+    format!("{home}/.local/share/picc/sherpa-onnx-streaming-zipformer-zh-xlarge-int8-2025-06-30")
 }
 
 type TapBlock = RcBlock<dyn Fn(NonNull<AVAudioPCMBuffer>, NonNull<AVAudioTime>)>;
@@ -86,15 +86,15 @@ fn main() {
     // Create recognizer
     let config = recognizer::OnlineConfig {
         encoder: model_dir
-            .join("encoder-epoch-99-avg-1.onnx")
+            .join("encoder.int8.onnx")
             .to_string_lossy()
             .into(),
         decoder: model_dir
-            .join("decoder-epoch-99-avg-1.onnx")
+            .join("decoder.onnx")
             .to_string_lossy()
             .into(),
         joiner: model_dir
-            .join("joiner-epoch-99-avg-1.onnx")
+            .join("joiner.int8.onnx")
             .to_string_lossy()
             .into(),
         tokens: model_dir.join("tokens.txt").to_string_lossy().into(),
