@@ -1,3 +1,4 @@
+mod recognizer;
 mod resample;
 
 fn main() {
