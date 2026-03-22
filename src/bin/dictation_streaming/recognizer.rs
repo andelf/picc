@@ -4,6 +4,7 @@ use std::ffi::CString;
 pub struct OnlineRecognizer {
     recognizer: *const sherpa_rs::sherpa_rs_sys::SherpaOnnxOnlineRecognizer,
     stream: *const sherpa_rs::sherpa_rs_sys::SherpaOnnxOnlineStream,
+    sample_rate: i32,
 }
 
 #[derive(Debug, Clone)]
@@ -82,7 +83,11 @@ impl OnlineRecognizer {
                 return Err("SherpaOnnxCreateOnlineStream returned null".into());
             }
 
-            Ok(Self { recognizer, stream })
+            Ok(Self {
+                recognizer,
+                stream,
+                sample_rate: config.sample_rate,
+            })
         }
     }
 
@@ -91,7 +96,7 @@ impl OnlineRecognizer {
         unsafe {
             sherpa_rs::sherpa_rs_sys::SherpaOnnxOnlineStreamAcceptWaveform(
                 self.stream,
-                16000,
+                self.sample_rate,
                 samples.as_ptr(),
                 samples.len() as i32,
             );

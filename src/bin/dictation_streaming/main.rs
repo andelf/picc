@@ -28,22 +28,25 @@ fn default_model_dir() -> String {
     format!("{home}/.local/share/picc/sherpa-onnx-streaming-zipformer-zh-xlarge-2024-11-19")
 }
 
-fn setup_audio_engine(sample_buf: Arc<Mutex<Vec<f32>>>) -> (Retained<AVAudioEngine>, u32) {
+type TapBlock = RcBlock<dyn Fn(NonNull<AVAudioPCMBuffer>, NonNull<AVAudioTime>)>;
+
+fn setup_audio_engine(
+    sample_buf: Arc<Mutex<Vec<f32>>>,
+) -> (Retained<AVAudioEngine>, u32, TapBlock) {
     unsafe {
         let engine = AVAudioEngine::new();
         let microphone = engine.inputNode();
         let format = microphone.outputFormatForBus(0);
         let native_rate = format.sampleRate() as u32;
 
-        let tap_block = RcBlock::new(
+        let tap_block: TapBlock = RcBlock::new(
             move |buffer: NonNull<AVAudioPCMBuffer>, _time: NonNull<AVAudioTime>| {
-                let buf = unsafe { buffer.as_ref() };
-                let float_data = unsafe { buf.floatChannelData() };
+                let buf = buffer.as_ref();
+                let float_data = buf.floatChannelData();
                 let frame_length = buf.frameLength();
                 if !float_data.is_null() && frame_length > 0 {
-                    let channel0 = unsafe { (*float_data).as_ptr() };
-                    let slice =
-                        unsafe { std::slice::from_raw_parts(channel0, frame_length as usize) };
+                    let channel0 = (*float_data).as_ptr();
+                    let slice = std::slice::from_raw_parts(channel0, frame_length as usize);
                     if let Ok(mut samples) = sample_buf.lock() {
                         samples.extend_from_slice(slice);
                     }
@@ -63,7 +66,7 @@ fn setup_audio_engine(sample_buf: Arc<Mutex<Vec<f32>>>) -> (Retained<AVAudioEngi
             .startAndReturnError()
             .expect("failed to start audio engine");
 
-        (engine, native_rate)
+        (engine, native_rate, tap_block)
     }
 }
 
@@ -105,7 +108,7 @@ fn main() {
     let running = Arc::new(AtomicBool::new(true));
 
     // Setup audio
-    let (engine, native_rate) = setup_audio_engine(sample_buf.clone());
+    let (engine, native_rate, _tap_block) = setup_audio_engine(sample_buf.clone());
     eprintln!(
         "Listening... (native rate: {native_rate}Hz, Ctrl+C to stop)"
     );
@@ -158,11 +161,13 @@ fn main() {
         }
     }
 
-    // Graceful shutdown
-    rec.input_finished();
-    let text = rec.decode_and_get_text();
-    if !text.trim().is_empty() {
-        println!("{}", text);
+    // Graceful shutdown: flush pending utterance if any
+    if !last_text.is_empty() {
+        rec.input_finished();
+        let text = rec.decode_and_get_text();
+        if !text.trim().is_empty() {
+            println!("\r\x1b[2K{}", text);
+        }
     }
 
     unsafe {
