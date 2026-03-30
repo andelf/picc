@@ -23,21 +23,24 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject};
 use objc2::{define_class, sel, AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSImage, NSMenu, NSMenuItem, NSStatusBar,
-    NSStatusItem,
+    NSAnimationContext, NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSFont,
+    NSImage, NSLineBreakMode, NSMenu, NSMenuItem, NSPanel, NSScreen, NSStatusBar, NSStatusItem,
+    NSStatusWindowLevel, NSTextField, NSTextAlignment, NSView, NSVisualEffectBlendingMode,
+    NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView, NSWindowStyleMask,
 };
 use objc2_avf_audio::{
     AVAudioEngine, AVAudioEngineConfigurationChangeNotification, AVAudioPCMBuffer, AVAudioTime,
 };
 use objc2_core_foundation::{
-    CFMachPort, CFRetained, CFRunLoop, CFString, CFType, kCFRunLoopCommonModes,
+    kCFRunLoopCommonModes, CFMachPort, CFRetained, CFRunLoop, CFString, CFType,
 };
 use objc2_core_graphics::{
     CGEvent, CGEventMask, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement,
     CGEventTapProxy, CGEventType,
 };
 use objc2_foundation::{
-    ns_string, NSDate, NSLocale, NSNotification, NSNotificationCenter, NSRunLoop, NSString, NSTimer,
+    ns_string, NSDate, NSLocale, NSNotification, NSNotificationCenter, NSPoint, NSRect, NSRunLoop,
+    NSSize, NSString, NSTimer,
 };
 use objc2_speech::{
     SFSpeechAudioBufferRecognitionRequest, SFSpeechRecognitionResult, SFSpeechRecognizer,
@@ -60,9 +63,13 @@ struct Args {
     #[arg(long, default_value = "apple")]
     engine: String,
 
-    /// SenseVoice model directory (required for sensevoice engine)
+    /// SenseVoice model directory
     #[arg(long)]
     model_dir: Option<String>,
+
+    /// SenseVoice model file name inside --model-dir
+    #[arg(long, default_value = "model.int8.onnx")]
+    model_file_name: String,
 
     /// Language hint for SenseVoice: auto, zh, en, ja, ko, yue
     #[arg(long, default_value = "auto")]
@@ -132,6 +139,9 @@ const AUDIO_ERROR: u8 = 5;
 
 /// Sample rate discovered by the audio thread — read by main thread for resampling.
 static NATIVE_SAMPLE_RATE: AtomicU32 = AtomicU32::new(16000);
+
+/// Current audio RMS level (f32 bits stored as u32) — updated by audio tap callback.
+static AUDIO_RMS: AtomicU32 = AtomicU32::new(0);
 
 /// Commands sent to the audio management thread.
 const CMD_START: u8 = 1;
@@ -237,7 +247,10 @@ unsafe extern "C-unwind" fn event_tap_callback(
                 }
                 SHOULD_START.store(true, Ordering::Relaxed);
             } else {
-                debug!(is_rec, cancel_pending, "KEY_DOWN → IGNORED (already recording)");
+                debug!(
+                    is_rec,
+                    cancel_pending, "KEY_DOWN → IGNORED (already recording)"
+                );
             }
         } else if !right_cmd_pressed && was_down {
             // Release
@@ -282,7 +295,10 @@ unsafe extern "C-unwind" fn event_tap_callback(
             } else {
                 if hold < 300 {
                     SHOULD_START.store(false, Ordering::Relaxed);
-                    debug!(hold, "KEY_UP → cleared SHOULD_START (short tap, not yet recording)");
+                    debug!(
+                        hold,
+                        "KEY_UP → cleared SHOULD_START (short tap, not yet recording)"
+                    );
                 } else {
                     debug!(hold, is_rec, should_start, "KEY_UP → noop (not recording)");
                 }
@@ -372,6 +388,37 @@ fn ensure_sensevoice_model(base_dir: &Path) -> String {
     eprintln!(" done");
 
     model_dir.to_string_lossy().into_owned()
+}
+
+#[cfg(feature = "sensevoice")]
+fn resolve_sensevoice_paths(base_dir: &Path, args: &Args) -> (String, String) {
+    let model_dir = args.model_dir.clone().unwrap_or_else(|| {
+        let preferred = base_dir.join(SENSEVOICE_MODEL_DIR);
+        if preferred.join(&args.model_file_name).exists() {
+            preferred.to_string_lossy().into_owned()
+        } else {
+            ensure_sensevoice_model(base_dir)
+        }
+    });
+
+    let model_path = Path::new(&model_dir).join(&args.model_file_name);
+    assert!(
+        model_path.exists(),
+        "SenseVoice model file not found: {}",
+        model_path.display()
+    );
+
+    let tokens_path = Path::new(&model_dir).join("tokens.txt");
+    assert!(
+        tokens_path.exists(),
+        "SenseVoice tokens not found: {}",
+        tokens_path.display()
+    );
+
+    (
+        model_path.to_string_lossy().into_owned(),
+        tokens_path.to_string_lossy().into_owned(),
+    )
 }
 
 // --- Dictation post-processing ---
@@ -514,8 +561,10 @@ fn auto_insert_spaces(s: &str, punct: bool, cjk: bool) -> String {
 
                 if want_cjk || want_punct {
                     // Exception: decimal point — don't space after '.' when digit.digit
-                    let is_decimal_dot = prev == '.' && prev_kind == CharKind::Delimiter
-                        && classify(chars.get(i.wrapping_sub(2)).copied().unwrap_or(' ')) == CharKind::Digit
+                    let is_decimal_dot = prev == '.'
+                        && prev_kind == CharKind::Delimiter
+                        && classify(chars.get(i.wrapping_sub(2)).copied().unwrap_or(' '))
+                            == CharKind::Digit
                         && kind == CharKind::Digit;
                     if !is_decimal_dot {
                         out.push(' ');
@@ -534,7 +583,18 @@ fn strip_trailing_punctuation(s: &str) -> String {
     s.trim_end_matches(|c: char| {
         matches!(
             c,
-            '.' | ',' | '!' | '?' | ';' | ':' | '。' | '，' | '！' | '？' | '；' | '：' | '、'
+            '.' | ','
+                | '!'
+                | '?'
+                | ';'
+                | ':'
+                | '。'
+                | '，'
+                | '！'
+                | '？'
+                | '；'
+                | '：'
+                | '、'
                 | '…'
         )
     })
@@ -590,7 +650,10 @@ define_class!(
 
             let item: &NSMenuItem = unsafe { &*(sender as *const AnyObject as *const NSMenuItem) };
             item.setState(if opts.space_around_punct { 1 } else { 0 });
-            info!(enabled = opts.space_around_punct, "space around punctuation");
+            info!(
+                enabled = opts.space_around_punct,
+                "space around punctuation"
+            );
         }
 
         #[unsafe(method(toggleSpaceBetweenCjk:))]
@@ -601,7 +664,10 @@ define_class!(
 
             let item: &NSMenuItem = unsafe { &*(sender as *const AnyObject as *const NSMenuItem) };
             item.setState(if opts.space_between_cjk { 1 } else { 0 });
-            info!(enabled = opts.space_between_cjk, "space between CJK & Latin");
+            info!(
+                enabled = opts.space_between_cjk,
+                "space between CJK & Latin"
+            );
         }
 
         #[unsafe(method(toggleStripTrailingPunct:))]
@@ -612,7 +678,10 @@ define_class!(
 
             let item: &NSMenuItem = unsafe { &*(sender as *const AnyObject as *const NSMenuItem) };
             item.setState(if opts.strip_trailing_punct { 1 } else { 0 });
-            info!(enabled = opts.strip_trailing_punct, "strip trailing punctuation");
+            info!(
+                enabled = opts.strip_trailing_punct,
+                "strip trailing punctuation"
+            );
         }
     }
 );
@@ -678,9 +747,13 @@ fn focused_ax_element() -> Option<CFRetained<AXUIElement>> {
 
 /// Extract a CFRange from an AXValue attribute.
 fn ax_value_as_cfrange(value: &CFRetained<CFType>) -> Option<objc2_core_foundation::CFRange> {
-    let ax_value: &objc2_application_services::AXValue =
-        unsafe { &*(value.as_ref() as *const CFType as *const objc2_application_services::AXValue) };
-    let mut range = objc2_core_foundation::CFRange { location: 0, length: 0 };
+    let ax_value: &objc2_application_services::AXValue = unsafe {
+        &*(value.as_ref() as *const CFType as *const objc2_application_services::AXValue)
+    };
+    let mut range = objc2_core_foundation::CFRange {
+        location: 0,
+        length: 0,
+    };
     let ok = unsafe {
         ax_value.value(
             objc2_application_services::AXValueType::CFRange,
@@ -764,7 +837,7 @@ const CLIPBOARD_ONLY_BUNDLES: &[&str] = &[
     "org.mozilla.firefox",
     "com.microsoft.edgemac",
     "com.brave.Browser",
-    "com.electron.",           // prefix match for Electron apps
+    "com.electron.", // prefix match for Electron apps
     "us.zoom.xos",
     "com.larksuite.Lark",
     "com.larksuite.larkApp",
@@ -887,12 +960,12 @@ struct ChatResponseMessage {
     content: String,
 }
 
-const SYSTEM_PROMPT: &str = "你是一个文本纠错助手。用户会提供一段已输入的文本，以及一条语音纠错指令。\n\
+const SYSTEM_PROMPT: &str =
+    "你是一个文本纠错助手。用户会提供一段已输入的文本，以及一条语音纠错指令。\n\
 请根据指令修改文本，只输出修改后的完整文本，不要添加任何解释。";
 
 fn call_llm(original_text: &str, instruction: &str) -> Result<String, String> {
-    let api_key =
-        std::env::var("KIMI_API_KEY").map_err(|_| "KIMI_API_KEY not set".to_string())?;
+    let api_key = std::env::var("KIMI_API_KEY").map_err(|_| "KIMI_API_KEY not set".to_string())?;
 
     let original_text = original_text.trim();
     let instruction = instruction.trim();
@@ -942,6 +1015,346 @@ fn call_llm(original_text: &str, instruction: &str) -> Result<String, String> {
         .ok_or_else(|| "no choices in response".to_string())
 }
 
+// --- Floating capsule overlay ---
+
+/// Waveform bar weights (center-high, sides-low)
+const BAR_WEIGHTS: [f32; 5] = [0.5, 0.8, 1.0, 0.75, 0.55];
+/// Smoothed per-bar levels (updated each timer tick)
+static BAR_LEVELS: [AtomicU32; 5] = [
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+    AtomicU32::new(0),
+];
+
+/// Create a capsule-shaped mask image for NSVisualEffectView.
+/// Uses cap insets so the image stretches correctly when width changes.
+fn make_capsule_mask(width: f64, height: f64, radius: f64) -> Retained<NSImage> {
+    let size = NSSize::new(width, height);
+    let handler = block2::RcBlock::new(move |rect: NSRect| -> objc2::runtime::Bool {
+        objc2_app_kit::NSColor::whiteColor().setFill();
+        let path = objc2_app_kit::NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(
+            rect, radius, radius,
+        );
+        path.fill();
+        objc2::runtime::Bool::YES
+    });
+    let image = NSImage::imageWithSize_flipped_drawingHandler(size, false, &handler);
+
+    // Cap insets: the rounded corners are `radius` wide/tall; the middle stretches.
+    image.setCapInsets(objc2_foundation::NSEdgeInsets {
+        top: radius,
+        left: radius,
+        bottom: radius,
+        right: radius,
+    });
+    // NSImageResizingModeStretch = 1
+    image.setResizingMode(objc2_app_kit::NSImageResizingMode(1));
+
+    image
+}
+
+// Custom NSView that draws 5 vertical waveform bars driven by audio RMS.
+define_class!(
+    #[unsafe(super(NSView, objc2_app_kit::NSResponder, NSObject))]
+    #[name = "WaveformView"]
+    #[derive(Debug, PartialEq)]
+    struct WaveformView;
+
+    #[allow(non_snake_case)]
+    impl WaveformView {
+        #[unsafe(method(drawRect:))]
+        fn drawRect(&self, _dirty_rect: NSRect) {
+            let bounds = self.bounds();
+            let bar_count = 5;
+            let bar_width: f64 = 4.0;
+            let bar_gap: f64 = 3.5;
+            let total_w = bar_count as f64 * bar_width + (bar_count - 1) as f64 * bar_gap;
+            let x_offset = (bounds.size.width - total_w) / 2.0;
+            let max_height = bounds.size.height * 0.85;
+            let min_height: f64 = 4.0;
+            let cy = bounds.origin.y + bounds.size.height / 2.0;
+
+            objc2_app_kit::NSColor::colorWithSRGBRed_green_blue_alpha(0.95, 0.22, 0.22, 0.9)
+                .setFill();
+
+            for (i, bar_level) in BAR_LEVELS.iter().enumerate().take(bar_count) {
+                let level = f32::from_bits(bar_level.load(Ordering::Relaxed));
+                let h = min_height + (max_height - min_height) * level as f64;
+                let x = bounds.origin.x + x_offset + i as f64 * (bar_width + bar_gap);
+                let y = cy - h / 2.0;
+                let rect = NSRect::new(NSPoint::new(x, y), NSSize::new(bar_width, h));
+                let path =
+                    objc2_app_kit::NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(
+                        rect,
+                        bar_width / 2.0,
+                        bar_width / 2.0,
+                    );
+                path.fill();
+            }
+        }
+    }
+);
+
+/// Capsule overlay state — held by main thread during the app's lifetime.
+struct CapsuleOverlay {
+    panel: Retained<NSPanel>,
+    waveform_view: Retained<NSView>,
+    text_label: Retained<NSTextField>,
+    /// Current target width for the capsule (animated)
+    current_width: Cell<f64>,
+}
+
+const CAPSULE_HEIGHT: f64 = 56.0;
+const CAPSULE_CORNER_RADIUS: f64 = 28.0;
+const CAPSULE_PADDING_LEFT: f64 = 16.0;
+const CAPSULE_PADDING_RIGHT: f64 = 16.0;
+const WAVEFORM_WIDTH: f64 = 44.0;
+const WAVEFORM_HEIGHT: f64 = 32.0;
+const GAP: f64 = 10.0;
+const TEXT_MIN_WIDTH: f64 = 160.0;
+const TEXT_MAX_WIDTH: f64 = 560.0;
+const CAPSULE_BOTTOM_MARGIN: f64 = 48.0;
+const LABEL_HEIGHT: f64 = 26.0;
+const LABEL_Y: f64 = (CAPSULE_HEIGHT - LABEL_HEIGHT) / 2.0;
+
+fn create_capsule_overlay(mtm: MainThreadMarker) -> CapsuleOverlay {
+    let min_width = CAPSULE_PADDING_LEFT + WAVEFORM_WIDTH + GAP + TEXT_MIN_WIDTH + CAPSULE_PADDING_RIGHT;
+    let rect = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(min_width, CAPSULE_HEIGHT));
+
+    // NSPanel — nonactivating, borderless (use initWithContentRect via msg_send on NSWindow)
+    let panel: Retained<NSPanel> = unsafe {
+        let alloc = NSPanel::alloc(mtm);
+        let style = NSWindowStyleMask::NonactivatingPanel;
+        let backing = NSBackingStoreType::Buffered;
+        let panel: Retained<NSPanel> = objc2::msg_send![
+            alloc,
+            initWithContentRect: rect,
+            styleMask: style,
+            backing: backing,
+            defer: false,
+        ];
+        panel
+    };
+
+    panel.setLevel(NSStatusWindowLevel + 1);
+    panel.setOpaque(false);
+    panel.setBackgroundColor(Some(&objc2_app_kit::NSColor::clearColor()));
+    panel.setHasShadow(true);
+    panel.setIgnoresMouseEvents(true);
+    panel.setMovableByWindowBackground(false);
+
+    // NSVisualEffectView — HUD window material, rounded capsule
+    let effect_view = NSVisualEffectView::initWithFrame(
+        NSVisualEffectView::alloc(mtm),
+        NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(min_width, CAPSULE_HEIGHT)),
+    );
+    effect_view.setMaterial(NSVisualEffectMaterial::HUDWindow);
+    effect_view.setBlendingMode(NSVisualEffectBlendingMode::BehindWindow);
+    effect_view.setState(NSVisualEffectState::Active);
+    // Use maskImage for proper capsule clipping (CALayer cornerRadius doesn't
+    // correctly clip the blur material on all window compositing modes).
+    let mask = make_capsule_mask(min_width, CAPSULE_HEIGHT, CAPSULE_CORNER_RADIUS);
+    effect_view.setMaskImage(Some(&mask));
+
+    // Waveform view
+    let wf_x = CAPSULE_PADDING_LEFT;
+    let wf_y = (CAPSULE_HEIGHT - WAVEFORM_HEIGHT) / 2.0;
+    let wf_rect = NSRect::new(
+        NSPoint::new(wf_x, wf_y),
+        NSSize::new(WAVEFORM_WIDTH, WAVEFORM_HEIGHT),
+    );
+    let waveform_view: Retained<NSView> = unsafe {
+        let alloc = WaveformView::alloc(mtm);
+        let view: Retained<WaveformView> =
+            objc2::msg_send![alloc, initWithFrame: wf_rect];
+        Retained::cast_unchecked(view)
+    };
+
+    // Text label — vertically centered
+    let label_font = NSFont::systemFontOfSize(18.0);
+    let label_x = CAPSULE_PADDING_LEFT + WAVEFORM_WIDTH + GAP;
+    let label = NSTextField::initWithFrame(
+        NSTextField::alloc(mtm),
+        NSRect::new(
+            NSPoint::new(label_x, LABEL_Y),
+            NSSize::new(TEXT_MIN_WIDTH, LABEL_HEIGHT),
+        ),
+    );
+    label.setBordered(false);
+    label.setBezeled(false);
+    label.setEditable(false);
+    label.setSelectable(false);
+    label.setDrawsBackground(false);
+    label.setTextColor(Some(&objc2_app_kit::NSColor::whiteColor()));
+    label.setFont(Some(&label_font));
+    label.setAlignment(NSTextAlignment::Left);
+    label.setLineBreakMode(NSLineBreakMode::ByTruncatingTail);
+    label.setMaximumNumberOfLines(1);
+    label.setStringValue(&NSString::from_str(""));
+
+    // Assemble
+    effect_view.addSubview(&waveform_view);
+    effect_view.addSubview(&label);
+    panel.setContentView(Some(&effect_view));
+
+    // Position at bottom center of main screen
+    position_capsule(&panel, min_width, mtm);
+
+    CapsuleOverlay {
+        panel,
+        waveform_view,
+        text_label: label,
+        current_width: Cell::new(min_width),
+    }
+}
+
+fn position_capsule(panel: &NSPanel, width: f64, mtm: MainThreadMarker) {
+    let screen_frame = NSScreen::mainScreen(mtm)
+        .map(|s| s.frame())
+        .unwrap_or(NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1920.0, 1080.0)));
+    let x = screen_frame.origin.x + (screen_frame.size.width - width) / 2.0;
+    let y = screen_frame.origin.y + CAPSULE_BOTTOM_MARGIN;
+    panel.setFrame_display(
+        NSRect::new(NSPoint::new(x, y), NSSize::new(width, CAPSULE_HEIGHT)),
+        true,
+    );
+}
+
+fn show_capsule(overlay: &CapsuleOverlay, mtm: MainThreadMarker) {
+    let panel = &overlay.panel;
+    // Reset to minimum width
+    let min_width = CAPSULE_PADDING_LEFT + WAVEFORM_WIDTH + GAP + TEXT_MIN_WIDTH + CAPSULE_PADDING_RIGHT;
+    overlay.current_width.set(min_width);
+    overlay.text_label.setStringValue(&NSString::from_str(""));
+    position_capsule(panel, min_width, mtm);
+
+    // Resize effect view
+    if let Some(cv) = panel.contentView() {
+        cv.setFrame(NSRect::new(
+            NSPoint::new(0.0, 0.0),
+            NSSize::new(min_width, CAPSULE_HEIGHT),
+        ));
+    }
+    overlay.text_label.setFrame(NSRect::new(
+        NSPoint::new(CAPSULE_PADDING_LEFT + WAVEFORM_WIDTH + GAP, LABEL_Y),
+        NSSize::new(TEXT_MIN_WIDTH, LABEL_HEIGHT),
+    ));
+
+    // Start invisible for spring entrance
+    panel.setAlphaValue(0.0);
+    panel.orderFront(None);
+
+    // Animate entrance (0.35s spring-like)
+    NSAnimationContext::runAnimationGroup(
+        &block2::RcBlock::new(|ctx: std::ptr::NonNull<NSAnimationContext>| {
+            let ctx = unsafe { ctx.as_ref() };
+            ctx.setDuration(0.35);
+            ctx.setAllowsImplicitAnimation(true);
+            panel.setAlphaValue(1.0);
+        }),
+    );
+}
+
+fn hide_capsule(overlay: &CapsuleOverlay) {
+    let panel = &overlay.panel;
+    // Animate exit (0.22s fade + scale)
+    let panel_clone = panel.clone();
+    NSAnimationContext::runAnimationGroup_completionHandler(
+        &block2::RcBlock::new(|ctx: std::ptr::NonNull<NSAnimationContext>| {
+            let ctx = unsafe { ctx.as_ref() };
+            ctx.setDuration(0.22);
+            ctx.setAllowsImplicitAnimation(true);
+            panel.setAlphaValue(0.0);
+        }),
+        Some(&block2::RcBlock::new(move || {
+            panel_clone.orderOut(None);
+            // Reset bar levels
+            for bar in &BAR_LEVELS {
+                bar.store(0, Ordering::Relaxed);
+            }
+        })),
+    );
+}
+
+/// Update smooth bar levels from current audio RMS. Called each timer tick (~50ms).
+fn update_bar_levels() {
+    let raw_rms = f32::from_bits(AUDIO_RMS.load(Ordering::Relaxed));
+    // Convert to dB scale: map [-60dB, 0dB] → [0.0, 1.0]
+    // This makes quiet speech visible and loud speech not clipped.
+    let db = if raw_rms > 1e-6 { 20.0 * raw_rms.log10() } else { -60.0 };
+    let rms = ((db + 60.0) / 60.0).clamp(0.0, 1.0);
+
+    // Simple PRNG for jitter (xorshift32)
+    static JITTER_SEED: AtomicU32 = AtomicU32::new(12345);
+    let mut seed = JITTER_SEED.load(Ordering::Relaxed);
+
+    for i in 0..5 {
+        let target = rms * BAR_WEIGHTS[i];
+
+        // Add ±4% random jitter
+        seed ^= seed << 13;
+        seed ^= seed >> 17;
+        seed ^= seed << 5;
+        let jitter = ((seed % 200) as f32 / 100.0 - 1.0) * 0.04; // -0.04 to +0.04
+        let target = (target + jitter * target).clamp(0.0, 1.0);
+
+        let prev = f32::from_bits(BAR_LEVELS[i].load(Ordering::Relaxed));
+        let smoothed = if target > prev {
+            // Attack: 40% toward target
+            prev + (target - prev) * 0.4
+        } else {
+            // Release: 15% toward target
+            prev + (target - prev) * 0.15
+        };
+        BAR_LEVELS[i].store(smoothed.to_bits(), Ordering::Relaxed);
+    }
+    JITTER_SEED.store(seed, Ordering::Relaxed);
+}
+
+/// Update capsule text label and animate width change.
+fn update_capsule_text(overlay: &CapsuleOverlay, text: &str, mtm: MainThreadMarker) {
+    overlay.text_label.setStringValue(&NSString::from_str(text));
+    overlay.text_label.sizeToFit();
+
+    let fitted_w = overlay.text_label.frame().size.width;
+    let text_w = fitted_w.clamp(TEXT_MIN_WIDTH, TEXT_MAX_WIDTH);
+    let new_width = CAPSULE_PADDING_LEFT + WAVEFORM_WIDTH + GAP + text_w + CAPSULE_PADDING_RIGHT;
+    let old_width = overlay.current_width.get();
+
+    if (new_width - old_width).abs() > 2.0 {
+        overlay.current_width.set(new_width);
+
+        let panel = &overlay.panel;
+        // Animate width change (0.25s)
+        NSAnimationContext::runAnimationGroup(
+            &block2::RcBlock::new(|ctx: std::ptr::NonNull<NSAnimationContext>| {
+                let ctx = unsafe { ctx.as_ref() };
+                ctx.setDuration(0.25);
+                ctx.setAllowsImplicitAnimation(true);
+
+                // Reposition panel centered
+                position_capsule(panel, new_width, mtm);
+
+                // Resize effect view
+                if let Some(cv) = panel.contentView() {
+                    cv.setFrame(NSRect::new(
+                        NSPoint::new(0.0, 0.0),
+                        NSSize::new(new_width, CAPSULE_HEIGHT),
+                    ));
+                }
+            }),
+        );
+
+        // Update label frame (not animated, just ensure correct size)
+        overlay.text_label.setFrame(NSRect::new(
+            NSPoint::new(CAPSULE_PADDING_LEFT + WAVEFORM_WIDTH + GAP, LABEL_Y),
+            NSSize::new(text_w, LABEL_HEIGHT),
+        ));
+    }
+}
+
 // --- Main ---
 
 fn main() {
@@ -979,21 +1392,19 @@ fn main() {
     #[cfg(feature = "sensevoice")]
     let sv_recognizer: Cell<Option<sherpa_rs::sense_voice::SenseVoiceRecognizer>> =
         if use_sensevoice {
-            let model_dir = args.model_dir.unwrap_or_else(|| {
-                let home = std::env::var("HOME").unwrap();
-                let base = Path::new(&home).join(".local/share/picc");
-                ensure_sensevoice_model(&base)
-            });
+            let home = std::env::var("HOME").unwrap();
+            let base = Path::new(&home).join(".local/share/picc");
+            let (model_path, tokens_path) = resolve_sensevoice_paths(&base, &args);
             let config = sherpa_rs::sense_voice::SenseVoiceConfig {
-                model: format!("{model_dir}/model.int8.onnx"),
-                tokens: format!("{model_dir}/tokens.txt"),
+                model: model_path.clone(),
+                tokens: tokens_path.clone(),
                 language: args.lang.clone(),
                 use_itn: true,
                 ..Default::default()
             };
-            info!(path = %model_dir, "loading SenseVoice model");
+            info!(model = %model_path, tokens = %tokens_path, "loading SenseVoice model");
             let recognizer = sherpa_rs::sense_voice::SenseVoiceRecognizer::new(config)
-                .expect("failed to init SenseVoice — check --model-dir");
+                .expect("failed to init SenseVoice — check --model-dir/--model-file-name");
             info!("SenseVoice model loaded");
             Cell::new(Some(recognizer))
         } else {
@@ -1054,7 +1465,10 @@ fn main() {
     .expect("failed to create event tap — grant Accessibility permission");
 
     // Store tap pointer so the callback can re-enable it on timeout.
-    EVENT_TAP_PTR.store(&*tap as *const CFMachPort as *mut std::ffi::c_void, Ordering::Relaxed);
+    EVENT_TAP_PTR.store(
+        &*tap as *const CFMachPort as *mut std::ffi::c_void,
+        Ordering::Relaxed,
+    );
 
     let run_loop_source = CFMachPort::new_run_loop_source(None, Some(&tap), 0)
         .expect("failed to create run loop source");
@@ -1146,7 +1560,10 @@ fn main() {
     } else {
         "Apple Speech"
     };
-    info!(engine = engine_name, "ready — hold right Cmd: dictate | tap+hold: correct");
+    info!(
+        engine = engine_name,
+        "ready — hold right Cmd: dictate | tap+hold: correct"
+    );
 
     // --- State ---
     let is_recording = Cell::new(false);
@@ -1162,6 +1579,9 @@ fn main() {
 
     let _tap = tap;
     let _run_loop_source = run_loop_source;
+
+    // --- Floating capsule overlay ---
+    let capsule = create_capsule_overlay(mtm);
 
     // --- Timer (50ms polling) ---
     let _timer = unsafe {
@@ -1184,7 +1604,11 @@ fn main() {
                     let should_stop = SHOULD_STOP.load(Ordering::Relaxed);
                     let should_cancel = SHOULD_CANCEL.load(Ordering::Relaxed);
                     let mode = current_mode.get();
-                    let mode_name = if mode == MODE_CORRECT { "correct" } else { "dictate" };
+                    let mode_name = if mode == MODE_CORRECT {
+                        "correct"
+                    } else {
+                        "dictate"
+                    };
                     debug!(
                         elapsed_s = format_args!("{:.1}", elapsed_s),
                         mode = mode_name,
@@ -1192,6 +1616,19 @@ fn main() {
                         should_cancel,
                         "HEARTBEAT: still recording"
                     );
+                }
+
+                // Update waveform bars and redraw
+                update_bar_levels();
+                capsule.waveform_view.setNeedsDisplay(true);
+
+                // Update partial transcription text (Apple Speech path)
+                if !use_sensevoice {
+                    if let Ok(text) = RECOGNIZED_TEXT.lock() {
+                        if !text.is_empty() {
+                            update_capsule_text(&capsule, &text, mtm);
+                        }
+                    }
                 }
             } else {
                 heartbeat_tick.set(0);
@@ -1258,7 +1695,9 @@ fn main() {
                         mic.removeTapOnBus(0);
                         engine.stop();
                     }
-                    if let Ok(mut s) = samples_ref.lock() { s.clear(); }
+                    if let Ok(mut s) = samples_ref.lock() {
+                        s.clear();
+                    }
                     debug!("TIMER → CANCEL: engine stopped");
                 } else {
                     {
@@ -1277,6 +1716,7 @@ fn main() {
                     }
                 }
                 set_status_icon(&status_item, AppState::Idle, mtm);
+                hide_capsule(&capsule);
             }
 
             // --- START recording ---
@@ -1304,7 +1744,9 @@ fn main() {
                 };
                 set_status_icon(&status_item, icon, mtm);
                 play_start_sound();
-                debug!("TIMER → START [1]: icon set, sound played");
+                AUDIO_RMS.store(0, Ordering::Relaxed);
+                show_capsule(&capsule, mtm);
+                debug!("TIMER → START [1]: icon set, sound played, capsule shown");
 
                 if use_sensevoice {
                     // Device changed: recreate the entire AVAudioEngine.
@@ -1357,8 +1799,7 @@ fn main() {
                     debug!("TIMER → START [2b]: calling installTapOnBus");
                     let samples_tap = samples_ref.clone();
                     let tap_block = RcBlock::new(
-                        move |buffer: NonNull<AVAudioPCMBuffer>,
-                              _time: NonNull<AVAudioTime>| {
+                        move |buffer: NonNull<AVAudioPCMBuffer>, _time: NonNull<AVAudioTime>| {
                             if !COLLECTING.load(Ordering::Relaxed) {
                                 return;
                             }
@@ -1369,6 +1810,10 @@ fn main() {
                                 let channel0 = (*float_data).as_ptr();
                                 let slice =
                                     std::slice::from_raw_parts(channel0, frame_length as usize);
+                                // Compute RMS for waveform visualization
+                                let sum_sq: f32 = slice.iter().map(|s| s * s).sum();
+                                let rms = (sum_sq / slice.len() as f32).sqrt();
+                                AUDIO_RMS.store(rms.to_bits(), Ordering::Relaxed);
                                 if let Ok(mut samples) = samples_tap.lock() {
                                     samples.extend_from_slice(slice);
                                 }
@@ -1392,7 +1837,10 @@ fn main() {
                     debug!("TIMER → START [3]: prepare + start");
                     engine.prepare();
                     if let Err(e) = engine.startAndReturnError() {
-                        error!(?e, "TIMER → START: engine start failed, will retry with new engine");
+                        error!(
+                            ?e,
+                            "TIMER → START: engine start failed, will retry with new engine"
+                        );
                         let mic = engine.inputNode();
                         mic.removeTapOnBus(0);
                         engine.stop();
@@ -1410,7 +1858,10 @@ fn main() {
                             return;
                         }
                         // Recreate engine and try again with cooldown
-                        info!(retry = start_retries, "TIMER → START: recreating engine for retry");
+                        info!(
+                            retry = start_retries,
+                            "TIMER → START: recreating engine for retry"
+                        );
                         let new_engine = AVAudioEngine::new();
                         audio_engine.replace(new_engine);
                         config_change_cooldown.set(20); // 1s cooldown before retry
@@ -1426,8 +1877,12 @@ fn main() {
                 } else {
                     // Apple Speech path — always reinstalls tap, so just drain the flag
                     if AUDIO_CONFIG_CHANGED.swap(false, Ordering::Relaxed) {
-                        info!("TIMER → START: audio config changed, recreating engine (apple speech)");
-                        { audio_engine.borrow().stop(); }
+                        info!(
+                            "TIMER → START: audio config changed, recreating engine (apple speech)"
+                        );
+                        {
+                            audio_engine.borrow().stop();
+                        }
                         audio_engine.replace(AVAudioEngine::new());
                     }
                     let engine = audio_engine.borrow();
@@ -1455,7 +1910,19 @@ fn main() {
                         let tap_block = RcBlock::new(
                             move |buffer: NonNull<AVAudioPCMBuffer>,
                                   _time: NonNull<AVAudioTime>| {
-                                req_clone.appendAudioPCMBuffer(buffer.as_ref());
+                                let buf = buffer.as_ref();
+                                // Compute RMS for waveform visualization
+                                let float_data = buf.floatChannelData();
+                                let frame_length = buf.frameLength();
+                                if !float_data.is_null() && frame_length > 0 {
+                                    let channel0 = (*float_data).as_ptr();
+                                    let slice =
+                                        std::slice::from_raw_parts(channel0, frame_length as usize);
+                                    let sum_sq: f32 = slice.iter().map(|s| s * s).sum();
+                                    let rms = (sum_sq / slice.len() as f32).sqrt();
+                                    AUDIO_RMS.store(rms.to_bits(), Ordering::Relaxed);
+                                }
+                                req_clone.appendAudioPCMBuffer(buf);
                             },
                         );
                         microphone.installTapOnBus_bufferSize_format_block(
@@ -1474,10 +1941,7 @@ fn main() {
                                 warn!("recognition error: {:?}", error.localizedDescription());
                             } else if !result.is_null() {
                                 let result = &*result;
-                                let text = result
-                                    .bestTranscription()
-                                    .formattedString()
-                                    .to_string();
+                                let text = result.bestTranscription().formattedString().to_string();
                                 debug!(text = %text, "partial");
                                 if let Ok(mut stored) = RECOGNIZED_TEXT.lock() {
                                     *stored = text;
@@ -1499,7 +1963,11 @@ fn main() {
             // --- STOP recording ---
             if SHOULD_STOP.swap(false, Ordering::Relaxed) && is_recording.get() {
                 let mode = current_mode.get();
-                let mode_name = if mode == MODE_CORRECT { "correct" } else { "dictate" };
+                let mode_name = if mode == MODE_CORRECT {
+                    "correct"
+                } else {
+                    "dictate"
+                };
                 debug!(
                     mode = mode_name,
                     is_processing = is_processing.get(),
@@ -1507,6 +1975,7 @@ fn main() {
                 );
                 is_recording.set(false);
                 IS_RECORDING.store(false, Ordering::Relaxed);
+                hide_capsule(&capsule);
 
                 let spoken: String;
 
@@ -1552,13 +2021,28 @@ fn main() {
                                 .collect::<Vec<f32>>()
                         };
                         drop(raw_samples);
-                        info!(duration_s = format_args!("{:.1}", samples_16k.len() as f64 / 16000.0), "transcribing audio");
+                        info!(
+                            duration_s = format_args!("{:.1}", samples_16k.len() as f64 / 16000.0),
+                            "transcribing audio"
+                        );
                         if let Some(mut recognizer) = sv_recognizer.take() {
                             let t0 = std::time::Instant::now();
                             let result = recognizer.transcribe(16000, &samples_16k);
                             let ms = t0.elapsed().as_secs_f64() * 1000.0;
-                            info!(text = %result.text, elapsed_ms = format_args!("{:.0}", ms), "ASR result");
-                            spoken = result.text;
+                            info!(
+                                text = %result.text,
+                                lang = %result.lang,
+                                token_count = result.tokens.len(),
+                                timestamp_count = result.timestamps.len(),
+                                elapsed_ms = format_args!("{:.0}", ms),
+                                "ASR result"
+                            );
+                            debug!(
+                                tokens = ?result.tokens,
+                                timestamps = ?result.timestamps,
+                                "ASR metadata"
+                            );
+                            spoken = result.text.clone();
                             sv_recognizer.set(Some(recognizer));
                         } else {
                             spoken = String::new();
@@ -1614,7 +2098,10 @@ fn main() {
                     // 3. type_text: simulate keyboard input at cursor position
                     let opts = delegate.ivars().options.get();
                     let mut spoken = apply_dictation_transforms(&spoken, opts);
-                    if opts.fullwidth_to_halfwidth && opts.space_around_punct && !spoken.starts_with(' ') {
+                    if opts.fullwidth_to_halfwidth
+                        && opts.space_around_punct
+                        && !spoken.starts_with(' ')
+                    {
                         if let Some(prev) = char_before_cursor() {
                             if SPACE_AFTER_PUNCT.contains(&prev) {
                                 spoken.insert(0, ' ');
@@ -1646,8 +2133,7 @@ fn main() {
                         return;
                     }
 
-                    let app_name = frontmost_bundle_id()
-                        .unwrap_or_else(|| "unknown".to_string());
+                    let app_name = frontmost_bundle_id().unwrap_or_else(|| "unknown".to_string());
                     info!(app = %app_name, "correction mode");
 
                     // Terminals: AXValue returns entire buffer, skip reading
@@ -1663,7 +2149,10 @@ fn main() {
                             // Limit text length to avoid sending huge payloads to LLM
                             let trimmed = original_text.trim();
                             if trimmed.chars().count() > 250 {
-                                warn!(len = trimmed.chars().count(), "text too long (>250 chars), typing instead");
+                                warn!(
+                                    len = trimmed.chars().count(),
+                                    "text too long (>250 chars), typing instead"
+                                );
                                 type_text(&spoken);
                                 set_status_icon(&status_item, AppState::Idle, mtm);
                                 return;
@@ -1685,8 +2174,12 @@ fn main() {
                                 let result = call_llm(&orig, &instr);
                                 let elapsed = t0.elapsed().as_secs_f64() * 1000.0;
                                 match &result {
-                                    Ok(text) => info!(text = %text, elapsed_ms = format_args!("{:.0}", elapsed), "LLM result"),
-                                    Err(e) => error!(err = %e, elapsed_ms = format_args!("{:.0}", elapsed), "LLM error"),
+                                    Ok(text) => {
+                                        info!(text = %text, elapsed_ms = format_args!("{:.0}", elapsed), "LLM result")
+                                    }
+                                    Err(e) => {
+                                        error!(err = %e, elapsed_ms = format_args!("{:.0}", elapsed), "LLM error")
+                                    }
                                 }
                                 if let Ok(mut r) = LLM_RESULT.lock() {
                                     *r = Some(result);
@@ -1702,7 +2195,6 @@ fn main() {
                     }
                 }
             }
-
         });
 
         NSTimer::scheduledTimerWithTimeInterval_repeats_block(0.05, true, &block)
@@ -1713,7 +2205,7 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{auto_insert_spaces, apply_dictation_transforms, DictationOptions};
+    use super::{apply_dictation_transforms, auto_insert_spaces, DictationOptions};
 
     /// Helper: both punct and cjk spacing enabled (the common case).
     fn spaced(s: &str) -> String {
@@ -1726,7 +2218,10 @@ mod tests {
     fn cjk_latin_spacing() {
         assert_eq!(auto_insert_spaces("中文abc", false, true), "中文 abc");
         assert_eq!(auto_insert_spaces("abc中文", false, true), "abc 中文");
-        assert_eq!(auto_insert_spaces("中文abc中文", false, true), "中文 abc 中文");
+        assert_eq!(
+            auto_insert_spaces("中文abc中文", false, true),
+            "中文 abc 中文"
+        );
     }
 
     #[test]
@@ -1745,7 +2240,10 @@ mod tests {
 
     #[test]
     fn delimiter_spacing() {
-        assert_eq!(auto_insert_spaces("hello,world", true, false), "hello, world");
+        assert_eq!(
+            auto_insert_spaces("hello,world", true, false),
+            "hello, world"
+        );
         assert_eq!(auto_insert_spaces("a.b", true, false), "a. b");
         assert_eq!(auto_insert_spaces("ok!nice", true, false), "ok! nice");
     }
@@ -1758,7 +2256,10 @@ mod tests {
 
     #[test]
     fn bracket_spacing() {
-        assert_eq!(auto_insert_spaces("hello(world)test", true, false), "hello (world) test");
+        assert_eq!(
+            auto_insert_spaces("hello(world)test", true, false),
+            "hello (world) test"
+        );
         assert_eq!(spaced("你好(世界)"), "你好 (世界)");
     }
 
@@ -1771,7 +2272,10 @@ mod tests {
     #[test]
     fn punct_only_off_no_effect() {
         // With punct=false, delimiter spacing is not applied
-        assert_eq!(auto_insert_spaces("hello,world", false, true), "hello,world");
+        assert_eq!(
+            auto_insert_spaces("hello,world", false, true),
+            "hello,world"
+        );
     }
 
     // --- Both flags ---
@@ -1817,6 +2321,9 @@ mod tests {
             space_between_cjk: true,
             strip_trailing_punct: false,
         };
-        assert_eq!(apply_dictation_transforms("中文abc中文", opts), "中文 abc 中文");
+        assert_eq!(
+            apply_dictation_transforms("中文abc中文", opts),
+            "中文 abc 中文"
+        );
     }
 }

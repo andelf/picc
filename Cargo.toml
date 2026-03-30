@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/dictation-ng"]
+members = [".", "crates/dictation-ng", "crates/homophone-replacer"]
 
 [package]
 name = "picc"
@@ -58,8 +58,17 @@ path = "src/bin/dictation_streaming/main.rs"
 required-features = ["sensevoice"]
 
 [[bin]]
+name = "dictation-pause"
+path = "src/bin/dictation_pause.rs"
+required-features = ["sensevoice"]
+
+[[bin]]
 name = "voice-correct"
 path = "src/bin/voice_correct.rs"
+
+[[bin]]
+name = "voice-correct-v2"
+path = "src/bin/voice_correct_v2.rs"
 
 [[bin]]
 name = "clipcopy"
@@ -104,9 +113,17 @@ objc2-app-kit = { version = "0.3.2", features = [
     "NSMenuItem",
     "NSButton",
     "NSControl",
+    "NSCell",
+    "NSText",
     "NSPasteboard",
+    "NSVisualEffectView",
+    "NSTextField",
+    "NSFont",
+    "NSAnimationContext",
+    "NSParagraphStyle",
     "block2",
 ] }
+objc2-quartz-core = { version = "0.3.2", features = ["CALayer"] }
 objc2-core-graphics = { version = "0.3.2", features = [
     "CGImage",
     "CGGeometry",
@@ -194,6 +211,7 @@ time = { version = "0.3", features = ["local-offset", "formatting", "macros"] }
 rand = "0.10"
 sherpa-rs = { version = "0.6", default-features = false, features = ["static", "sys"], optional = true }
 ctrlc = "3"
+homophone-replacer = { path = "crates/homophone-replacer" }
 
 [features]
 default = []
