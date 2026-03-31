@@ -19,6 +19,8 @@ cargo run --bin picc
 
 ### axcli — Accessibility CLI
 
+> **Note:** axcli is now maintained in a standalone repository: [andelf/axcli](https://github.com/andelf/axcli). The version here may be outdated.
+
 Playwright-style CLI for macOS app automation via the Accessibility API. Supports element locating, clicking, typing, scrolling, screenshots with OCR, and more.
 
 ```sh
