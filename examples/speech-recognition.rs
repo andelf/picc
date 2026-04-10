@@ -89,8 +89,7 @@ fn main() {
             if task.isFinishing() {
                 break;
             }
-            NSRunLoop::currentRunLoop()
-                .runUntilDate(&NSDate::dateWithTimeIntervalSinceNow(1.0));
+            NSRunLoop::currentRunLoop().runUntilDate(&NSDate::dateWithTimeIntervalSinceNow(1.0));
         }
     }
 }

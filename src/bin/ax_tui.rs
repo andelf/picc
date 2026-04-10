@@ -273,15 +273,20 @@ impl App {
     /// Refresh the entire tree and try to relocate to the previously selected node.
     fn refresh_tree(&mut self) {
         // Save the AXUIElement of the currently selected node for relocation
-        let prev_element = self
-            .selected_node_info()
-            .map(|info| info.ax_node.0.clone());
+        let prev_element = self.selected_node_info().map(|info| info.ax_node.0.clone());
 
         // Rebuild everything from scratch
         self.nodes.clear();
         self.locator_cache.clear();
         self.locator_pending = None;
-        populate_nodes(&self.app_root, &[], &[], 0, self.preload_depth, &mut self.nodes);
+        populate_nodes(
+            &self.app_root,
+            &[],
+            &[],
+            0,
+            self.preload_depth,
+            &mut self.nodes,
+        );
         self.tree_items = rebuild_tree_items(&self.nodes, &[]);
 
         // Try to relocate to the previous node
@@ -312,7 +317,10 @@ impl App {
         if id.is_empty() {
             return String::new();
         }
-        self.locator_cache.get(&id).cloned().unwrap_or_else(|| "...".to_string())
+        self.locator_cache
+            .get(&id)
+            .cloned()
+            .unwrap_or_else(|| "...".to_string())
     }
 
     /// Request locator computation for the current selection if not cached.
@@ -336,12 +344,10 @@ impl App {
             match accessibility::attr_value(&current, "AXParent") {
                 Some(parent_val) => {
                     let parent = unsafe {
-                        objc2_core_foundation::CFRetained::retain(
-                            std::ptr::NonNull::new_unchecked(
-                                parent_val.as_ref() as *const objc2_core_foundation::CFType
-                                    as *mut objc2_application_services::AXUIElement,
-                            ),
-                        )
+                        objc2_core_foundation::CFRetained::retain(std::ptr::NonNull::new_unchecked(
+                            parent_val.as_ref() as *const objc2_core_foundation::CFType
+                                as *mut objc2_application_services::AXUIElement,
+                        ))
                     };
                     current = parent;
                 }
@@ -372,7 +378,12 @@ impl App {
 
     /// Enter action mode for the currently selected node.
     fn enter_action_mode(&mut self) {
-        let mut items = vec!["Move to".into(), "Click".into(), "Focus".into(), "Text content".into()];
+        let mut items = vec![
+            "Move to".into(),
+            "Click".into(),
+            "Focus".into(),
+            "Text content".into(),
+        ];
         if let Some(info) = self.selected_node_info() {
             for action in info.ax_node.actions() {
                 items.push(action);
@@ -542,11 +553,7 @@ impl App {
             .collect();
 
         let list = List::new(items)
-            .block(
-                Block::default()
-                    .borders(Borders::ALL)
-                    .title(" Attributes "),
-            )
+            .block(Block::default().borders(Borders::ALL).title(" Attributes "))
             .highlight_style(Style::default().add_modifier(Modifier::BOLD));
 
         frame.render_stateful_widget(list, area, &mut self.attrs_state);
@@ -595,14 +602,14 @@ impl App {
         }
 
         // Build ancestor chain from target up to app_root
-        let mut chain: Vec<objc2_core_foundation::CFRetained<objc2_application_services::AXUIElement>> = Vec::new();
+        let mut chain: Vec<
+            objc2_core_foundation::CFRetained<objc2_application_services::AXUIElement>,
+        > = Vec::new();
         chain.push(unsafe {
-            objc2_core_foundation::CFRetained::retain(
-                std::ptr::NonNull::new_unchecked(
-                    target as *const objc2_application_services::AXUIElement
-                        as *mut objc2_application_services::AXUIElement,
-                ),
-            )
+            objc2_core_foundation::CFRetained::retain(std::ptr::NonNull::new_unchecked(
+                target as *const objc2_application_services::AXUIElement
+                    as *mut objc2_application_services::AXUIElement,
+            ))
         });
         loop {
             let current = chain.last().unwrap();
@@ -612,13 +619,10 @@ impl App {
             match accessibility::attr_value(current, "AXParent") {
                 Some(parent_val) => {
                     let parent = unsafe {
-                        objc2_core_foundation::CFRetained::retain(
-                            std::ptr::NonNull::new_unchecked(
-                                parent_val.as_ref()
-                                    as *const objc2_core_foundation::CFType
-                                    as *mut objc2_application_services::AXUIElement,
-                            ),
-                        )
+                        objc2_core_foundation::CFRetained::retain(std::ptr::NonNull::new_unchecked(
+                            parent_val.as_ref() as *const objc2_core_foundation::CFType
+                                as *mut objc2_application_services::AXUIElement,
+                        ))
                     };
                     chain.push(parent);
                 }
@@ -907,7 +911,10 @@ fn populate_nodes(
 }
 
 /// Rebuild the Vec<TreeItem> from the nodes HashMap for a given parent id.
-fn rebuild_tree_items(nodes: &HashMap<Id, NodeInfo>, parent_id: &[usize]) -> Vec<TreeItem<'static, usize>> {
+fn rebuild_tree_items(
+    nodes: &HashMap<Id, NodeInfo>,
+    parent_id: &[usize],
+) -> Vec<TreeItem<'static, usize>> {
     // Find direct children: keys that are parent_id ++ [i]
     let mut child_indices: Vec<usize> = nodes
         .keys()
@@ -940,12 +947,8 @@ fn rebuild_tree_items(nodes: &HashMap<Id, NodeInfo>, parent_id: &[usize]) -> Vec
                     .unwrap_or_else(|_| TreeItem::new_leaf(i, info.label.clone()))
             } else if info.child_count > 0 {
                 // Not loaded yet — show placeholder
-                TreeItem::new(
-                    i,
-                    display,
-                    vec![TreeItem::new_leaf(usize::MAX, "...")],
-                )
-                .unwrap_or_else(|_| TreeItem::new_leaf(i, info.label.clone()))
+                TreeItem::new(i, display, vec![TreeItem::new_leaf(usize::MAX, "...")])
+                    .unwrap_or_else(|_| TreeItem::new_leaf(i, info.label.clone()))
             } else {
                 TreeItem::new_leaf(i, display)
             }
@@ -1011,10 +1014,7 @@ fn main() -> io::Result<()> {
     Ok(())
 }
 
-fn run_app(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    app: &mut App,
-) -> io::Result<()> {
+fn run_app(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> io::Result<()> {
     const DEBOUNCE: Duration = Duration::from_millis(20);
 
     app.request_locator();
@@ -1223,8 +1223,8 @@ fn handle_action_key(app: &mut App, code: KeyCode) -> (bool, Option<ActionReques
         }
         KeyCode::Char('k') | KeyCode::Left | KeyCode::Up => {
             if !app.action_items.is_empty() {
-                app.action_selected = (app.action_selected + app.action_items.len() - 1)
-                    % app.action_items.len();
+                app.action_selected =
+                    (app.action_selected + app.action_items.len() - 1) % app.action_items.len();
             }
             (true, None)
         }
@@ -1346,10 +1346,7 @@ fn search_prev(app: &mut App) {
     let mut all_ids: Vec<Id> = app.nodes.keys().cloned().collect();
     all_ids.sort();
 
-    let cur_pos = all_ids
-        .iter()
-        .position(|id| *id == current)
-        .unwrap_or(0);
+    let cur_pos = all_ids.iter().position(|id| *id == current).unwrap_or(0);
 
     let len = all_ids.len();
     for offset in 1..=len {

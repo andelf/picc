@@ -25,7 +25,7 @@ use objc2::{define_class, sel, AnyThread, DefinedClass, MainThreadMarker, MainTh
 use objc2_app_kit::{
     NSAnimationContext, NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSFont,
     NSImage, NSLineBreakMode, NSMenu, NSMenuItem, NSPanel, NSScreen, NSStatusBar, NSStatusItem,
-    NSStatusWindowLevel, NSTextField, NSTextAlignment, NSView, NSVisualEffectBlendingMode,
+    NSStatusWindowLevel, NSTextAlignment, NSTextField, NSView, NSVisualEffectBlendingMode,
     NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView, NSWindowStyleMask,
 };
 use objc2_avf_audio::{
@@ -1085,12 +1085,11 @@ define_class!(
                 let x = bounds.origin.x + x_offset + i as f64 * (bar_width + bar_gap);
                 let y = cy - h / 2.0;
                 let rect = NSRect::new(NSPoint::new(x, y), NSSize::new(bar_width, h));
-                let path =
-                    objc2_app_kit::NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(
-                        rect,
-                        bar_width / 2.0,
-                        bar_width / 2.0,
-                    );
+                let path = objc2_app_kit::NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(
+                    rect,
+                    bar_width / 2.0,
+                    bar_width / 2.0,
+                );
                 path.fill();
             }
         }
@@ -1120,8 +1119,12 @@ const LABEL_HEIGHT: f64 = 26.0;
 const LABEL_Y: f64 = (CAPSULE_HEIGHT - LABEL_HEIGHT) / 2.0;
 
 fn create_capsule_overlay(mtm: MainThreadMarker) -> CapsuleOverlay {
-    let min_width = CAPSULE_PADDING_LEFT + WAVEFORM_WIDTH + GAP + TEXT_MIN_WIDTH + CAPSULE_PADDING_RIGHT;
-    let rect = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(min_width, CAPSULE_HEIGHT));
+    let min_width =
+        CAPSULE_PADDING_LEFT + WAVEFORM_WIDTH + GAP + TEXT_MIN_WIDTH + CAPSULE_PADDING_RIGHT;
+    let rect = NSRect::new(
+        NSPoint::new(0.0, 0.0),
+        NSSize::new(min_width, CAPSULE_HEIGHT),
+    );
 
     // NSPanel — nonactivating, borderless (use initWithContentRect via msg_send on NSWindow)
     let panel: Retained<NSPanel> = unsafe {
@@ -1148,7 +1151,10 @@ fn create_capsule_overlay(mtm: MainThreadMarker) -> CapsuleOverlay {
     // NSVisualEffectView — HUD window material, rounded capsule
     let effect_view = NSVisualEffectView::initWithFrame(
         NSVisualEffectView::alloc(mtm),
-        NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(min_width, CAPSULE_HEIGHT)),
+        NSRect::new(
+            NSPoint::new(0.0, 0.0),
+            NSSize::new(min_width, CAPSULE_HEIGHT),
+        ),
     );
     effect_view.setMaterial(NSVisualEffectMaterial::HUDWindow);
     effect_view.setBlendingMode(NSVisualEffectBlendingMode::BehindWindow);
@@ -1167,8 +1173,7 @@ fn create_capsule_overlay(mtm: MainThreadMarker) -> CapsuleOverlay {
     );
     let waveform_view: Retained<NSView> = unsafe {
         let alloc = WaveformView::alloc(mtm);
-        let view: Retained<WaveformView> =
-            objc2::msg_send![alloc, initWithFrame: wf_rect];
+        let view: Retained<WaveformView> = objc2::msg_send![alloc, initWithFrame: wf_rect];
         Retained::cast_unchecked(view)
     };
 
@@ -1213,7 +1218,10 @@ fn create_capsule_overlay(mtm: MainThreadMarker) -> CapsuleOverlay {
 fn position_capsule(panel: &NSPanel, width: f64, mtm: MainThreadMarker) {
     let screen_frame = NSScreen::mainScreen(mtm)
         .map(|s| s.frame())
-        .unwrap_or(NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1920.0, 1080.0)));
+        .unwrap_or(NSRect::new(
+            NSPoint::new(0.0, 0.0),
+            NSSize::new(1920.0, 1080.0),
+        ));
     let x = screen_frame.origin.x + (screen_frame.size.width - width) / 2.0;
     let y = screen_frame.origin.y + CAPSULE_BOTTOM_MARGIN;
     panel.setFrame_display(
@@ -1225,7 +1233,8 @@ fn position_capsule(panel: &NSPanel, width: f64, mtm: MainThreadMarker) {
 fn show_capsule(overlay: &CapsuleOverlay, mtm: MainThreadMarker) {
     let panel = &overlay.panel;
     // Reset to minimum width
-    let min_width = CAPSULE_PADDING_LEFT + WAVEFORM_WIDTH + GAP + TEXT_MIN_WIDTH + CAPSULE_PADDING_RIGHT;
+    let min_width =
+        CAPSULE_PADDING_LEFT + WAVEFORM_WIDTH + GAP + TEXT_MIN_WIDTH + CAPSULE_PADDING_RIGHT;
     overlay.current_width.set(min_width);
     overlay.text_label.setStringValue(&NSString::from_str(""));
     position_capsule(panel, min_width, mtm);
@@ -1247,14 +1256,14 @@ fn show_capsule(overlay: &CapsuleOverlay, mtm: MainThreadMarker) {
     panel.orderFront(None);
 
     // Animate entrance (0.35s spring-like)
-    NSAnimationContext::runAnimationGroup(
-        &block2::RcBlock::new(|ctx: std::ptr::NonNull<NSAnimationContext>| {
+    NSAnimationContext::runAnimationGroup(&block2::RcBlock::new(
+        |ctx: std::ptr::NonNull<NSAnimationContext>| {
             let ctx = unsafe { ctx.as_ref() };
             ctx.setDuration(0.35);
             ctx.setAllowsImplicitAnimation(true);
             panel.setAlphaValue(1.0);
-        }),
-    );
+        },
+    ));
 }
 
 fn hide_capsule(overlay: &CapsuleOverlay) {
@@ -1283,7 +1292,11 @@ fn update_bar_levels() {
     let raw_rms = f32::from_bits(AUDIO_RMS.load(Ordering::Relaxed));
     // Convert to dB scale: map [-60dB, 0dB] → [0.0, 1.0]
     // This makes quiet speech visible and loud speech not clipped.
-    let db = if raw_rms > 1e-6 { 20.0 * raw_rms.log10() } else { -60.0 };
+    let db = if raw_rms > 1e-6 {
+        20.0 * raw_rms.log10()
+    } else {
+        -60.0
+    };
     let rms = ((db + 60.0) / 60.0).clamp(0.0, 1.0);
 
     // Simple PRNG for jitter (xorshift32)
@@ -1328,8 +1341,8 @@ fn update_capsule_text(overlay: &CapsuleOverlay, text: &str, mtm: MainThreadMark
 
         let panel = &overlay.panel;
         // Animate width change (0.25s)
-        NSAnimationContext::runAnimationGroup(
-            &block2::RcBlock::new(|ctx: std::ptr::NonNull<NSAnimationContext>| {
+        NSAnimationContext::runAnimationGroup(&block2::RcBlock::new(
+            |ctx: std::ptr::NonNull<NSAnimationContext>| {
                 let ctx = unsafe { ctx.as_ref() };
                 ctx.setDuration(0.25);
                 ctx.setAllowsImplicitAnimation(true);
@@ -1344,8 +1357,8 @@ fn update_capsule_text(overlay: &CapsuleOverlay, text: &str, mtm: MainThreadMark
                         NSSize::new(new_width, CAPSULE_HEIGHT),
                     ));
                 }
-            }),
-        );
+            },
+        ));
 
         // Update label frame (not animated, just ensure correct size)
         overlay.text_label.setFrame(NSRect::new(

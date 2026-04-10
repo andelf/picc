@@ -9,9 +9,9 @@ use block2::RcBlock;
 use objc2::rc::Retained;
 use objc2::AnyThread;
 use objc2_core_foundation::CFRetained;
+use objc2_core_foundation::CGRect;
 use objc2_core_graphics::CGImage;
 use objc2_foundation::NSError;
-use objc2_core_foundation::CGRect;
 use objc2_screen_capture_kit::{
     SCContentFilter, SCRunningApplication, SCScreenshotManager, SCShareableContent,
     SCStreamConfiguration, SCWindow,
@@ -30,20 +30,22 @@ extern "C" {
 /// Bridges the async ObjC callback to a synchronous call.
 fn get_shareable_content() -> Option<Retained<SCShareableContent>> {
     let (tx, rx) = mpsc::channel();
-    let block = RcBlock::new(move |content: *mut SCShareableContent, error: *mut NSError| {
-        if !error.is_null() {
-            let err = unsafe { &*error };
-            eprintln!("SCShareableContent error: {}", err.localizedDescription());
-            let _ = tx.send(None);
-            return;
-        }
-        if content.is_null() {
-            let _ = tx.send(None);
-            return;
-        }
-        let retained = unsafe { Retained::retain(content).unwrap() };
-        let _ = tx.send(Some(retained));
-    });
+    let block = RcBlock::new(
+        move |content: *mut SCShareableContent, error: *mut NSError| {
+            if !error.is_null() {
+                let err = unsafe { &*error };
+                eprintln!("SCShareableContent error: {}", err.localizedDescription());
+                let _ = tx.send(None);
+                return;
+            }
+            if content.is_null() {
+                let _ = tx.send(None);
+                return;
+            }
+            let retained = unsafe { Retained::retain(content).unwrap() };
+            let _ = tx.send(Some(retained));
+        },
+    );
     unsafe {
         SCShareableContent::getShareableContentExcludingDesktopWindows_onScreenWindowsOnly_completionHandler(
             true,
@@ -193,7 +195,9 @@ fn capture_window(window: &SCWindow) -> Option<CFRetained<CGImage>> {
 
     unsafe {
         SCScreenshotManager::captureImageWithFilter_configuration_completionHandler(
-            &filter, &config, Some(&block),
+            &filter,
+            &config,
+            Some(&block),
         );
     }
     rx.recv_timeout(Duration::from_secs(5)).ok().flatten()

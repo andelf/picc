@@ -7,13 +7,13 @@ use std::time::Instant;
 
 use block2::RcBlock;
 use clap::Parser;
-use rand::RngExt as _;
-use serde::{Deserialize, Serialize};
-use tracing::{debug, info, warn};
 use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject, NSObject};
 use objc2::sel;
 use objc2::{define_class, msg_send, MainThreadMarker, MainThreadOnly};
+use rand::RngExt as _;
+use serde::{Deserialize, Serialize};
+use tracing::{debug, info, warn};
 
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSBezierPath, NSColor,
@@ -174,7 +174,11 @@ define_class!(
         #[unsafe(method(keyDown:))]
         fn keyDown(&self, event: &NSEvent) {
             let key_code = event.keyCode();
-            debug!("keyDown: keyCode={}, isKeyWindow={}", key_code, self.isKeyWindow());
+            debug!(
+                "keyDown: keyCode={}, isKeyWindow={}",
+                key_code,
+                self.isKeyWindow()
+            );
             if key_code == 53 {
                 info!("ESC pressed, dismissing countdown");
                 dismiss_countdown();
@@ -335,7 +339,11 @@ fn create_and_show_windows() {
         windows.push(win);
     }
 
-    info!("Created {} windows for {} screens", windows.len(), screens.len());
+    info!(
+        "Created {} windows for {} screens",
+        windows.len(),
+        screens.len()
+    );
 
     // 显示所有窗口
     for win in &windows {
@@ -426,8 +434,7 @@ fn setup_menubar(mtm: MainThreadMarker) {
     }
 
     // 创建 MenuDelegate
-    let delegate: Retained<MenuDelegate> =
-        unsafe { msg_send![MenuDelegate::alloc(mtm), init] };
+    let delegate: Retained<MenuDelegate> = unsafe { msg_send![MenuDelegate::alloc(mtm), init] };
 
     // 创建菜单
     let menu = NSMenu::new(mtm);
@@ -483,7 +490,11 @@ fn update_menubar_title() {
         let (remaining, timer_expired) = WORK_TIMER.with(|t| match t.borrow().as_ref() {
             Some(timer) if timer.isValid() => {
                 let diff = timer.fireDate().timeIntervalSinceDate(&NSDate::now());
-                if diff > 0.0 { (diff as u32, false) } else { (0u32, true) }
+                if diff > 0.0 {
+                    (diff as u32, false)
+                } else {
+                    (0u32, true)
+                }
             }
             _ => (0u32, true),
         });
@@ -507,7 +518,11 @@ fn update_menubar_title() {
 
     let peer_count = get_peer_count();
     let peer_status = if peer_count > 0 {
-        format!("Synced with {} peer{}", peer_count, if peer_count > 1 { "s" } else { "" })
+        format!(
+            "Synced with {} peer{}",
+            peer_count,
+            if peer_count > 1 { "s" } else { "" }
+        )
     } else if LAN_SYNC.lock().unwrap().is_some() {
         "No peers".to_string()
     } else {
@@ -537,8 +552,7 @@ fn start_menubar_timer() {
         process_lan_queue(); // 兜底处理 LAN 消息
         update_menubar_title();
     });
-    let timer =
-        unsafe { NSTimer::scheduledTimerWithTimeInterval_repeats_block(1.0, true, &block) };
+    let timer = unsafe { NSTimer::scheduledTimerWithTimeInterval_repeats_block(1.0, true, &block) };
     MENUBAR_TIMER.with(|t| {
         *t.borrow_mut() = Some(timer);
     });
@@ -549,7 +563,11 @@ fn update_skip_menu_title(skip: bool) {
         let mtm = MainThreadMarker::new().unwrap();
         if let Some(menu) = item.menu(mtm) {
             if let Some(skip_item) = menu.itemAtIndex(4) {
-                let title = if skip { "Enable next break" } else { "Skip next break" };
+                let title = if skip {
+                    "Enable next break"
+                } else {
+                    "Skip next break"
+                };
                 skip_item.setTitle(&NSString::from_str(title));
             }
         }
@@ -613,7 +631,12 @@ fn show_countdown_with(override_remaining: u32) {
         state.remaining_secs
     };
 
-    info!("Break started: {}s ({}m{}s)", break_secs, break_secs / 60, break_secs % 60);
+    info!(
+        "Break started: {}s ({}m{}s)",
+        break_secs,
+        break_secs / 60,
+        break_secs % 60
+    );
 
     // LAN sync: 快速广播 break 事件 (0/50/100ms)
     send_heartbeat();
@@ -630,8 +653,7 @@ fn show_countdown_with(override_remaining: u32) {
     let block = RcBlock::new(move |_timer: NonNull<NSTimer>| {
         tick_countdown();
     });
-    let timer =
-        unsafe { NSTimer::scheduledTimerWithTimeInterval_repeats_block(1.0, true, &block) };
+    let timer = unsafe { NSTimer::scheduledTimerWithTimeInterval_repeats_block(1.0, true, &block) };
     COUNTDOWN_TIMER.with(|t| {
         *t.borrow_mut() = Some(timer);
     });
@@ -654,7 +676,10 @@ fn tick_countdown() {
         (state.remaining_secs, state.is_breaking)
     };
 
-    debug!("tick: remaining={}s, is_breaking={}", remaining, is_breaking);
+    debug!(
+        "tick: remaining={}s, is_breaking={}",
+        remaining, is_breaking
+    );
 
     refresh_all_views();
 
@@ -714,7 +739,11 @@ fn dismiss_countdown() {
 
 fn start_work_timer() {
     let work_secs = STATE.lock().unwrap().work_secs;
-    info!("Starting work timer: {:.0}s ({:.1}m)", work_secs, work_secs / 60.0);
+    info!(
+        "Starting work timer: {:.0}s ({:.1}m)",
+        work_secs,
+        work_secs / 60.0
+    );
     start_work_timer_with(work_secs);
 }
 
@@ -726,9 +755,8 @@ fn start_work_timer_with(secs: f64) {
         debug!("Work timer fired after {:.0}s", secs);
         show_countdown();
     });
-    let timer = unsafe {
-        NSTimer::scheduledTimerWithTimeInterval_repeats_block(secs, false, &block)
-    };
+    let timer =
+        unsafe { NSTimer::scheduledTimerWithTimeInterval_repeats_block(secs, false, &block) };
     WORK_TIMER.with(|t| {
         *t.borrow_mut() = Some(timer);
     });
@@ -738,9 +766,8 @@ fn start_work_timer_with(secs: f64) {
 // -- 休眠唤醒处理 --
 
 fn ensure_menubar_timer() {
-    let needs_restart = MENUBAR_TIMER.with(|t| {
-        t.borrow().as_ref().map_or(true, |timer| !timer.isValid())
-    });
+    let needs_restart =
+        MENUBAR_TIMER.with(|t| t.borrow().as_ref().map_or(true, |timer| !timer.isValid()));
     if needs_restart {
         start_menubar_timer();
         info!("Menubar timer was invalid after wake, restarted");
@@ -748,16 +775,14 @@ fn ensure_menubar_timer() {
 }
 
 fn ensure_countdown_timer() {
-    let needs_restart = COUNTDOWN_TIMER.with(|t| {
-        t.borrow().as_ref().map_or(true, |timer| !timer.isValid())
-    });
+    let needs_restart =
+        COUNTDOWN_TIMER.with(|t| t.borrow().as_ref().map_or(true, |timer| !timer.isValid()));
     if needs_restart {
         let block = RcBlock::new(move |_timer: NonNull<NSTimer>| {
             tick_countdown();
         });
-        let timer = unsafe {
-            NSTimer::scheduledTimerWithTimeInterval_repeats_block(1.0, true, &block)
-        };
+        let timer =
+            unsafe { NSTimer::scheduledTimerWithTimeInterval_repeats_block(1.0, true, &block) };
         COUNTDOWN_TIMER.with(|t| {
             *t.borrow_mut() = Some(timer);
         });
@@ -813,7 +838,10 @@ fn handle_wake() {
         if !timer_ok {
             let wake_secs = STATE.lock().unwrap().wake_secs;
             start_work_timer_with(wake_secs);
-            info!("Wake during work: timer expired, reset to {:.0}s", wake_secs);
+            info!(
+                "Wake during work: timer expired, reset to {:.0}s",
+                wake_secs
+            );
         }
     }
 
@@ -823,17 +851,14 @@ fn handle_wake() {
 
 // -- LAN Sync 函数 --
 
-
 /// dispatch_async 到主线程执行闭包
 fn dispatch_async_main(f: impl Fn() + Send + 'static) {
     let block = RcBlock::new(move |_: NonNull<AnyObject>| {
         f();
     });
     unsafe {
-        let queue: *mut AnyObject = msg_send![
-            AnyClass::get(c"NSOperationQueue").unwrap(),
-            mainQueue
-        ];
+        let queue: *mut AnyObject =
+            msg_send![AnyClass::get(c"NSOperationQueue").unwrap(), mainQueue];
         let _: () = msg_send![queue, addOperationWithBlock: &*block];
     }
 }
@@ -853,7 +878,11 @@ fn get_my_secs_to_break() -> u32 {
     WORK_TIMER.with(|t| match t.borrow().as_ref() {
         Some(timer) if timer.isValid() => {
             let diff = timer.fireDate().timeIntervalSinceDate(&NSDate::now());
-            if diff > 0.0 { diff as u32 } else { 0 }
+            if diff > 0.0 {
+                diff as u32
+            } else {
+                0
+            }
         }
         _ => 0,
     })
@@ -901,7 +930,10 @@ fn send_heartbeat() {
     if let Ok(json) = serde_json::to_vec(&hb) {
         for addr in &lan.broadcast_addrs {
             match lan.socket.send_to(&json, addr.as_str()) {
-                Ok(n) => debug!("Heartbeat sent: {} bytes to {}, state={}, secs_to_break={}, peers={}", n, addr, my_state, secs_to_break, hb.peers),
+                Ok(n) => debug!(
+                    "Heartbeat sent: {} bytes to {}, state={}, secs_to_break={}, peers={}",
+                    n, addr, my_state, secs_to_break, hb.peers
+                ),
                 Err(e) => warn!("Failed to send heartbeat to {}: {}", addr, e),
             }
         }
@@ -915,13 +947,16 @@ fn update_peer(id: u64, hb: &Heartbeat) {
         None => return,
     };
 
-    lan.peers.insert(id, PeerInfo {
-        state: hb.state.clone(),
-        secs_to_break: hb.secs_to_break,
-        break_secs: hb.break_secs,
-        work_secs: hb.work_secs,
-        last_seen: Instant::now(),
-    });
+    lan.peers.insert(
+        id,
+        PeerInfo {
+            state: hb.state.clone(),
+            secs_to_break: hb.secs_to_break,
+            break_secs: hb.break_secs,
+            work_secs: hb.work_secs,
+            last_seen: Instant::now(),
+        },
+    );
 }
 
 fn cleanup_stale_peers() {
@@ -932,17 +967,26 @@ fn cleanup_stale_peers() {
     };
 
     let before = lan.peers.len();
-    lan.peers.retain(|_id, peer| peer.last_seen.elapsed().as_secs() < 9);
+    lan.peers
+        .retain(|_id, peer| peer.last_seen.elapsed().as_secs() < 9);
     let removed = before - lan.peers.len();
     if removed > 0 {
-        info!("Cleaned up {} stale peers, {} remaining", removed, lan.peers.len());
+        info!(
+            "Cleaned up {} stale peers, {} remaining",
+            removed,
+            lan.peers.len()
+        );
     }
 }
 
 fn apply_sync_rules(hb: &Heartbeat) {
     // 分别获取锁，避免死锁
     let is_breaking = STATE.lock().unwrap().is_breaking;
-    let synced = LAN_SYNC.lock().unwrap().as_ref().map_or(true, |lan| lan.synced);
+    let synced = LAN_SYNC
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map_or(true, |lan| lan.synced);
 
     // Rule 0: 首次同步 — 采纳 peer 的 config 和 timing
     if !synced && hb.state == "working" {
@@ -989,7 +1033,10 @@ fn apply_sync_rules(hb: &Heartbeat) {
     // Rule 3: breaking 时，如果 peer 是 working → 跟着退出 break
     if is_breaking {
         if hb.state == "working" {
-            info!("Rule 3: peer {:x} is working while we're breaking, dismissing", hb.id);
+            info!(
+                "Rule 3: peer {:x} is working while we're breaking, dismissing",
+                hb.id
+            );
             dismiss_countdown();
         }
         return;
@@ -1003,7 +1050,10 @@ fn apply_sync_rules(hb: &Heartbeat) {
                 state.break_secs = hb.break_secs;
             }
         }
-        info!("Rule 2: peer {:x} is breaking ({}s remaining), triggering break", hb.id, hb.secs_to_break);
+        info!(
+            "Rule 2: peer {:x} is breaking ({}s remaining), triggering break",
+            hb.id, hb.secs_to_break
+        );
         show_countdown_with(hb.secs_to_break);
         return;
     }
@@ -1039,8 +1089,7 @@ fn start_heartbeat_timer() {
     let block = RcBlock::new(move |_timer: NonNull<NSTimer>| {
         send_heartbeat();
     });
-    let timer =
-        unsafe { NSTimer::scheduledTimerWithTimeInterval_repeats_block(3.0, true, &block) };
+    let timer = unsafe { NSTimer::scheduledTimerWithTimeInterval_repeats_block(3.0, true, &block) };
     HEARTBEAT_TIMER.with(|t| {
         *t.borrow_mut() = Some(timer);
     });
@@ -1109,25 +1158,28 @@ fn start_lan_sync(port: u16) -> Result<(), Box<dyn std::error::Error>> {
                 Ok((len, addr)) => {
                     debug!("UDP recv: {} bytes from {}", len, addr);
                     match serde_json::from_slice::<Heartbeat>(&buf[..len]) {
-                    Err(e) => {
-                        let raw = String::from_utf8_lossy(&buf[..len.min(200)]);
-                        warn!("JSON parse error: {}, raw: {}", e, raw);
-                    }
-                    Ok(hb) => {
-                        if hb.id == my_node_id {
-                            debug!("Ignoring own heartbeat");
-                            continue;
+                        Err(e) => {
+                            let raw = String::from_utf8_lossy(&buf[..len.min(200)]);
+                            warn!("JSON parse error: {}, raw: {}", e, raw);
                         }
-                        debug!("Heartbeat from {:x} @ {}: state={}, secs_to_break={}, peers={}", hb.id, addr, hb.state, hb.secs_to_break, hb.peers);
+                        Ok(hb) => {
+                            if hb.id == my_node_id {
+                                debug!("Ignoring own heartbeat");
+                                continue;
+                            }
+                            debug!(
+                                "Heartbeat from {:x} @ {}: state={}, secs_to_break={}, peers={}",
+                                hb.id, addr, hb.state, hb.secs_to_break, hb.peers
+                            );
 
-                        let is_breaking = hb.state == "breaking";
-                        LAN_QUEUE.lock().unwrap().push_back(hb);
+                            let is_breaking = hb.state == "breaking";
+                            LAN_QUEUE.lock().unwrap().push_back(hb);
 
-                        // break 事件立即 dispatch 到主线程处理
-                        if is_breaking {
-                            dispatch_async_main(|| process_lan_queue());
+                            // break 事件立即 dispatch 到主线程处理
+                            if is_breaking {
+                                dispatch_async_main(|| process_lan_queue());
+                            }
                         }
-                    }
                     }
                 }
                 Err(e) => {

@@ -17,7 +17,7 @@
 //!   cargo run --bin ax_print -- --app Lark --locator '.SearchButton' --screenshot
 //!   cargo run --bin ax_print -- --app Lark --locator '.SearchButton' --screenshot /tmp/shot.png
 
-use objc2_core_foundation::{CFString, CFURL, CFURLPathStyle, CGPoint, CGRect, CGSize};
+use objc2_core_foundation::{CFString, CFURLPathStyle, CGPoint, CGRect, CGSize, CFURL};
 use objc2_core_graphics::CGImage;
 use objc2_image_io::CGImageDestination;
 use picc::accessibility::{self, AXNode};
@@ -27,7 +27,11 @@ const TEXT_ROLES: &[&str] = &["AXStaticText", "AXTextArea", "AXTextField"];
 
 /// Sort class names: meaningful ones first, noisy ones (numeric, `-` or `_` prefixed) last.
 fn sort_classes(classes: &[String]) -> Vec<&str> {
-    let mut visible: Vec<&str> = classes.iter().filter(|c| !c.starts_with('_')).map(|s| s.as_str()).collect();
+    let mut visible: Vec<&str> = classes
+        .iter()
+        .filter(|c| !c.starts_with('_'))
+        .map(|s| s.as_str())
+        .collect();
     visible.sort_by_key(|c| {
         if c.starts_with('-') || c.chars().next().map_or(true, |ch| ch.is_ascii_digit()) {
             1
@@ -59,8 +63,7 @@ fn main() {
     } else if let Some(pos) = args.iter().position(|a| a == "--app") {
         let name = args.get(pos + 1).expect("--app requires a value");
         let mtm = objc2::MainThreadMarker::new().expect("must run on main thread");
-        let (p, localized) =
-            accessibility::find_app_by_name(mtm, name).expect("app not found");
+        let (p, localized) = accessibility::find_app_by_name(mtm, name).expect("app not found");
         pid = p;
         eprintln!("Found app: {localized} (pid={pid})");
         AXNode::app(pid)
@@ -78,21 +81,21 @@ fn main() {
     let do_scroll_to = args.iter().any(|a| a == "--scroll-to");
     let do_move = args.iter().any(|a| a == "--move-to");
     let do_click = args.iter().any(|a| a == "--click");
-    let input_text = args
-        .iter()
-        .position(|a| a == "--input")
-        .map(|i| args.get(i + 1).expect("--input requires a TEXT value").clone());
-    let press_key = args
-        .iter()
-        .position(|a| a == "--press")
-        .map(|i| args.get(i + 1).expect("--press requires a key like Enter, Tab, Control+a").clone());
+    let input_text = args.iter().position(|a| a == "--input").map(|i| {
+        args.get(i + 1)
+            .expect("--input requires a TEXT value")
+            .clone()
+    });
+    let press_key = args.iter().position(|a| a == "--press").map(|i| {
+        args.get(i + 1)
+            .expect("--press requires a key like Enter, Tab, Control+a")
+            .clone()
+    });
     let do_screenshot = args.iter().any(|a| a == "--screenshot");
     let screenshot_path = if do_screenshot {
         // Next arg after --screenshot is optional path (if it doesn't start with --)
         let pos = args.iter().position(|a| a == "--screenshot").unwrap();
-        args.get(pos + 1)
-            .filter(|s| !s.starts_with("--"))
-            .cloned()
+        args.get(pos + 1).filter(|s| !s.starts_with("--")).cloned()
     } else {
         None
     };
@@ -101,7 +104,9 @@ fn main() {
 
     // --locator: resolve a locator string
     let roots = if let Some(pos) = args.iter().position(|a| a == "--locator") {
-        let loc = args.get(pos + 1).expect("--locator requires a selector string");
+        let loc = args
+            .get(pos + 1)
+            .expect("--locator requires a selector string");
         if show_all && !has_action {
             let nodes = app.locate_all(loc);
             if nodes.is_empty() {
@@ -157,7 +162,9 @@ fn main() {
         if do_scroll_to {
             eprintln!("Scrolling element into view...");
             if !accessibility::perform_action(&node.0, "AXScrollToVisible") {
-                eprintln!("warning: AXScrollToVisible failed (element may not be in a scroll area)");
+                eprintln!(
+                    "warning: AXScrollToVisible failed (element may not be in a scroll area)"
+                );
             } else {
                 std::thread::sleep(std::time::Duration::from_millis(300));
             }
@@ -240,7 +247,9 @@ fn main() {
     let multi = roots.len() > 1;
     for (i, root) in roots.iter().enumerate() {
         if multi {
-            if i > 0 { println!(); }
+            if i > 0 {
+                println!();
+            }
             eprintln!("--- match {}/{} ---", i + 1, roots.len());
             print_with_ancestors(root, max_depth, &mut interactive);
         } else {
@@ -310,7 +319,13 @@ fn print_with_ancestors(node: &AXNode, max_depth: usize, interactive: &mut usize
     println!("{indent}- {line}  ← matched");
     // Subtree children
     for child in node.children() {
-        print_tree_inner(&child, base_depth + 1, base_depth + max_depth, interactive, false);
+        print_tree_inner(
+            &child,
+            base_depth + 1,
+            base_depth + max_depth,
+            interactive,
+            false,
+        );
     }
 }
 
@@ -318,7 +333,13 @@ fn print_tree(node: &AXNode, depth: usize, max_depth: usize, interactive: &mut u
     print_tree_inner(node, depth, max_depth, interactive, depth == 0);
 }
 
-fn print_tree_inner(node: &AXNode, depth: usize, max_depth: usize, interactive: &mut usize, is_root: bool) {
+fn print_tree_inner(
+    node: &AXNode,
+    depth: usize,
+    max_depth: usize,
+    interactive: &mut usize,
+    is_root: bool,
+) {
     if depth > max_depth {
         return;
     }
@@ -358,10 +379,7 @@ fn print_tree_inner(node: &AXNode, depth: usize, max_depth: usize, interactive: 
     let keep = is_root || is_text_node || is_interactive || is_structural;
 
     if keep {
-        let short_role = role
-            .strip_prefix("AX")
-            .unwrap_or(&role)
-            .to_lowercase();
+        let short_role = role.strip_prefix("AX").unwrap_or(&role).to_lowercase();
 
         let indent = "  ".repeat(depth);
         let mut line = String::new();
@@ -444,7 +462,12 @@ fn truncate(s: &str, max: usize) -> String {
 
 fn save_cgimage(image: &CGImage, path: &str) {
     let cf_path = CFString::from_str(path);
-    let url = CFURL::with_file_system_path(None, Some(&cf_path), CFURLPathStyle::CFURLPOSIXPathStyle, false);
+    let url = CFURL::with_file_system_path(
+        None,
+        Some(&cf_path),
+        CFURLPathStyle::CFURLPOSIXPathStyle,
+        false,
+    );
     let Some(url) = url else {
         eprintln!("error: failed to create URL for {path}");
         std::process::exit(1);

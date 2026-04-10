@@ -24,7 +24,7 @@ use objc2_app_kit::{
     NSStatusItem,
 };
 use objc2_avf_audio::{AVAudioEngine, AVAudioPCMBuffer, AVAudioTime};
-use objc2_core_foundation::{CFMachPort, CFRunLoop, kCFRunLoopCommonModes};
+use objc2_core_foundation::{kCFRunLoopCommonModes, CFMachPort, CFRunLoop};
 use objc2_core_graphics::{
     CGEvent, CGEventMask, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement,
     CGEventTapProxy, CGEventType,
@@ -137,7 +137,8 @@ fn download_with_progress(url: &str, dest: &Path, label: &str) -> Result<(), Str
         if n == 0 {
             break;
         }
-        file.write_all(&buf[..n]).map_err(|e| format!("write: {e}"))?;
+        file.write_all(&buf[..n])
+            .map_err(|e| format!("write: {e}"))?;
         downloaded += n as u64;
         if total > 0 {
             let pct = (downloaded as f64 / total as f64 * 100.0) as u32;
@@ -147,7 +148,9 @@ fn download_with_progress(url: &str, dest: &Path, label: &str) -> Result<(), Str
             let bar_len = 30;
             let filled = (bar_len as f64 * downloaded as f64 / total as f64) as usize;
             let bar: String = "█".repeat(filled) + &"░".repeat(bar_len - filled);
-            eprint!("\r[dictation] {label}: {bar} {mb:.1}/{total_mb:.1} MB ({pct}%) {speed:.1} MB/s");
+            eprint!(
+                "\r[dictation] {label}: {bar} {mb:.1}/{total_mb:.1} MB ({pct}%) {speed:.1} MB/s"
+            );
         }
     }
     eprintln!();
@@ -172,7 +175,12 @@ fn try_download_from_github(base_dir: &Path) -> Result<(), String> {
     download_with_progress(SENSEVOICE_GITHUB_URL, &archive, "tar.bz2")?;
     eprint!("[dictation] extracting...");
     let status = std::process::Command::new("tar")
-        .args(["xjf", &archive.to_string_lossy(), "-C", &base_dir.to_string_lossy()])
+        .args([
+            "xjf",
+            &archive.to_string_lossy(),
+            "-C",
+            &base_dir.to_string_lossy(),
+        ])
         .status()
         .map_err(|e| format!("tar: {e}"))?;
     if !status.success() {
@@ -190,7 +198,10 @@ fn ensure_sensevoice_model(base_dir: &Path) -> String {
         return model_dir.to_string_lossy().into_owned();
     }
 
-    eprintln!("[dictation] SenseVoice model not found at {}", model_dir.display());
+    eprintln!(
+        "[dictation] SenseVoice model not found at {}",
+        model_dir.display()
+    );
     eprintln!("[dictation] first run — downloading model, this may take a few minutes...");
     std::fs::create_dir_all(base_dir).expect("failed to create model directory");
 
@@ -224,34 +235,33 @@ fn main() {
     app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
 
     // --- SenseVoice recognizer (if needed) ---
-    let sv_recognizer: Cell<Option<sherpa_rs::sense_voice::SenseVoiceRecognizer>> = if use_sensevoice
-    {
-        let model_dir = args.model_dir.unwrap_or_else(|| {
-            let home = std::env::var("HOME").unwrap();
-            let base = Path::new(&home).join(".local/share/picc");
-            ensure_sensevoice_model(&base)
-        });
-        let config = sherpa_rs::sense_voice::SenseVoiceConfig {
-            model: format!("{model_dir}/model.int8.onnx"),
-            tokens: format!("{model_dir}/tokens.txt"),
-            language: args.lang.clone(),
-            use_itn: true,
-            ..Default::default()
+    let sv_recognizer: Cell<Option<sherpa_rs::sense_voice::SenseVoiceRecognizer>> =
+        if use_sensevoice {
+            let model_dir = args.model_dir.unwrap_or_else(|| {
+                let home = std::env::var("HOME").unwrap();
+                let base = Path::new(&home).join(".local/share/picc");
+                ensure_sensevoice_model(&base)
+            });
+            let config = sherpa_rs::sense_voice::SenseVoiceConfig {
+                model: format!("{model_dir}/model.int8.onnx"),
+                tokens: format!("{model_dir}/tokens.txt"),
+                language: args.lang.clone(),
+                use_itn: true,
+                ..Default::default()
+            };
+            eprintln!("[dictation] loading SenseVoice model from {model_dir}...");
+            let recognizer = sherpa_rs::sense_voice::SenseVoiceRecognizer::new(config)
+                .expect("failed to init SenseVoice — check --model-dir");
+            eprintln!("[dictation] SenseVoice model loaded");
+            Cell::new(Some(recognizer))
+        } else {
+            Cell::new(None)
         };
-        eprintln!("[dictation] loading SenseVoice model from {model_dir}...");
-        let recognizer = sherpa_rs::sense_voice::SenseVoiceRecognizer::new(config)
-            .expect("failed to init SenseVoice — check --model-dir");
-        eprintln!("[dictation] SenseVoice model loaded");
-        Cell::new(Some(recognizer))
-    } else {
-        Cell::new(None)
-    };
 
     // --- Apple speech recognizer (if needed) ---
     let apple_recognizer = if !use_sensevoice {
         let recognizer = unsafe {
-            let locale =
-                NSLocale::initWithLocaleIdentifier(NSLocale::alloc(), ns_string!("zh-CN"));
+            let locale = NSLocale::initWithLocaleIdentifier(NSLocale::alloc(), ns_string!("zh-CN"));
             SFSpeechRecognizer::initWithLocale(SFSpeechRecognizer::alloc(), &locale).unwrap()
         };
         unsafe {
@@ -259,7 +269,10 @@ fn main() {
                 if status == SFSpeechRecognizerAuthorizationStatus::Authorized {
                     eprintln!("[dictation] speech recognition authorized");
                 } else {
-                    eprintln!("[dictation] speech recognition not authorized: {:?}", status);
+                    eprintln!(
+                        "[dictation] speech recognition not authorized: {:?}",
+                        status
+                    );
                 }
             });
             SFSpeechRecognizer::requestAuthorization(&handler);
@@ -285,8 +298,8 @@ fn main() {
     }
     .expect("failed to create event tap — grant Accessibility permission");
 
-    let run_loop_source =
-        CFMachPort::new_run_loop_source(None, Some(&tap), 0).expect("failed to create run loop source");
+    let run_loop_source = CFMachPort::new_run_loop_source(None, Some(&tap), 0)
+        .expect("failed to create run loop source");
     unsafe {
         let run_loop = CFRunLoop::current().expect("no current run loop");
         run_loop.add_source(Some(&run_loop_source), kCFRunLoopCommonModes);
@@ -317,9 +330,7 @@ fn main() {
     } else {
         "Apple Speech"
     };
-    eprintln!(
-        "[dictation] ready ({engine_name}) — hold right Command to dictate, release to type"
-    );
+    eprintln!("[dictation] ready ({engine_name}) — hold right Command to dictate, release to type");
 
     // --- State ---
     let is_recording = Cell::new(false);
@@ -360,8 +371,7 @@ fn main() {
 
                     let samples_tap = samples_ref.clone();
                     let tap_block = RcBlock::new(
-                        move |buffer: NonNull<AVAudioPCMBuffer>,
-                              _time: NonNull<AVAudioTime>| {
+                        move |buffer: NonNull<AVAudioPCMBuffer>, _time: NonNull<AVAudioTime>| {
                             let buf = buffer.as_ref();
                             let float_data = buf.floatChannelData();
                             let frame_length = buf.frameLength();
@@ -417,10 +427,7 @@ fn main() {
                                 );
                             } else if !result.is_null() {
                                 let result = &*result;
-                                let text = result
-                                    .bestTranscription()
-                                    .formattedString()
-                                    .to_string();
+                                let text = result.bestTranscription().formattedString().to_string();
                                 eprintln!("[dictation] partial: {}", text);
                                 if let Ok(mut stored) = RECOGNIZED_TEXT.lock() {
                                     *stored = text;
@@ -477,10 +484,7 @@ fn main() {
                                     let idx = src as usize;
                                     let frac = src - idx as f64;
                                     let a = raw_samples[idx];
-                                    let b = raw_samples
-                                        .get(idx + 1)
-                                        .copied()
-                                        .unwrap_or(a);
+                                    let b = raw_samples.get(idx + 1).copied().unwrap_or(a);
                                     a + (b - a) * frac as f32
                                 })
                                 .collect::<Vec<f32>>()

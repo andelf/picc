@@ -20,19 +20,24 @@
 //!   axcli --app Lark get AXValue '.SearchInput'
 
 use clap::{Parser, Subcommand};
-use objc2_core_foundation::{CGPoint, CGSize, CGRect};
+use objc2_core_foundation::{CGPoint, CGRect, CGSize};
 use objc2_core_graphics::CGImage;
 use picc::accessibility::{self, AXNode};
 use picc::actions::ExecutionContext;
-use picc::error::{AxError, exit_code};
+use picc::error::{exit_code, AxError};
 use picc::{input, screenshot, tree_fmt};
 
 #[derive(Parser)]
-#[command(name = "axcli", version, about = "macOS Accessibility CLI tool", long_about = "\
+#[command(
+    name = "axcli",
+    version,
+    about = "macOS Accessibility CLI tool",
+    long_about = "\
 macOS Accessibility CLI tool — automate any app via the Accessibility API.
 
 Workflow: snapshot (explore) → get text (read) → click/input (act) → screenshot (verify).
-Run `axcli <command> --help` for per-command tips.", after_help = "\
+Run `axcli <command> --help` for per-command tips.",
+    after_help = "\
 Locator syntax:
   #id                       DOM ID           e.g. #root, #modal
   .class                    DOM class        e.g. .SearchButton, .msg-item
@@ -57,7 +62,8 @@ Pseudo-classes:
   :has(selector)            Has descendant   e.g. .item:has(.reaction)
   :visible                  Non-zero size    e.g. AXButton:visible
   :nth-child(N)             Nth child (0-based) e.g. AXGroup:nth-child(0)
-")]
+"
+)]
 struct Cli {
     /// Application name
     #[arg(long, global = true)]
@@ -167,13 +173,9 @@ enum Command {
     ///
     /// Uses AXPress action, falls back to mouse click at element center.
     /// For off-screen elements, call `scroll-to` first.
-    Click {
-        locator: String,
-    },
+    Click { locator: String },
     /// Double-click element
-    Dblclick {
-        locator: String,
-    },
+    Dblclick { locator: String },
     /// Focus element and type text (appends to existing content)
     Input {
         /// Target element
@@ -189,28 +191,20 @@ enum Command {
         text: String,
     },
     /// Press key combo (Enter, Control+a, Command+Shift+v)
-    Press {
-        key: String,
-    },
+    Press { key: String },
     /// Move mouse to element center
     ///
     /// Useful for triggering hover-only UI (e.g. toolbars, tooltips).
     /// The hover state is lost when the mouse moves away.
     /// For off-screen elements, call `scroll-to` first.
-    Hover {
-        locator: String,
-    },
+    Hover { locator: String },
     /// Focus element (AXFocused + click fallback)
-    Focus {
-        locator: String,
-    },
+    Focus { locator: String },
     /// Scroll element into view (AXScrollToVisible)
     ///
     /// Call before hover/click if the element may be off-screen.
     /// Not needed for snapshot/get — they work regardless of viewport.
-    ScrollTo {
-        locator: String,
-    },
+    ScrollTo { locator: String },
     /// Scroll within an element (up/down/left/right)
     ///
     /// After scrolling, lazy-loaded lists may reindex elements.
@@ -338,9 +332,13 @@ fn run(cli: Cli) -> Result<(), AxError> {
 
     match cli.command {
         Command::ListApps => unreachable!(),
-        Command::Snapshot { locator, depth, all, max_text_len, simplify } => {
-            cmd_snapshot(&ctx, locator.as_deref(), depth, all, max_text_len, simplify)
-        }
+        Command::Snapshot {
+            locator,
+            depth,
+            all,
+            max_text_len,
+            simplify,
+        } => cmd_snapshot(&ctx, locator.as_deref(), depth, all, max_text_len, simplify),
         Command::Click { locator } => cmd_click(&ctx, &locator),
         Command::Dblclick { locator } => cmd_dblclick(&ctx, &locator),
         Command::Input { locator, text } => cmd_input(&ctx, &locator, &text),
@@ -349,12 +347,17 @@ fn run(cli: Cli) -> Result<(), AxError> {
         Command::Hover { locator } => cmd_hover(&ctx, &locator),
         Command::Focus { locator } => cmd_focus(&ctx, &locator),
         Command::ScrollTo { locator } => cmd_scroll_to(&ctx, &locator),
-        Command::Scroll { locator, direction, pixels } => {
-            cmd_scroll(&ctx, &locator, &direction, pixels)
-        }
-        Command::Screenshot { locator, output, ocr, legacy } => {
-            cmd_screenshot(&ctx, locator.as_deref(), output.as_deref(), ocr, legacy)
-        }
+        Command::Scroll {
+            locator,
+            direction,
+            pixels,
+        } => cmd_scroll(&ctx, &locator, &direction, pixels),
+        Command::Screenshot {
+            locator,
+            output,
+            ocr,
+            legacy,
+        } => cmd_screenshot(&ctx, locator.as_deref(), output.as_deref(), ocr, legacy),
         Command::Activate => {
             ctx.activate();
             Ok(())
@@ -382,7 +385,9 @@ fn resolve_app(cli: &Cli) -> Result<(i32, AXNode), AxError> {
             None => return Err(AxError::AppNotFound(name.clone())),
         }
     }
-    Err(AxError::InvalidArgument("--app or --pid is required".to_string()))
+    Err(AxError::InvalidArgument(
+        "--app or --pid is required".to_string(),
+    ))
 }
 
 /// Strip known pseudo-class suffixes from a segment for validation.
@@ -431,7 +436,11 @@ fn validate_segment(seg: &str) -> Result<(), String> {
         return Ok(());
     }
     if s.starts_with('#') {
-        return if s.len() > 1 { Ok(()) } else { Err("empty DOM ID after `#`".into()) };
+        return if s.len() > 1 {
+            Ok(())
+        } else {
+            Err("empty DOM ID after `#`".into())
+        };
     }
     if s.starts_with("text=") || s.starts_with("text~=") {
         return Ok(());
@@ -449,12 +458,20 @@ fn validate_segment(seg: &str) -> Result<(), String> {
     if s.contains('#') {
         // role#id — role part is optional, id must be non-empty
         let (_, id) = s.split_once('#').unwrap();
-        return if !id.is_empty() { Ok(()) } else { Err(format!("empty DOM ID after `#` in `{s}`")) };
+        return if !id.is_empty() {
+            Ok(())
+        } else {
+            Err(format!("empty DOM ID after `#` in `{s}`"))
+        };
     }
     if s.contains('.') {
         let without_not = s.split(":not(").next().unwrap_or(s);
         let has_class = without_not.split('.').skip(1).any(|c| !c.is_empty());
-        return if has_class { Ok(()) } else { Err(format!("empty class name in `{s}`")) };
+        return if has_class {
+            Ok(())
+        } else {
+            Err(format!("empty class name in `{s}`"))
+        };
     }
     if s.chars().all(|c| c.is_alphanumeric() || c == '_') {
         return Ok(());
@@ -467,7 +484,9 @@ fn validate_locator(locator: &str) -> Result<(), AxError> {
     for desc_part in locator.split(" >> ") {
         for seg in desc_part.split(" > ") {
             if let Err(msg) = validate_segment(seg) {
-                return Err(AxError::LocatorInvalid(format!("{msg}\n  locator: {locator}")));
+                return Err(AxError::LocatorInvalid(format!(
+                    "{msg}\n  locator: {locator}"
+                )));
             }
         }
     }
@@ -557,7 +576,9 @@ fn cmd_debug(what: &str) -> Result<(), AxError> {
             // CGEvent uses CG coordinates (origin top-left, y down).
             // Convert: cg_y = primary_height - ns_y - ns_height
             let screens = NSScreen::screens(mtm);
-            let primary_h = screens.iter().next()
+            let primary_h = screens
+                .iter()
+                .next()
                 .map(|s| NSScreen::frame(&s).size.height)
                 .unwrap_or(0.0);
             for (i, screen) in screens.iter().enumerate() {
@@ -568,10 +589,7 @@ fn cmd_debug(what: &str) -> Result<(), AxError> {
                 let cg_y = primary_h - ns_frame.origin.y - ns_frame.size.height;
                 let w = ns_frame.size.width;
                 let h = ns_frame.size.height;
-                let on_screen = mx >= cg_x
-                    && mx < cg_x + w
-                    && my >= cg_y
-                    && my < cg_y + h;
+                let on_screen = mx >= cg_x && mx < cg_x + w && my >= cg_y && my < cg_y + h;
                 println!(
                     "Screen {i}: \"{name}\" origin=({cg_x:.0},{cg_y:.0}) size={w:.0}x{h:.0}{mark}",
                     mark = if on_screen { " ← cursor here" } else { "" },
@@ -579,11 +597,20 @@ fn cmd_debug(what: &str) -> Result<(), AxError> {
             }
             Ok(())
         }
-        _ => Err(AxError::InvalidArgument(format!("unknown debug command: {what} (available: mouse)"))),
+        _ => Err(AxError::InvalidArgument(format!(
+            "unknown debug command: {what} (available: mouse)"
+        ))),
     }
 }
 
-fn cmd_snapshot(ctx: &ExecutionContext, locator: Option<&str>, depth: usize, all: bool, max_text_len: usize, simplify: bool) -> Result<(), AxError> {
+fn cmd_snapshot(
+    ctx: &ExecutionContext,
+    locator: Option<&str>,
+    depth: usize,
+    all: bool,
+    max_text_len: usize,
+    simplify: bool,
+) -> Result<(), AxError> {
     let mut printer = tree_fmt::TreePrinter::new();
     printer.max_text_len = max_text_len;
     printer.simplify = simplify;
@@ -597,7 +624,9 @@ fn cmd_snapshot(ctx: &ExecutionContext, locator: Option<&str>, depth: usize, all
         if all {
             eprintln!("Found {} matches for {loc}", nodes.len());
             for (i, node) in nodes.iter().enumerate() {
-                if i > 0 { println!(); }
+                if i > 0 {
+                    println!();
+                }
                 eprintln!("--- match {}/{} ---", i + 1, nodes.len());
                 printer.print_with_ancestors(node, depth);
             }
@@ -730,7 +759,12 @@ fn cmd_scroll_to(ctx: &ExecutionContext, locator: &str) -> Result<(), AxError> {
     Ok(())
 }
 
-fn cmd_scroll(ctx: &ExecutionContext, locator: &str, direction: &str, pixels: i32) -> Result<(), AxError> {
+fn cmd_scroll(
+    ctx: &ExecutionContext,
+    locator: &str,
+    direction: &str,
+    pixels: i32,
+) -> Result<(), AxError> {
     let node = resolve_one(ctx, locator)?;
 
     ctx.activate();
@@ -743,9 +777,9 @@ fn cmd_scroll(ctx: &ExecutionContext, locator: &str, direction: &str, pixels: i3
         "left" => (pixels, 0),
         "right" => (-pixels, 0),
         _ => {
-            return Err(AxError::InvalidArgument(
-                format!("invalid direction '{direction}', use up/down/left/right"),
-            ));
+            return Err(AxError::InvalidArgument(format!(
+                "invalid direction '{direction}', use up/down/left/right"
+            )));
         }
     };
     eprintln!("Scrolling {direction} {pixels}px at ({cx:.0}, {cy:.0})");
@@ -803,18 +837,22 @@ fn run_ocr(image: &CGImage) -> Result<(), AxError> {
     Ok(())
 }
 
-fn cmd_screenshot(ctx: &ExecutionContext, locator: Option<&str>, output: Option<&str>, ocr: bool, legacy: bool) -> Result<(), AxError> {
+fn cmd_screenshot(
+    ctx: &ExecutionContext,
+    locator: Option<&str>,
+    output: Option<&str>,
+    ocr: bool,
+    legacy: bool,
+) -> Result<(), AxError> {
     screenshot::ensure_cg_init();
 
-    let path = output
-        .map(String::from)
-        .unwrap_or_else(|| {
-            let ts = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            format!("/tmp/ax_screenshot_{ts}.png")
-        });
+    let path = output.map(String::from).unwrap_or_else(|| {
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        format!("/tmp/ax_screenshot_{ts}.png")
+    });
 
     // Legacy path: activate app to foreground + CGWindowListCreateImage
     if legacy {
@@ -884,7 +922,11 @@ fn cmd_screenshot(ctx: &ExecutionContext, locator: Option<&str>, output: Option<
         if let Some(win_image) = win_image {
             // Compute element position relative to window, in pixels
             let img_w = CGImage::width(Some(&win_image));
-            let scale = if win_w > 0.0 { img_w as f64 / win_w } else { 1.0 };
+            let scale = if win_w > 0.0 {
+                img_w as f64 / win_w
+            } else {
+                1.0
+            };
             let crop_rect = CGRect::new(
                 CGPoint::new((el_x - win_x) * scale, (el_y - win_y) * scale),
                 CGSize::new(el_w * scale, el_h * scale),
@@ -990,9 +1032,14 @@ fn collect_text_inner(node: &AXNode, max_depth: usize, parts: &mut Vec<String>) 
     }
 
     // Block-level elements: insert newline before if we already have content
-    let is_block = role == "AXGroup" || role == "AXList" || role == "AXTable"
-        || role == "AXRow" || role == "AXHeading" || role == "AXParagraph"
-        || role == "AXBlockquote" || role == "AXArticle";
+    let is_block = role == "AXGroup"
+        || role == "AXList"
+        || role == "AXTable"
+        || role == "AXRow"
+        || role == "AXHeading"
+        || role == "AXParagraph"
+        || role == "AXBlockquote"
+        || role == "AXArticle";
 
     if is_block && !parts.is_empty() {
         if !parts.last().map_or(true, |s| s.ends_with('\n')) {
@@ -1051,7 +1098,12 @@ fn get_attr_value(node: &AXNode, attr: &GetAttr) -> Result<String, AxError> {
     }
 }
 
-fn cmd_get(ctx: &ExecutionContext, attr: &GetAttr, locator: &str, all: bool) -> Result<(), AxError> {
+fn cmd_get(
+    ctx: &ExecutionContext,
+    attr: &GetAttr,
+    locator: &str,
+    all: bool,
+) -> Result<(), AxError> {
     validate_locator(locator)?;
 
     if all {

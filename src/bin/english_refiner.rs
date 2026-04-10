@@ -15,7 +15,10 @@ use clap::Parser;
 use serde::{Deserialize, Serialize};
 
 #[derive(Parser)]
-#[command(name = "english-refiner", about = "English grammar/spelling correction hook")]
+#[command(
+    name = "english-refiner",
+    about = "English grammar/spelling correction hook"
+)]
 struct Cli {
     /// Output raw JSON instead of human-friendly format
     #[arg(long)]
@@ -87,7 +90,10 @@ fn classify(s: &str) -> InputKind {
     }
 
     // Check Chinese: CJK Unified Ideographs ratio
-    let cjk = s.chars().filter(|c| ('\u{4e00}'..='\u{9fff}').contains(c)).count();
+    let cjk = s
+        .chars()
+        .filter(|c| ('\u{4e00}'..='\u{9fff}').contains(c))
+        .count();
     if cjk as f64 / total as f64 > 0.3 {
         return InputKind::Chinese;
     }
@@ -117,8 +123,7 @@ Use casual, conversational tone as a native speaker would.\n\
 Return ONLY valid JSON: {\"refined\": \"<English translation>\", \"changes\": [\"translated from Chinese\"]}";
 
 fn call_kimi(system_prompt: &str, user_input: &str) -> Result<RefinedOutput, String> {
-    let api_key = std::env::var("KIMI_API_KEY")
-        .map_err(|_| "KIMI_API_KEY not set".to_string())?;
+    let api_key = std::env::var("KIMI_API_KEY").map_err(|_| "KIMI_API_KEY not set".to_string())?;
 
     let request = ChatRequest {
         model: "kimi-k2-0905-preview".to_string(),
@@ -197,7 +202,10 @@ fn main() {
                 if is_translate {
                     eprintln!("[english-refiner] 🔄 {}", output.refined);
                 } else {
-                    eprintln!("[english-refiner] \"{}\" → \"{}\"", output.original, output.refined);
+                    eprintln!(
+                        "[english-refiner] \"{}\" → \"{}\"",
+                        output.original, output.refined
+                    );
                 }
                 for change in &output.changes {
                     eprintln!("  • {change}");

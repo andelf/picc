@@ -13,8 +13,8 @@ use objc2::sel;
 use objc2::{define_class, msg_send, MainThreadMarker, MainThreadOnly};
 
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSEventMask, NSImage, NSMenu,
-    NSMenuItem, NSStatusBar, NSStatusItem,
+    NSApplication, NSApplicationActivationPolicy, NSEventMask, NSImage, NSMenu, NSMenuItem,
+    NSStatusBar, NSStatusItem,
 };
 use objc2_foundation::NSString;
 
@@ -116,8 +116,7 @@ fn main() {
             button.setImage(Some(&image));
         }
 
-        let target: Retained<ToggleTarget> =
-            unsafe { msg_send![ToggleTarget::alloc(mtm), init] };
+        let target: Retained<ToggleTarget> = unsafe { msg_send![ToggleTarget::alloc(mtm), init] };
         unsafe {
             button.setTarget(Some(&target));
             button.setAction(Some(sel!(toggle:)));

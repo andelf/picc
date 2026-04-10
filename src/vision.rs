@@ -8,15 +8,13 @@ pub use objc2_vision::{
 };
 
 use objc2::rc::Retained;
+use objc2::runtime::AnyObject;
 use objc2::AnyThread;
 use objc2_core_graphics::CGImage;
 use objc2_foundation::{NSArray, NSError, NSURL};
 use objc2_vision::VNImageOption;
-use objc2::runtime::AnyObject;
 
-pub fn new_handler_with_cgimage(
-    image: &CGImage,
-) -> Retained<VNImageRequestHandler> {
+pub fn new_handler_with_cgimage(image: &CGImage) -> Retained<VNImageRequestHandler> {
     let options = objc2_foundation::NSDictionary::<VNImageOption, AnyObject>::new();
     unsafe {
         VNImageRequestHandler::initWithCGImage_options(

@@ -220,8 +220,7 @@ impl Locator {
 
     /// Narrow results: search within each candidate's subtree for exact AXDescription.
     pub fn get_by_description(mut self, desc: &str) -> Self {
-        self.steps
-            .push(LocatorStep::Description(desc.to_string()));
+        self.steps.push(LocatorStep::Description(desc.to_string()));
         self
     }
 
@@ -368,9 +367,7 @@ impl Locator {
 
     /// Set focus on the first match.
     pub fn focus(&self) -> bool {
-        self.resolve()
-            .map(|n| n.set_focused(true))
-            .unwrap_or(false)
+        self.resolve().map(|n| n.set_focused(true)).unwrap_or(false)
     }
 
     /// Perform an arbitrary AX action on the first match.
@@ -382,9 +379,7 @@ impl Locator {
 
     /// Set AXValue on the first match.
     pub fn set_value(&self, text: &str) -> bool {
-        self.resolve()
-            .map(|n| n.set_value(text))
-            .unwrap_or(false)
+        self.resolve().map(|n| n.set_value(text)).unwrap_or(false)
     }
 }
 
@@ -510,11 +505,7 @@ fn matches_filter(node: &AXNode, criteria: &FilterCriteria) -> bool {
         // Re-root the sub-locator at this node and check if it has matches
         let sub = Locator {
             root: node.0.clone(),
-            steps: sub_locator
-                .steps
-                .iter()
-                .map(|s| clone_step(s))
-                .collect(),
+            steps: sub_locator.steps.iter().map(|s| clone_step(s)).collect(),
         };
         if sub.resolve_all().is_empty() {
             return false;
@@ -523,11 +514,7 @@ fn matches_filter(node: &AXNode, criteria: &FilterCriteria) -> bool {
     if let Some(ref sub_locator) = criteria.has_not {
         let sub = Locator {
             root: node.0.clone(),
-            steps: sub_locator
-                .steps
-                .iter()
-                .map(|s| clone_step(s))
-                .collect(),
+            steps: sub_locator.steps.iter().map(|s| clone_step(s)).collect(),
         };
         if !sub.resolve_all().is_empty() {
             return false;
@@ -553,21 +540,23 @@ fn clone_step(step: &LocatorStep) -> LocatorStep {
         LocatorStep::DomId(id) => LocatorStep::DomId(id.clone()),
         LocatorStep::DomClass(c) => LocatorStep::DomClass(c.clone()),
         LocatorStep::Query(q) => LocatorStep::Query(q.clone()),
-        LocatorStep::Filter(criteria) => {
-            LocatorStep::Filter(FilterCriteria {
-                has_text: criteria.has_text.clone(),
-                has_not_text: criteria.has_not_text.clone(),
-                has: criteria.has.as_ref().map(|loc| Box::new(Locator {
+        LocatorStep::Filter(criteria) => LocatorStep::Filter(FilterCriteria {
+            has_text: criteria.has_text.clone(),
+            has_not_text: criteria.has_not_text.clone(),
+            has: criteria.has.as_ref().map(|loc| {
+                Box::new(Locator {
                     root: loc.root.clone(),
                     steps: loc.steps.iter().map(clone_step).collect(),
-                })),
-                has_not: criteria.has_not.as_ref().map(|loc| Box::new(Locator {
+                })
+            }),
+            has_not: criteria.has_not.as_ref().map(|loc| {
+                Box::new(Locator {
                     root: loc.root.clone(),
                     steps: loc.steps.iter().map(clone_step).collect(),
-                })),
-                predicate: criteria.predicate,
-            })
-        }
+                })
+            }),
+            predicate: criteria.predicate,
+        }),
         LocatorStep::Nth(n) => LocatorStep::Nth(*n),
         LocatorStep::First => LocatorStep::First,
         LocatorStep::Last => LocatorStep::Last,
@@ -674,7 +663,9 @@ mod tests {
 
     #[test]
     fn clone_step_preserves_predicate() {
-        fn my_pred(_: &AXNode) -> bool { true }
+        fn my_pred(_: &AXNode) -> bool {
+            true
+        }
 
         let mut criteria = FilterCriteria::new();
         criteria.predicate(my_pred);
@@ -691,8 +682,14 @@ mod tests {
 
     #[test]
     fn clone_step_simple_variants() {
-        assert!(matches!(clone_step(&LocatorStep::Nth(5)), LocatorStep::Nth(5)));
-        assert!(matches!(clone_step(&LocatorStep::First), LocatorStep::First));
+        assert!(matches!(
+            clone_step(&LocatorStep::Nth(5)),
+            LocatorStep::Nth(5)
+        ));
+        assert!(matches!(
+            clone_step(&LocatorStep::First),
+            LocatorStep::First
+        ));
         assert!(matches!(clone_step(&LocatorStep::Last), LocatorStep::Last));
 
         if let LocatorStep::Role(r) = clone_step(&LocatorStep::Role("AXButton".into())) {

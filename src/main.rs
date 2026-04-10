@@ -11,14 +11,14 @@ use objc2::{define_class, msg_send, AnyThread, DefinedClass, MainThreadMarker, M
 
 use objc2_app_kit::{
     NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSBezierPath, NSColor,
-    NSCompositingOperation, NSEvent, NSEventMask, NSEventModifierFlags, NSGraphicsContext,
-    NSImage, NSPanel, NSPasteboard, NSPasteboardTypePNG, NSPasteboardTypeString, NSResponder,
-    NSScreen, NSView, NSWindow, NSWindowCollectionBehavior, NSWindowStyleMask,
+    NSCompositingOperation, NSEvent, NSEventMask, NSEventModifierFlags, NSGraphicsContext, NSImage,
+    NSPanel, NSPasteboard, NSPasteboardTypePNG, NSPasteboardTypeString, NSResponder, NSScreen,
+    NSView, NSWindow, NSWindowCollectionBehavior, NSWindowStyleMask,
 };
-use objc2_core_foundation::{CFString, CFURL, CFURLPathStyle, CGPoint, CGRect, CGSize};
+use objc2_core_foundation::{CFString, CFURLPathStyle, CGPoint, CGRect, CGSize, CFURL};
 use objc2_core_graphics::CGImage;
-use objc2_image_io::CGImageDestination;
 use objc2_foundation::{NSArray, NSData, NSDate, NSPoint, NSRect, NSRunLoop, NSSize, NSString};
+use objc2_image_io::CGImageDestination;
 use picc::vision;
 
 use std::sync::Mutex;
@@ -103,7 +103,12 @@ fn hide_all_overlays() {
 #[allow(dead_code)]
 fn save_cgimage(image: &CGImage, path: &str) {
     let cf_path = CFString::from_str(path);
-    let url = CFURL::with_file_system_path(None, Some(&cf_path), CFURLPathStyle::CFURLPOSIXPathStyle, false);
+    let url = CFURL::with_file_system_path(
+        None,
+        Some(&cf_path),
+        CFURLPathStyle::CFURLPOSIXPathStyle,
+        false,
+    );
     let Some(url) = url else {
         println!("save_cgimage({}) => false (bad url)", path);
         return;
@@ -216,8 +221,7 @@ define_class!(
 
             // 隐藏所有覆盖窗口，避免截图时把遮罩层也截进去
             hide_all_windows();
-            NSRunLoop::currentRunLoop()
-                .runUntilDate(&NSDate::dateWithTimeIntervalSinceNow(0.1));
+            NSRunLoop::currentRunLoop().runUntilDate(&NSDate::dateWithTimeIntervalSinceNow(0.1));
 
             let crop_img = picc::screenshot(rect).unwrap();
 
@@ -315,18 +319,14 @@ define_class!(
                 path.stroke();
 
                 // 在选框右下角显示分辨率大小
-                let scale = self
-                    .window()
-                    .map(|w| w.backingScaleFactor())
-                    .unwrap_or(2.0);
+                let scale = self.window().map(|w| w.backingScaleFactor()).unwrap_or(2.0);
                 let pixel_w = (w * scale) as u32;
                 let pixel_h = (h * scale) as u32;
                 let label = NSString::from_str(&format!("{} × {}", pixel_w, pixel_h));
 
                 unsafe {
                     let font_cls = AnyClass::get(c"NSFont").unwrap();
-                    let font: Retained<NSObject> =
-                        msg_send![font_cls, monospacedDigitSystemFontOfSize: 12.0_f64, weight: 0.0_f64];
+                    let font: Retained<NSObject> = msg_send![font_cls, monospacedDigitSystemFontOfSize: 12.0_f64, weight: 0.0_f64];
 
                     let dict_cls = AnyClass::get(c"NSMutableDictionary").unwrap();
                     let dict: Retained<NSObject> = msg_send![dict_cls, new];
@@ -352,16 +352,14 @@ define_class!(
                         local_y + h + gap
                     };
 
-                    let bg_rect =
-                        NSRect::new(NSPoint::new(bg_x, bg_y), NSSize::new(bg_w, bg_h));
+                    let bg_rect = NSRect::new(NSPoint::new(bg_x, bg_y), NSSize::new(bg_w, bg_h));
 
                     NSColor::colorWithSRGBRed_green_blue_alpha(0.0, 0.0, 0.0, 0.75).setFill();
                     NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(bg_rect, 4.0, 4.0)
                         .fill();
 
                     let text_pt = NSPoint::new(bg_x + pad_x, bg_y + pad_y);
-                    let _: () =
-                        msg_send![&*label, drawAtPoint: text_pt, withAttributes: &*dict];
+                    let _: () = msg_send![&*label, drawAtPoint: text_pt, withAttributes: &*dict];
                 }
             }
         }
@@ -431,9 +429,14 @@ fn ocr(img: &CGImage) {
 
 /// 复制 CGImage 到系统剪贴板（PNG 格式）
 fn copy_image_to_clipboard(img: &CGImage) {
-    let size = NSSize::new(CGImage::width(Some(img)) as f64, CGImage::height(Some(img)) as f64);
+    let size = NSSize::new(
+        CGImage::width(Some(img)) as f64,
+        CGImage::height(Some(img)) as f64,
+    );
     let ns_img = NSImage::initWithCGImage_size(NSImage::alloc(), img, size);
-    let tiff_data = ns_img.TIFFRepresentation().expect("failed to get TIFF data");
+    let tiff_data = ns_img
+        .TIFFRepresentation()
+        .expect("failed to get TIFF data");
     let bitmap_rep: Retained<NSObject> = unsafe {
         let cls = AnyClass::get(c"NSBitmapImageRep").unwrap();
         msg_send![cls, imageRepWithData: &*tiff_data]
@@ -448,7 +451,11 @@ fn copy_image_to_clipboard(img: &CGImage) {
     let pb = NSPasteboard::generalPasteboard();
     pb.clearContents();
     pb.setData_forType(Some(&png_data), unsafe { NSPasteboardTypePNG });
-    println!("[Copied image to clipboard] {}x{}", CGImage::width(Some(img)), CGImage::height(Some(img)));
+    println!(
+        "[Copied image to clipboard] {}x{}",
+        CGImage::width(Some(img)),
+        CGImage::height(Some(img))
+    );
 }
 
 /// 检测是否为 Ctrl+Cmd+A 快捷键
@@ -488,8 +495,7 @@ fn show_snap_windows() {
                 // 刷新 overlay view（使用本地坐标，origin 为 0,0）
                 if let Some(content) = win.contentView() {
                     if let Some(overlay) = content.subviews().firstObject() {
-                        let content_frame =
-                            NSRect::new(NSPoint::new(0.0, 0.0), screen_frame.size);
+                        let content_frame = NSRect::new(NSPoint::new(0.0, 0.0), screen_frame.size);
                         overlay.setFrame(content_frame);
                         overlay.setHidden(false);
                         overlay.display();
@@ -565,10 +571,8 @@ fn main() {
             show_snap_windows();
         }
     });
-    let _global_monitor = NSEvent::addGlobalMonitorForEventsMatchingMask_handler(
-        NSEventMask::KeyDown,
-        &global_block,
-    );
+    let _global_monitor =
+        NSEvent::addGlobalMonitorForEventsMatchingMask_handler(NSEventMask::KeyDown, &global_block);
 
     // 注册本地快捷键监听（app 有焦点时）
     let local_block = RcBlock::new(move |event: NonNull<NSEvent>| -> *mut NSEvent {
@@ -581,10 +585,7 @@ fn main() {
         }
     });
     let _local_monitor = unsafe {
-        NSEvent::addLocalMonitorForEventsMatchingMask_handler(
-            NSEventMask::KeyDown,
-            &local_block,
-        )
+        NSEvent::addLocalMonitorForEventsMatchingMask_handler(NSEventMask::KeyDown, &local_block)
     };
 
     println!("PICC running. Press Ctrl+Cmd+A to capture screenshot.");

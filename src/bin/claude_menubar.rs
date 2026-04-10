@@ -504,9 +504,9 @@ fn update_menubar() {
                 for (id, state) in &sessions {
                     let short_id = if id.len() > 8 { &id[..8] } else { id };
                     let status_indicator = if state.needs_input {
-                        " \u{23f3}"  // ⏳
+                        " \u{23f3}" // ⏳
                     } else if state.is_working {
-                        " \u{26a1}"  // ⚡
+                        " \u{26a1}" // ⚡
                     } else {
                         " \u{1f4a4}" // 💤
                     };
@@ -550,8 +550,7 @@ fn setup_menubar(mtm: MainThreadMarker) {
         unsafe { set_button_monospaced_title(&button, " --") };
     }
 
-    let delegate: Retained<MenuDelegate> =
-        unsafe { msg_send![MenuDelegate::alloc(mtm), init] };
+    let delegate: Retained<MenuDelegate> = unsafe { msg_send![MenuDelegate::alloc(mtm), init] };
 
     let menu = NSMenu::new(mtm);
 
@@ -598,7 +597,8 @@ fn print_hook_config() {
 
     eprintln!("=== Claude Code Hook Configuration ===");
     eprintln!("Add the following to ~/.claude/settings.json:\n");
-    eprintln!(r#"{{
+    eprintln!(
+        r#"{{
   "hooks": {{
     "UserPromptSubmit": [
       {{
@@ -622,6 +622,10 @@ fn print_hook_config() {
       {{
         "matcher": "permission_prompt",
         "hooks": [{{ "type": "command", "command": "{bin_path} --hook" }}]
+      }},
+      {{
+        "matcher": "idle_prompt",
+        "hooks": [{{ "type": "command", "command": "{bin_path} --hook" }}]
       }}
     ],
     "Stop": [
@@ -631,7 +635,8 @@ fn print_hook_config() {
       }}
     ]
   }}
-}}"#);
+}}"#
+    );
     eprintln!();
 }
 
@@ -658,7 +663,11 @@ fn run_menubar() {
     poll_and_update();
     start_poll_timer();
 
-    eprintln!("[claude_menubar] Running (pid: {}). Polling every {:.0}s.", std::process::id(), POLL_INTERVAL);
+    eprintln!(
+        "[claude_menubar] Running (pid: {}). Polling every {:.0}s.",
+        std::process::id(),
+        POLL_INTERVAL
+    );
 
     app.run();
 

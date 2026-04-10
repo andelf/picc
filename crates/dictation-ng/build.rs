@@ -26,12 +26,7 @@ fn main() {
     }
 
     // macOS frameworks
-    for fw in &[
-        "Foundation",
-        "CoreML",
-        "Accelerate",
-        "CoreFoundation",
-    ] {
+    for fw in &["Foundation", "CoreML", "Accelerate", "CoreFoundation"] {
         println!("cargo:rustc-link-lib=framework={fw}");
     }
 

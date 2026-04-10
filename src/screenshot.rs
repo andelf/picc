@@ -1,8 +1,10 @@
 //! Screenshot capture and image saving utilities.
 
-use objc2_core_foundation::{CFRetained, CFString, CFURL, CFURLPathStyle, CGPoint, CGRect, CGSize};
+use objc2_core_foundation::{CFRetained, CFString, CFURLPathStyle, CGPoint, CGRect, CGSize, CFURL};
 #[allow(deprecated)]
-use objc2_core_graphics::{CGImage, CGWindowImageOption, CGWindowListCreateImage, CGWindowListOption};
+use objc2_core_graphics::{
+    CGImage, CGWindowImageOption, CGWindowListCreateImage, CGWindowListOption,
+};
 use objc2_image_io::CGImageDestination;
 
 extern "C" {
@@ -12,7 +14,9 @@ extern "C" {
 /// Ensure the CoreGraphics window server connection is initialized.
 /// Must be called before any CGImage/ImageIO operations in a CLI context.
 pub fn ensure_cg_init() {
-    unsafe { CGMainDisplayID(); }
+    unsafe {
+        CGMainDisplayID();
+    }
 }
 
 /// Capture a screenshot of the given screen rectangle.
@@ -29,7 +33,12 @@ pub fn capture_full() -> Option<CFRetained<CGImage>> {
 /// Save a CGImage as PNG to the given file path. Returns true on success.
 pub fn save_png(image: &CGImage, path: &str) -> bool {
     let cf_path = CFString::from_str(path);
-    let url = CFURL::with_file_system_path(None, Some(&cf_path), CFURLPathStyle::CFURLPOSIXPathStyle, false);
+    let url = CFURL::with_file_system_path(
+        None,
+        Some(&cf_path),
+        CFURLPathStyle::CFURLPOSIXPathStyle,
+        false,
+    );
     let Some(url) = url else { return false };
     let png_type = CFString::from_str("public.png");
     let dest = unsafe { CGImageDestination::with_url(&url, &png_type, 1, None) };

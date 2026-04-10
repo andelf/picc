@@ -19,8 +19,7 @@ fn main() {
     let handler = vision::new_handler_with_url(&url);
 
     let reqs = NSArray::from_retained_slice(&[req.clone()]);
-    let reqs: &NSArray<objc2_vision::VNRequest> =
-        unsafe { &*((&*reqs) as *const _ as *const _) };
+    let reqs: &NSArray<objc2_vision::VNRequest> = unsafe { &*((&*reqs) as *const _ as *const _) };
     vision::perform_requests(&handler, reqs).unwrap();
 
     if let Some(results) = req.results() {

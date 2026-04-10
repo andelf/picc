@@ -44,7 +44,11 @@ impl fmt::Display for AxError {
             Self::ActionFailed(action) => write!(f, "{action} failed"),
             Self::AttributeNotFound(attr) => write!(f, "no value for {attr}"),
             Self::Timeout { locator, duration } => {
-                write!(f, "timeout after {:.1}s waiting for '{locator}'", duration.as_secs_f64())
+                write!(
+                    f,
+                    "timeout after {:.1}s waiting for '{locator}'",
+                    duration.as_secs_f64()
+                )
             }
             Self::InvalidArgument(msg) => write!(f, "{msg}"),
             Self::ScreenshotFailed(msg) => write!(f, "screenshot failed: {msg}"),
@@ -117,7 +121,10 @@ mod tests {
 
     #[test]
     fn display_element_zero_size() {
-        assert_eq!(AxError::ElementZeroSize.to_string(), "element has zero size (not visible)");
+        assert_eq!(
+            AxError::ElementZeroSize.to_string(),
+            "element has zero size (not visible)"
+        );
     }
 
     #[test]

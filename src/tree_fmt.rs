@@ -124,13 +124,7 @@ impl TreePrinter {
         self.print_tree_inner(node, depth, max_depth, depth == 0);
     }
 
-    fn print_tree_inner(
-        &mut self,
-        node: &AXNode,
-        depth: usize,
-        max_depth: usize,
-        is_root: bool,
-    ) {
+    fn print_tree_inner(&mut self, node: &AXNode, depth: usize, max_depth: usize, is_root: bool) {
         if depth > max_depth {
             return;
         }
@@ -182,10 +176,7 @@ impl TreePrinter {
         let keep = is_root || is_text_node || is_interactive || is_structural;
 
         if keep {
-            let short_role = role
-                .strip_prefix("AX")
-                .unwrap_or(&role)
-                .to_lowercase();
+            let short_role = role.strip_prefix("AX").unwrap_or(&role).to_lowercase();
 
             let indent = "  ".repeat(depth);
             let mut line = String::new();
@@ -262,7 +253,9 @@ fn has_content(node: &AXNode, max_depth: usize) -> bool {
     if max_depth == 0 {
         return false;
     }
-    node.children().iter().any(|c| has_content(c, max_depth - 1))
+    node.children()
+        .iter()
+        .any(|c| has_content(c, max_depth - 1))
 }
 
 /// Count descendants up to a shallow depth, capped at 100 for speed.

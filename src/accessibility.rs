@@ -149,9 +149,7 @@ fn cf_type_as_ax_elements(value: &CFType) -> Vec<CFRetained<AXUIElement>> {
     for i in 0..count {
         let ptr = unsafe { array.as_opaque().value_at_index(i as CFIndex) };
         if !ptr.is_null() {
-            let el = unsafe {
-                CFRetained::retain(NonNull::new_unchecked(ptr as *mut AXUIElement))
-            };
+            let el = unsafe { CFRetained::retain(NonNull::new_unchecked(ptr as *mut AXUIElement)) };
             result.push(el);
         }
     }
@@ -518,7 +516,10 @@ impl AXNode {
 
     /// Find the first direct child matching `query`.
     pub fn child_matching(&self, q: &AXQuery) -> Option<AXNode> {
-        children(&self.0).into_iter().find(|c| q.matches(c)).map(AXNode::new)
+        children(&self.0)
+            .into_iter()
+            .find(|c| q.matches(c))
+            .map(AXNode::new)
     }
 
     /// Find all direct children matching `query`.
@@ -622,7 +623,7 @@ impl AXNode {
         // AXParent returns an AXUIElement
         let el = unsafe {
             CFRetained::retain(NonNull::new_unchecked(
-                value.as_ref() as *const CFType as *mut AXUIElement,
+                value.as_ref() as *const CFType as *mut AXUIElement
             ))
         };
         Some(AXNode::new(el))
@@ -651,7 +652,11 @@ impl AXNode {
                 NonNull::new_unchecked(&mut point as *mut CGPoint as *mut _),
             )
         };
-        if ok { Some((point.x, point.y)) } else { None }
+        if ok {
+            Some((point.x, point.y))
+        } else {
+            None
+        }
     }
 
     /// Get the size (width, height) of this element.
@@ -660,14 +665,21 @@ impl AXNode {
         use objc2_core_foundation::CGSize;
         let value = attr_value(&self.0, "AXSize")?;
         let ax_val = unsafe { &*(value.as_ref() as *const CFType as *const AXValue) };
-        let mut size = CGSize { width: 0.0, height: 0.0 };
+        let mut size = CGSize {
+            width: 0.0,
+            height: 0.0,
+        };
         let ok = unsafe {
             ax_val.value(
                 AXValueType(2), // kAXValueCGSizeType
                 NonNull::new_unchecked(&mut size as *mut CGSize as *mut _),
             )
         };
-        if ok { Some((size.width, size.height)) } else { None }
+        if ok {
+            Some((size.width, size.height))
+        } else {
+            None
+        }
     }
 
     /// Set an attribute value on the underlying element.
@@ -869,7 +881,14 @@ fn count_matches_inner(
                 return;
             }
         }
-        count_matches_inner(&child, selector, target, depth - 1, found_target, found_other);
+        count_matches_inner(
+            &child,
+            selector,
+            target,
+            depth - 1,
+            found_target,
+            found_other,
+        );
     }
 }
 
@@ -953,7 +972,13 @@ fn parse_pseudo_classes(selector: &str) -> PseudoClasses<'_> {
         break;
     }
 
-    PseudoClasses { base, has_text, has_selector, visible, nth_child }
+    PseudoClasses {
+        base,
+        has_text,
+        has_selector,
+        visible,
+        nth_child,
+    }
 }
 
 /// Check if an element's subtree contains the given text.
@@ -979,9 +1004,14 @@ fn subtree_has_text(el: &AXUIElement, text: &str) -> bool {
 fn element_is_visible(el: &AXUIElement) -> bool {
     use objc2_application_services::{AXValue, AXValueType};
     use objc2_core_foundation::CGSize;
-    let Some(value) = attr_value(el, "AXSize") else { return false };
+    let Some(value) = attr_value(el, "AXSize") else {
+        return false;
+    };
     let ax_val = unsafe { &*(value.as_ref() as *const CFType as *const AXValue) };
-    let mut size = CGSize { width: 0.0, height: 0.0 };
+    let mut size = CGSize {
+        width: 0.0,
+        height: 0.0,
+    };
     let ok = unsafe {
         ax_val.value(
             AXValueType(2),
@@ -993,10 +1023,10 @@ fn element_is_visible(el: &AXUIElement) -> bool {
 
 /// Check if an element is the Nth child (0-based) among all its parent's children.
 fn is_nth_child(el: &AXUIElement, n: usize) -> bool {
-    let Some(parent_val) = attr_value(el, "AXParent") else { return false };
-    let parent = unsafe {
-        &*(parent_val.as_ref() as *const CFType as *const AXUIElement)
+    let Some(parent_val) = attr_value(el, "AXParent") else {
+        return false;
     };
+    let parent = unsafe { &*(parent_val.as_ref() as *const CFType as *const AXUIElement) };
     let siblings = children(parent);
     siblings.get(n).is_some_and(|sib| is_same_element(sib, el))
 }
@@ -1141,24 +1171,36 @@ fn element_matches_base_selector(el: &AXUIElement, selector: &str) -> bool {
                     pattern.to_string()
                 };
                 if let Ok(re) = regex::Regex::new(&regex_pattern) {
-                    return [attr_string(el, "AXValue"), attr_string(el, "AXTitle"), attr_string(el, "AXDescription")]
-                        .iter()
-                        .any(|v| v.as_ref().is_some_and(|s| re.is_match(s)));
+                    return [
+                        attr_string(el, "AXValue"),
+                        attr_string(el, "AXTitle"),
+                        attr_string(el, "AXDescription"),
+                    ]
+                    .iter()
+                    .any(|v| v.as_ref().is_some_and(|s| re.is_match(s)));
                 }
             }
             return false;
         }
         // text=VALUE — exact text matching
         let val = rest.trim_matches('"');
-        return [attr_string(el, "AXValue"), attr_string(el, "AXTitle"), attr_string(el, "AXDescription")]
-            .iter()
-            .any(|v| v.as_deref() == Some(val));
+        return [
+            attr_string(el, "AXValue"),
+            attr_string(el, "AXTitle"),
+            attr_string(el, "AXDescription"),
+        ]
+        .iter()
+        .any(|v| v.as_deref() == Some(val));
     }
     if let Some(rest) = selector.strip_prefix("text~=") {
         let val = rest.trim_matches('"');
-        return [attr_string(el, "AXValue"), attr_string(el, "AXTitle"), attr_string(el, "AXDescription")]
-            .iter()
-            .any(|v| v.as_ref().is_some_and(|s| s.contains(val)));
+        return [
+            attr_string(el, "AXValue"),
+            attr_string(el, "AXTitle"),
+            attr_string(el, "AXDescription"),
+        ]
+        .iter()
+        .any(|v| v.as_ref().is_some_and(|s| s.contains(val)));
     }
 
     // Parse role[attr="value"] or role[attr*="value"] etc.
@@ -1220,11 +1262,19 @@ fn element_matches_base_selector(el: &AXUIElement, selector: &str) -> bool {
         let classes = attr_string_list(el, "AXDOMClassList");
         dom_sel.matches(&classes)
     } else if selector.contains(":nth(") {
-        let Some((role_part, rest)) = selector.split_once(":nth(") else { return false };
-        let Some(n_str) = rest.strip_suffix(')') else { return false };
-        let Ok(n) = n_str.parse::<usize>() else { return false };
+        let Some((role_part, rest)) = selector.split_once(":nth(") else {
+            return false;
+        };
+        let Some(n_str) = rest.strip_suffix(')') else {
+            return false;
+        };
+        let Ok(n) = n_str.parse::<usize>() else {
+            return false;
+        };
         let el_role = attr_string(el, "AXRole").unwrap_or_default();
-        if !role_matches(&el_role, role_part) { return false }
+        if !role_matches(&el_role, role_part) {
+            return false;
+        }
         nth_among_siblings(el).is_some_and(|(_, idx)| idx == n)
     } else {
         // Plain role — support both "AXButton" and "button" (case-insensitive without AX prefix)
@@ -1237,9 +1287,7 @@ fn element_matches_base_selector(el: &AXUIElement, selector: &str) -> bool {
 fn nth_among_siblings(el: &AXUIElement) -> Option<(String, usize)> {
     let role = attr_string(el, "AXRole")?;
     let parent_val = attr_value(el, "AXParent")?;
-    let parent = unsafe {
-        &*(parent_val.as_ref() as *const CFType as *const AXUIElement)
-    };
+    let parent = unsafe { &*(parent_val.as_ref() as *const CFType as *const AXUIElement) };
     let siblings = children(parent);
     let mut idx = 0;
     for sib in &siblings {
@@ -1285,7 +1333,7 @@ pub fn generate_locator(root: &AXUIElement, target: &AXUIElement) -> String {
         };
         let parent = unsafe {
             CFRetained::retain(NonNull::new_unchecked(
-                parent_val.as_ref() as *const CFType as *mut AXUIElement,
+                parent_val.as_ref() as *const CFType as *mut AXUIElement
             ))
         };
 
@@ -1372,14 +1420,7 @@ fn chain_check_inner(
         }
         if element_matches_selector(&child, ancestor_sel) {
             // Search within this ancestor for target_sel matches
-            count_matches_inner(
-                &child,
-                target_sel,
-                target,
-                50,
-                found_target,
-                found_other,
-            );
+            count_matches_inner(&child, target_sel, target, 50, found_target, found_other);
         } else {
             chain_check_inner(
                 &child,
@@ -1409,10 +1450,7 @@ fn chain_check_inner(
 /// - `AXGroup:nth(2)` — nth among siblings with same role
 /// - `nth=N` — pick Nth result from previous step
 /// - `sel1 >> sel2 >> nth=0` — pipeline chain
-pub fn resolve_locator(
-    root: &AXUIElement,
-    locator: &str,
-) -> Option<CFRetained<AXUIElement>> {
+pub fn resolve_locator(root: &AXUIElement, locator: &str) -> Option<CFRetained<AXUIElement>> {
     resolve_locator_all(root, locator).into_iter().next()
 }
 
@@ -1461,10 +1499,7 @@ fn parse_locator_steps(locator: &str) -> Vec<LocatorStep<'_>> {
 /// Special selectors:
 /// - `nth=N` — pick the Nth element (0-based) from current results
 /// - `first` / `last` — pick first/last element from current results
-pub fn resolve_locator_all(
-    root: &AXUIElement,
-    locator: &str,
-) -> Vec<CFRetained<AXUIElement>> {
+pub fn resolve_locator_all(root: &AXUIElement, locator: &str) -> Vec<CFRetained<AXUIElement>> {
     let steps = parse_locator_steps(locator);
 
     if steps.is_empty() {
@@ -1488,7 +1523,10 @@ pub fn resolve_locator_all(
 }
 
 /// Apply a typed pipeline step (descendant or direct child).
-fn apply_step_typed(elements: &[CFRetained<AXUIElement>], step: &LocatorStep<'_>) -> Vec<CFRetained<AXUIElement>> {
+fn apply_step_typed(
+    elements: &[CFRetained<AXUIElement>],
+    step: &LocatorStep<'_>,
+) -> Vec<CFRetained<AXUIElement>> {
     match step {
         LocatorStep::Descendant(sel) => apply_step_inner(elements, sel, false),
         LocatorStep::DirectChild(sel) => apply_step_inner(elements, sel, true),
@@ -1497,7 +1535,11 @@ fn apply_step_typed(elements: &[CFRetained<AXUIElement>], step: &LocatorStep<'_>
 
 /// Apply a single pipeline step to a set of elements.
 /// If `direct_only` is true, only search direct children (not descendants).
-fn apply_step_inner(elements: &[CFRetained<AXUIElement>], step: &str, direct_only: bool) -> Vec<CFRetained<AXUIElement>> {
+fn apply_step_inner(
+    elements: &[CFRetained<AXUIElement>],
+    step: &str,
+    direct_only: bool,
+) -> Vec<CFRetained<AXUIElement>> {
     // nth=N — pick Nth element from current set (supports negative index)
     if let Some(n_str) = step.strip_prefix("nth=") {
         if let Ok(n) = n_str.parse::<isize>() {
@@ -1506,7 +1548,11 @@ fn apply_step_inner(elements: &[CFRetained<AXUIElement>], step: &str, direct_onl
             } else {
                 Some(n as usize)
             };
-            return idx.and_then(|i| elements.get(i)).cloned().into_iter().collect();
+            return idx
+                .and_then(|i| elements.get(i))
+                .cloned()
+                .into_iter()
+                .collect();
         }
         return Vec::new();
     }
@@ -1661,7 +1707,7 @@ mod tests {
         // Missing closing quote — still parseable as attr content
         let ab = parse_attr_bracket(r#"title="Send"#);
         assert!(ab.is_some()); // just strips quotes
-        // But truly missing `=` is None
+                               // But truly missing `=` is None
         assert!(parse_attr_bracket("title").is_none());
     }
 
