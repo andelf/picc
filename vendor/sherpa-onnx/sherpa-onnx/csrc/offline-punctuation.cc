@@ -1,0 +1,68 @@
+// sherpa-onnx/csrc/offline-punctuation.cc
+//
+// Copyright (c)  2024  Xiaomi Corporation
+
+#include "sherpa-onnx/csrc/offline-punctuation.h"
+
+#include <string>
+
+#if __ANDROID_API__ >= 9
+#include "android/asset_manager.h"
+#include "android/asset_manager_jni.h"
+#endif
+
+#if __OHOS__
+#include "rawfile/raw_file_manager.h"
+#endif
+
+#include "sherpa-onnx/csrc/macros.h"
+#include "sherpa-onnx/csrc/offline-punctuation-impl.h"
+
+namespace sherpa_onnx {
+
+void OfflinePunctuationConfig::Register(ParseOptions *po) {
+  model.Register(po);
+}
+
+bool OfflinePunctuationConfig::Validate() const {
+  if (!model.Validate()) {
+    return false;
+  }
+
+  return true;
+}
+
+std::string OfflinePunctuationConfig::ToString() const {
+  std::ostringstream os;
+
+  os << "OfflinePunctuationConfig(";
+  os << "model=" << model.ToString() << ")";
+
+  return os.str();
+}
+
+OfflinePunctuation::OfflinePunctuation(const OfflinePunctuationConfig &config)
+    : impl_(OfflinePunctuationImpl::Create(config)) {}
+
+template <typename Manager>
+OfflinePunctuation::OfflinePunctuation(Manager *mgr,
+                                       const OfflinePunctuationConfig &config)
+    : impl_(OfflinePunctuationImpl::Create(mgr, config)) {}
+
+#if __ANDROID_API__ >= 9
+template OfflinePunctuation::OfflinePunctuation(
+    AAssetManager *mgr, const OfflinePunctuationConfig &config);
+#endif
+
+#if __OHOS__
+template OfflinePunctuation::OfflinePunctuation(
+    NativeResourceManager *mgr, const OfflinePunctuationConfig &config);
+#endif
+
+OfflinePunctuation::~OfflinePunctuation() = default;
+
+std::string OfflinePunctuation::AddPunctuation(const std::string &text) const {
+  return impl_->AddPunctuation(text);
+}
+
+}  // namespace sherpa_onnx

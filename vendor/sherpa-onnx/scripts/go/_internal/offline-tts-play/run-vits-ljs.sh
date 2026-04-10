@@ -1,0 +1,1 @@
+../../../../go-api-examples/offline-tts-play/run-vits-ljs.sh

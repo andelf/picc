@@ -1,0 +1,41 @@
+package com.k2fsa.sherpa.onnx
+
+fun main() {
+  testSpokenLanguageIdentifcation()
+}
+
+fun testSpokenLanguageIdentifcation() {
+  val config = SpokenLanguageIdentificationConfig(
+    whisper = SpokenLanguageIdentificationWhisperConfig(
+      encoder = "./sherpa-onnx-whisper-tiny/tiny-encoder.int8.onnx",
+      decoder = "./sherpa-onnx-whisper-tiny/tiny-decoder.int8.onnx",
+      tailPaddings = 33,
+    ),
+    numThreads=1,
+    debug=true,
+    provider="cpu",
+  )
+  val slid = SpokenLanguageIdentification(config=config)
+
+  val testFiles = arrayOf(
+    "./spoken-language-identification-test-wavs/ar-arabic.wav",
+    "./spoken-language-identification-test-wavs/bg-bulgarian.wav",
+    "./spoken-language-identification-test-wavs/de-german.wav",
+  )
+
+  for (waveFilename in testFiles) {
+    val waveData = WaveReader.readWaveFromFile(
+        filename = waveFilename,
+    )
+
+    val stream = slid.createStream()
+    stream.acceptWaveform(waveData.samples, sampleRate=waveData.sampleRate)
+    val lang = slid.compute(stream)
+    stream.release()
+    println(waveFilename)
+    println(lang)
+  }
+
+  slid.release()
+}
+
