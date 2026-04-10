@@ -2,3 +2,5 @@
 Cargo.lock
 .trash/
 /docs/
+CLAUDE.local.md
+.omx/
