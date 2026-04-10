@@ -143,10 +143,6 @@ static NATIVE_SAMPLE_RATE: AtomicU32 = AtomicU32::new(16000);
 /// Current audio RMS level (f32 bits stored as u32) — updated by audio tap callback.
 static AUDIO_RMS: AtomicU32 = AtomicU32::new(0);
 
-/// Current capsule display mode — read by WaveformView to pick bar color.
-/// 0 = none, MODE_DICTATION = red, MODE_CORRECT = blue/purple.
-static CAPSULE_DISPLAY_MODE: AtomicU8 = AtomicU8::new(0);
-
 /// Commands sent to the audio management thread.
 const CMD_START: u8 = 1;
 const CMD_STOP: u8 = 2;
@@ -1080,7 +1076,7 @@ define_class!(
             let min_height: f64 = 4.0;
             let cy = bounds.origin.y + bounds.size.height / 2.0;
 
-            let mode = CAPSULE_DISPLAY_MODE.load(Ordering::Relaxed);
+            let mode = SESSION_MODE.load(Ordering::Relaxed);
             let color = if mode == MODE_CORRECT {
                 // Blue-purple for correction mode
                 objc2_app_kit::NSColor::colorWithSRGBRed_green_blue_alpha(0.35, 0.45, 0.95, 0.9)
@@ -1249,7 +1245,6 @@ fn position_capsule(panel: &NSPanel, width: f64, mtm: MainThreadMarker) {
 }
 
 fn show_capsule(overlay: &CapsuleOverlay, mode: u8, mtm: MainThreadMarker) {
-    CAPSULE_DISPLAY_MODE.store(mode, Ordering::Relaxed);
     let panel = &overlay.panel;
     // Reset to minimum width
     let min_width =
@@ -2023,7 +2018,7 @@ fn main() {
                 IS_RECORDING.store(false, Ordering::Relaxed);
 
                 // Dictation: hide capsule immediately.
-                // Correction: keep capsule visible — will show "纠错中..." during LLM processing.
+                // Correction: keep capsule visible — will show "Correcting..." during LLM processing.
                 if mode == MODE_DICTATION {
                     hide_capsule(&capsule);
                 } else {
