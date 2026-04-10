@@ -5,6 +5,7 @@ use block2::RcBlock;
 use clap::Parser;
 use objc2::rc::Retained;
 use objc2_avf_audio::{AVAudioEngine, AVAudioPCMBuffer, AVAudioTime};
+use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -18,6 +19,10 @@ struct Args {
     #[arg(long, default_value_t = default_model_dir())]
     model_dir: String,
 
+    /// Model type: auto, transducer, paraformer
+    #[arg(long, default_value = "auto")]
+    model_type: String,
+
     /// Number of threads for inference
     #[arg(long, default_value_t = 4)]
     num_threads: i32,
@@ -26,6 +31,73 @@ struct Args {
 fn default_model_dir() -> String {
     let home = std::env::var("HOME").unwrap_or_default();
     format!("{home}/.local/share/picc/sherpa-onnx-streaming-zipformer-zh-xlarge-int8-2025-06-30")
+}
+
+fn pick_existing_file(model_dir: &Path, candidates: &[&str]) -> Option<String> {
+    candidates
+        .iter()
+        .map(|name| model_dir.join(name))
+        .find(|path| path.exists())
+        .map(|path| path.to_string_lossy().into_owned())
+}
+
+fn detect_model_kind(
+    model_dir: &Path,
+    requested: &str,
+) -> Result<recognizer::OnlineModelKind, String> {
+    match requested {
+        "transducer" => Ok(recognizer::OnlineModelKind::Transducer),
+        "paraformer" => Ok(recognizer::OnlineModelKind::Paraformer),
+        "auto" => {
+            if pick_existing_file(model_dir, &["joiner.int8.onnx", "joiner.onnx"]).is_some() {
+                Ok(recognizer::OnlineModelKind::Transducer)
+            } else if pick_existing_file(model_dir, &["encoder.int8.onnx", "encoder.onnx"])
+                .is_some()
+                && pick_existing_file(model_dir, &["decoder.int8.onnx", "decoder.onnx"]).is_some()
+            {
+                Ok(recognizer::OnlineModelKind::Paraformer)
+            } else {
+                Err(format!(
+                    "could not detect model type from {}",
+                    model_dir.display()
+                ))
+            }
+        }
+        other => Err(format!(
+            "unsupported --model-type: {other} (expected auto, transducer, paraformer)"
+        )),
+    }
+}
+
+fn build_online_config(model_dir: &Path, args: &Args) -> Result<recognizer::OnlineConfig, String> {
+    let tokens = model_dir.join("tokens.txt");
+    if !tokens.exists() {
+        return Err(format!("missing tokens.txt in {}", model_dir.display()));
+    }
+
+    let model_kind = detect_model_kind(model_dir, &args.model_type)?;
+    let encoder = pick_existing_file(model_dir, &["encoder.int8.onnx", "encoder.onnx"])
+        .ok_or_else(|| format!("missing encoder model in {}", model_dir.display()))?;
+    let decoder = pick_existing_file(model_dir, &["decoder.int8.onnx", "decoder.onnx"])
+        .ok_or_else(|| format!("missing decoder model in {}", model_dir.display()))?;
+
+    let joiner = match model_kind {
+        recognizer::OnlineModelKind::Transducer => Some(
+            pick_existing_file(model_dir, &["joiner.int8.onnx", "joiner.onnx"])
+                .ok_or_else(|| format!("missing joiner model in {}", model_dir.display()))?,
+        ),
+        recognizer::OnlineModelKind::Paraformer => None,
+    };
+
+    Ok(recognizer::OnlineConfig {
+        model_kind,
+        encoder,
+        decoder,
+        joiner,
+        tokens: tokens.to_string_lossy().into_owned(),
+        num_threads: args.num_threads,
+        ..Default::default()
+    })
 }
 
 type TapBlock = RcBlock<dyn Fn(NonNull<AVAudioPCMBuffer>, NonNull<AVAudioTime>)>;
@@ -72,35 +144,27 @@ fn setup_audio_engine(
 
 fn main() {
     let args = Args::parse();
-    let model_dir = std::path::PathBuf::from(&args.model_dir);
+    let model_dir = PathBuf::from(&args.model_dir);
 
-    // Verify model exists
-    if !model_dir.join("tokens.txt").exists() {
+    if !model_dir.exists() {
         eprintln!("Model not found at: {}", model_dir.display());
-        eprintln!(
-            "Download from: https://github.com/k2-fsa/sherpa-onnx/releases/tag/asr-models"
-        );
+        eprintln!("Download from: https://github.com/k2-fsa/sherpa-onnx/releases/tag/asr-models");
         std::process::exit(1);
     }
 
-    // Create recognizer
-    let config = recognizer::OnlineConfig {
-        encoder: model_dir
-            .join("encoder.int8.onnx")
-            .to_string_lossy()
-            .into(),
-        decoder: model_dir
-            .join("decoder.onnx")
-            .to_string_lossy()
-            .into(),
-        joiner: model_dir
-            .join("joiner.int8.onnx")
-            .to_string_lossy()
-            .into(),
-        tokens: model_dir.join("tokens.txt").to_string_lossy().into(),
-        num_threads: args.num_threads,
-        ..Default::default()
-    };
+    let config = build_online_config(&model_dir, &args).unwrap_or_else(|err| {
+        eprintln!("Invalid model directory: {err}");
+        eprintln!("Download from: https://github.com/k2-fsa/sherpa-onnx/releases/tag/asr-models");
+        std::process::exit(1);
+    });
+    eprintln!(
+        "Using {} model from {}",
+        match config.model_kind {
+            recognizer::OnlineModelKind::Transducer => "transducer",
+            recognizer::OnlineModelKind::Paraformer => "paraformer",
+        },
+        model_dir.display()
+    );
     let rec = recognizer::OnlineRecognizer::new(&config).expect("failed to create recognizer");
 
     // Audio buffer
@@ -109,9 +173,7 @@ fn main() {
 
     // Setup audio
     let (engine, native_rate, _tap_block) = setup_audio_engine(sample_buf.clone());
-    eprintln!(
-        "Listening... (native rate: {native_rate}Hz, Ctrl+C to stop)"
-    );
+    eprintln!("Listening... (native rate: {native_rate}Hz, Ctrl+C to stop)");
 
     // Ctrl+C handler
     let running_clone = running.clone();

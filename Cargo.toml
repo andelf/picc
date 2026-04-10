@@ -71,6 +71,10 @@ name = "voice-correct-v2"
 path = "src/bin/voice_correct_v2.rs"
 
 [[bin]]
+name = "key-test"
+path = "src/bin/key_test.rs"
+
+[[bin]]
 name = "clipcopy"
 path = "src/bin/clipcopy.rs"
 

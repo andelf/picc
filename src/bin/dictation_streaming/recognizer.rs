@@ -1,5 +1,11 @@
 use std::ffi::CString;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OnlineModelKind {
+    Transducer,
+    Paraformer,
+}
+
 /// Safe wrapper around sherpa-onnx Online Recognizer (streaming).
 pub struct OnlineRecognizer {
     recognizer: *const sherpa_rs::sherpa_rs_sys::SherpaOnnxOnlineRecognizer,
@@ -9,9 +15,10 @@ pub struct OnlineRecognizer {
 
 #[derive(Debug, Clone)]
 pub struct OnlineConfig {
+    pub model_kind: OnlineModelKind,
     pub encoder: String,
     pub decoder: String,
-    pub joiner: String,
+    pub joiner: Option<String>,
     pub tokens: String,
     pub num_threads: i32,
     pub provider: String,
@@ -26,9 +33,10 @@ pub struct OnlineConfig {
 impl Default for OnlineConfig {
     fn default() -> Self {
         Self {
+            model_kind: OnlineModelKind::Transducer,
             encoder: String::new(),
             decoder: String::new(),
-            joiner: String::new(),
+            joiner: None,
             tokens: String::new(),
             num_threads: 4,
             provider: "cpu".into(),
@@ -48,7 +56,10 @@ impl OnlineRecognizer {
 
         let encoder = CString::new(config.encoder.as_str()).unwrap();
         let decoder = CString::new(config.decoder.as_str()).unwrap();
-        let joiner = CString::new(config.joiner.as_str()).unwrap();
+        let joiner = config
+            .joiner
+            .as_ref()
+            .map(|s| CString::new(s.as_str()).unwrap());
         let tokens = CString::new(config.tokens.as_str()).unwrap();
         let provider = CString::new(config.provider.as_str()).unwrap();
         let decoding_method = CString::new("greedy_search").unwrap();
@@ -59,9 +70,18 @@ impl OnlineRecognizer {
             c_config.feat_config.sample_rate = config.sample_rate;
             c_config.feat_config.feature_dim = config.feature_dim;
 
-            c_config.model_config.transducer.encoder = encoder.as_ptr();
-            c_config.model_config.transducer.decoder = decoder.as_ptr();
-            c_config.model_config.transducer.joiner = joiner.as_ptr();
+            match config.model_kind {
+                OnlineModelKind::Transducer => {
+                    c_config.model_config.transducer.encoder = encoder.as_ptr();
+                    c_config.model_config.transducer.decoder = decoder.as_ptr();
+                    c_config.model_config.transducer.joiner =
+                        joiner.as_ref().map_or(std::ptr::null(), |s| s.as_ptr());
+                }
+                OnlineModelKind::Paraformer => {
+                    c_config.model_config.paraformer.encoder = encoder.as_ptr();
+                    c_config.model_config.paraformer.decoder = decoder.as_ptr();
+                }
+            }
             c_config.model_config.tokens = tokens.as_ptr();
             c_config.model_config.num_threads = config.num_threads;
             c_config.model_config.provider = provider.as_ptr();
@@ -131,18 +151,15 @@ impl OnlineRecognizer {
     /// Check if an endpoint (silence after speech) was detected.
     pub fn is_endpoint(&self) -> bool {
         unsafe {
-            sherpa_rs::sherpa_rs_sys::SherpaOnnxOnlineStreamIsEndpoint(
-                self.recognizer, self.stream,
-            ) != 0
+            sherpa_rs::sherpa_rs_sys::SherpaOnnxOnlineStreamIsEndpoint(self.recognizer, self.stream)
+                != 0
         }
     }
 
     /// Reset the stream for the next utterance (call after endpoint).
     pub fn reset(&self) {
         unsafe {
-            sherpa_rs::sherpa_rs_sys::SherpaOnnxOnlineStreamReset(
-                self.recognizer, self.stream,
-            );
+            sherpa_rs::sherpa_rs_sys::SherpaOnnxOnlineStreamReset(self.recognizer, self.stream);
         }
     }
 
