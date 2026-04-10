@@ -143,6 +143,10 @@ static NATIVE_SAMPLE_RATE: AtomicU32 = AtomicU32::new(16000);
 /// Current audio RMS level (f32 bits stored as u32) — updated by audio tap callback.
 static AUDIO_RMS: AtomicU32 = AtomicU32::new(0);
 
+/// Current capsule display mode — read by WaveformView to pick bar color.
+/// 0 = none, MODE_DICTATION = red, MODE_CORRECT = blue/purple.
+static CAPSULE_DISPLAY_MODE: AtomicU8 = AtomicU8::new(0);
+
 /// Commands sent to the audio management thread.
 const CMD_START: u8 = 1;
 const CMD_STOP: u8 = 2;
@@ -1076,8 +1080,15 @@ define_class!(
             let min_height: f64 = 4.0;
             let cy = bounds.origin.y + bounds.size.height / 2.0;
 
-            objc2_app_kit::NSColor::colorWithSRGBRed_green_blue_alpha(0.95, 0.22, 0.22, 0.9)
-                .setFill();
+            let mode = CAPSULE_DISPLAY_MODE.load(Ordering::Relaxed);
+            let color = if mode == MODE_CORRECT {
+                // Blue-purple for correction mode
+                objc2_app_kit::NSColor::colorWithSRGBRed_green_blue_alpha(0.35, 0.45, 0.95, 0.9)
+            } else {
+                // Red for dictation mode
+                objc2_app_kit::NSColor::colorWithSRGBRed_green_blue_alpha(0.95, 0.22, 0.22, 0.9)
+            };
+            color.setFill();
 
             for (i, bar_level) in BAR_LEVELS.iter().enumerate().take(bar_count) {
                 let level = f32::from_bits(bar_level.load(Ordering::Relaxed));
@@ -1178,7 +1189,14 @@ fn create_capsule_overlay(mtm: MainThreadMarker) -> CapsuleOverlay {
     };
 
     // Text label — vertically centered
-    let label_font = NSFont::systemFontOfSize(18.0);
+    let label_font = unsafe {
+        // SF Pro Rounded, medium weight — softer look for the HUD capsule
+        let base = NSFont::systemFontOfSize_weight(18.0, objc2_app_kit::NSFontWeightMedium);
+        let desc = base.fontDescriptor();
+        desc.fontDescriptorWithDesign(objc2_app_kit::NSFontDescriptorSystemDesignRounded)
+            .and_then(|d| NSFont::fontWithDescriptor_size(&d, 18.0))
+            .unwrap_or(base)
+    };
     let label_x = CAPSULE_PADDING_LEFT + WAVEFORM_WIDTH + GAP;
     let label = NSTextField::initWithFrame(
         NSTextField::alloc(mtm),
@@ -1230,13 +1248,19 @@ fn position_capsule(panel: &NSPanel, width: f64, mtm: MainThreadMarker) {
     );
 }
 
-fn show_capsule(overlay: &CapsuleOverlay, mtm: MainThreadMarker) {
+fn show_capsule(overlay: &CapsuleOverlay, mode: u8, mtm: MainThreadMarker) {
+    CAPSULE_DISPLAY_MODE.store(mode, Ordering::Relaxed);
     let panel = &overlay.panel;
     // Reset to minimum width
     let min_width =
         CAPSULE_PADDING_LEFT + WAVEFORM_WIDTH + GAP + TEXT_MIN_WIDTH + CAPSULE_PADDING_RIGHT;
     overlay.current_width.set(min_width);
-    overlay.text_label.setStringValue(&NSString::from_str(""));
+    let hint = if mode == MODE_CORRECT {
+        "Correcting..."
+    } else {
+        "Dictating..."
+    };
+    overlay.text_label.setStringValue(&NSString::from_str(hint));
     position_capsule(panel, min_width, mtm);
 
     // Resize effect view
@@ -1654,12 +1678,21 @@ fn main() {
                 if tick % 5 == 0 {
                     let frame = (tick / 5) as usize % PROCESSING_ICONS.len();
                     set_status_icon_name(&status_item, PROCESSING_ICONS[frame], mtm);
+
+                    // Animate capsule text dots
+                    let dots = match frame % 3 {
+                        0 => "Correcting.",
+                        1 => "Correcting..",
+                        _ => "Correcting...",
+                    };
+                    update_capsule_text(&capsule, dots, mtm);
                 }
 
                 // Check if LLM result has arrived
                 if let Ok(mut r) = LLM_RESULT.try_lock() {
                     if let Some(result) = r.take() {
                         is_processing.set(false);
+                        hide_capsule(&capsule);
                         let original = correction_original.take().unwrap_or_default();
                         match result {
                             Ok(corrected) if corrected != original => {
@@ -1758,7 +1791,7 @@ fn main() {
                 set_status_icon(&status_item, icon, mtm);
                 play_start_sound();
                 AUDIO_RMS.store(0, Ordering::Relaxed);
-                show_capsule(&capsule, mtm);
+                show_capsule(&capsule, mode, mtm);
                 debug!("TIMER → START [1]: icon set, sound played, capsule shown");
 
                 if use_sensevoice {
@@ -1988,7 +2021,19 @@ fn main() {
                 );
                 is_recording.set(false);
                 IS_RECORDING.store(false, Ordering::Relaxed);
-                hide_capsule(&capsule);
+
+                // Dictation: hide capsule immediately.
+                // Correction: keep capsule visible — will show "纠错中..." during LLM processing.
+                if mode == MODE_DICTATION {
+                    hide_capsule(&capsule);
+                } else {
+                    // Stop waveform animation, show processing hint
+                    for bar in &BAR_LEVELS {
+                        bar.store(0, Ordering::Relaxed);
+                    }
+                    capsule.waveform_view.setNeedsDisplay(true);
+                    update_capsule_text(&capsule, "Correcting...", mtm);
+                }
 
                 let spoken: String;
 
@@ -2095,6 +2140,7 @@ fn main() {
                 // Empty speech → skip entirely
                 if spoken.is_empty() {
                     debug!("TIMER → STOP: no speech recognized, resetting to idle");
+                    hide_capsule(&capsule);
                     set_status_icon(&status_item, AppState::Idle, mtm);
                     return;
                 }
@@ -2142,6 +2188,7 @@ fn main() {
                     // Skip if a previous LLM call is still in flight
                     if is_processing.get() {
                         warn!("still processing previous correction, skipping");
+                        hide_capsule(&capsule);
                         set_status_icon(&status_item, AppState::Idle, mtm);
                         return;
                     }
@@ -2152,6 +2199,7 @@ fn main() {
                     // Terminals: AXValue returns entire buffer, skip reading
                     if matches_bundle_list(&app_name, SKIP_AX_READ_BUNDLES) {
                         info!(text = %spoken, "terminal app, typing instead");
+                        hide_capsule(&capsule);
                         type_text(&spoken);
                         set_status_icon(&status_item, AppState::Idle, mtm);
                         return;
@@ -2166,6 +2214,7 @@ fn main() {
                                     len = trimmed.chars().count(),
                                     "text too long (>250 chars), typing instead"
                                 );
+                                hide_capsule(&capsule);
                                 type_text(&spoken);
                                 set_status_icon(&status_item, AppState::Idle, mtm);
                                 return;
@@ -2202,6 +2251,7 @@ fn main() {
                         None => {
                             // Empty field → fall back to typing (no LLM call)
                             info!(text = %spoken, "field empty, typing instead");
+                            hide_capsule(&capsule);
                             type_text(&spoken);
                             set_status_icon(&status_item, AppState::Idle, mtm);
                         }
