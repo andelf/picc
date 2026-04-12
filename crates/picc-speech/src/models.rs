@@ -193,6 +193,37 @@ pub fn resolve_repo_parakeet_de_paths(
     })
 }
 
+const SILERO_VAD_FILENAME: &str = "silero_vad.onnx";
+const SILERO_VAD_URL: &str =
+    "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/silero_vad.onnx";
+
+/// Resolve (and auto-download) the Silero VAD model path.
+/// Returns the full path to `silero_vad.onnx` under `base_dir`.
+pub fn resolve_silero_vad_model_path(base_dir: &Path) -> Result<String, String> {
+    let model_path = base_dir.join(SILERO_VAD_FILENAME);
+    if model_path.exists() {
+        return Ok(model_path.to_string_lossy().into_owned());
+    }
+
+    eprintln!("[vad] silero_vad.onnx not found at {}", model_path.display());
+    eprintln!("[vad] downloading Silero VAD model...");
+    std::fs::create_dir_all(base_dir).map_err(|e| format!("create model directory: {e}"))?;
+
+    let resp = reqwest::blocking::Client::new()
+        .get(SILERO_VAD_URL)
+        .send()
+        .map_err(|e| format!("download request failed: {e}"))?;
+    if !resp.status().is_success() {
+        return Err(format!("download failed: HTTP {}", resp.status()));
+    }
+    let bytes = resp.bytes().map_err(|e| format!("download read: {e}"))?;
+    let size_mb = bytes.len() as f64 / 1_048_576.0;
+    std::fs::write(&model_path, &bytes).map_err(|e| format!("write model: {e}"))?;
+    eprintln!("[vad] downloaded {size_mb:.1} MB → {}", model_path.display());
+
+    Ok(model_path.to_string_lossy().into_owned())
+}
+
 fn pick_existing_file(model_dir: &Path, names: &[&str]) -> Result<String, String> {
     for name in names {
         let path = model_dir.join(name);

@@ -51,6 +51,8 @@ use picc_macos_app::{
 use picc_macos_input::{parse_key_combo, press_key_combo, type_text};
 #[cfg(feature = "sensevoice")]
 use picc_speech::models::{resolve_repo_parakeet_de_paths, resolve_repo_sensevoice_paths};
+#[cfg(feature = "sensevoice")]
+use picc_speech::resolve_silero_vad_model_path;
 use picc_speech::postprocess::{apply_dictation_transforms, DictationOptions};
 #[cfg(feature = "sensevoice")]
 use picc_speech::resample_linear;
@@ -124,6 +126,7 @@ static AUDIO_RMS: AtomicU32 = AtomicU32::new(0);
 struct MenuDelegateIvars {
     options: Cell<DictationOptions>,
     punct_spaces_item: RefCell<Option<Retained<NSMenuItem>>>,
+    vad_enabled: Cell<bool>,
 }
 
 impl std::fmt::Debug for MenuDelegateIvars {
@@ -278,6 +281,16 @@ define_class!(
                 enabled = opts.strip_trailing_punct,
                 "strip trailing punctuation"
             );
+        }
+
+        #[unsafe(method(toggleVad:))]
+        fn toggle_vad(&self, sender: &AnyObject) {
+            let enabled = !self.ivars().vad_enabled.get();
+            self.ivars().vad_enabled.set(enabled);
+
+            let item: &NSMenuItem = unsafe { &*(sender as *const AnyObject as *const NSMenuItem) };
+            item.setState(if enabled { 1 } else { 0 });
+            info!(enabled, "auto segment (VAD)");
         }
     }
 );
@@ -649,7 +662,7 @@ fn create_capsule_overlay(mtm: MainThreadMarker) -> CapsuleOverlay {
 
     // Text label — SF Pro Rounded for a softer look matching the capsule shape.
     let label_font = unsafe {
-        let base = NSFont::systemFontOfSize_weight(17.0, objc2_app_kit::NSFontWeightMedium);
+        let base = NSFont::systemFontOfSize_weight(17.0, objc2_app_kit::NSFontWeightRegular);
         base.fontDescriptor()
             .fontDescriptorWithDesign(NSFontDescriptorSystemDesignRounded)
             .and_then(|desc| NSFont::fontWithDescriptor_size(&desc, 17.0))
@@ -899,8 +912,9 @@ fn main() {
     }
 
     // --- SenseVoice recognizer (if needed) ---
+    // Wrapped in Arc<Mutex> so background ASR threads can borrow.
     #[cfg(feature = "sensevoice")]
-    let sv_recognizer: Cell<Option<sherpa_rs::sense_voice::SenseVoiceRecognizer>> =
+    let sv_recognizer: Arc<Mutex<Option<sherpa_rs::sense_voice::SenseVoiceRecognizer>>> =
         if use_sensevoice {
             let home = std::env::var("HOME").unwrap();
             let base = Path::new(&home).join(".local/share/picc");
@@ -923,13 +937,13 @@ fn main() {
             let recognizer = sherpa_rs::sense_voice::SenseVoiceRecognizer::new(config)
                 .expect("failed to init SenseVoice — check --model-dir/--model-file-name");
             info!("SenseVoice model loaded");
-            Cell::new(Some(recognizer))
+            Arc::new(Mutex::new(Some(recognizer)))
         } else {
-            Cell::new(None)
+            Arc::new(Mutex::new(None))
         };
 
     #[cfg(feature = "sensevoice")]
-    let parakeet_recognizer: Cell<Option<sherpa_rs::transducer::TransducerRecognizer>> =
+    let parakeet_recognizer: Arc<Mutex<Option<sherpa_rs::transducer::TransducerRecognizer>>> =
         if use_parakeet_de {
             let home = std::env::var("HOME").unwrap();
             let base = Path::new(&home).join(".local/share/picc");
@@ -958,10 +972,37 @@ fn main() {
             let recognizer = sherpa_rs::transducer::TransducerRecognizer::new(config)
                 .expect("failed to init Parakeet — check --model-dir");
             info!("Parakeet model loaded");
-            Cell::new(Some(recognizer))
+            Arc::new(Mutex::new(Some(recognizer)))
         } else {
-            Cell::new(None)
+            Arc::new(Mutex::new(None))
         };
+
+    // --- Silero VAD (if offline ASR) ---
+    #[cfg(feature = "sensevoice")]
+    let silero_vad: Option<RefCell<sherpa_rs::silero_vad::SileroVad>> = if use_offline_asr {
+        let home = std::env::var("HOME").unwrap();
+        let base = Path::new(&home).join(".local/share/picc");
+        let vad_model = resolve_silero_vad_model_path(&base)
+            .expect("failed to resolve Silero VAD model path");
+        info!(model = %vad_model, "loading Silero VAD");
+        let vad = sherpa_rs::silero_vad::SileroVad::new(
+            sherpa_rs::silero_vad::SileroVadConfig {
+                model: vad_model,
+                min_silence_duration: 1.0,
+                min_speech_duration: 0.25,
+                threshold: 0.5,
+                sample_rate: 16000,
+                window_size: 512,
+                ..Default::default()
+            },
+            60.0,
+        )
+        .expect("failed to init Silero VAD");
+        info!("Silero VAD loaded");
+        Some(RefCell::new(vad))
+    } else {
+        None
+    };
 
     // --- Apple speech recognizer (if needed) ---
     let apple_recognizer = if !use_offline_asr {
@@ -1021,6 +1062,7 @@ fn main() {
         let this = MenuDelegate::alloc(mtm).set_ivars(MenuDelegateIvars {
             options: Cell::new(DictationOptions::default()),
             punct_spaces_item: RefCell::new(None),
+            vad_enabled: Cell::new(true),
         });
         unsafe { objc2::msg_send![super(this), init] }
     };
@@ -1067,10 +1109,28 @@ fn main() {
     );
     unsafe { strip_item.setTarget(Some(&delegate)) };
 
+    // Toggle: auto segment (VAD)
+    let vad_item = new_menu_item(
+        mtm,
+        "Auto Segment (VAD)",
+        Some(sel!(toggleVad:)),
+        "",
+    );
+    unsafe { vad_item.setTarget(Some(&delegate)) };
+    if use_offline_asr {
+        vad_item.setState(1); // on by default for offline engines
+    } else {
+        // Apple Speech is already streaming — VAD toggle not applicable
+        vad_item.setEnabled(false);
+        vad_item.setState(0);
+    }
+
     menu.addItem(&fw_item);
     menu.addItem(&punct_spaces_item);
     menu.addItem(&cjk_spaces_item);
     menu.addItem(&strip_item);
+    menu.addItem(&NSMenuItem::separatorItem(mtm));
+    menu.addItem(&vad_item);
     menu.addItem(&NSMenuItem::separatorItem(mtm));
     menu.addItem(&quit_item);
     status_item.setMenu(Some(&menu));
@@ -1099,6 +1159,17 @@ fn main() {
     let accumulated_samples: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
     let native_sample_rate: Cell<u32> = Cell::new(16000);
 
+    // --- VAD segmented recognition state (offline ASR only) ---
+    // Tracks how many samples from accumulated_samples have been fed to VAD.
+    let vad_cursor: Cell<usize> = Cell::new(0);
+    // Resampled (16kHz) buffer for incremental VAD feeding.
+    let vad_resampled_buf: RefCell<Vec<f32>> = RefCell::new(Vec::new());
+    // Partial ASR results from background threads, in order.
+    let partial_results: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    // Number of ASR segments currently being recognized in background threads.
+    let pending_asr: Arc<std::sync::atomic::AtomicU32> =
+        Arc::new(std::sync::atomic::AtomicU32::new(0));
+
     let _tap = tap;
     let _run_loop_source = run_loop_source;
 
@@ -1108,6 +1179,12 @@ fn main() {
     // --- Timer (50ms polling) ---
     let _timer = unsafe {
         let samples_ref = accumulated_samples.clone();
+        let partial_results_ref = partial_results.clone();
+        let pending_asr_ref = pending_asr.clone();
+        #[cfg(feature = "sensevoice")]
+        let sv_recognizer_ref = sv_recognizer.clone();
+        #[cfg(feature = "sensevoice")]
+        let parakeet_recognizer_ref = parakeet_recognizer.clone();
         let delegate = delegate.clone();
 
         // Counter for recording heartbeat (logs every ~2s)
@@ -1149,6 +1226,127 @@ fn main() {
                     if let Ok(text) = RECOGNIZED_TEXT.lock() {
                         if !text.is_empty() {
                             update_capsule_text(&capsule, &text, mtm);
+                        }
+                    }
+                }
+
+                // --- VAD segmented recognition (offline ASR path) ---
+                #[cfg(feature = "sensevoice")]
+                if use_offline_asr && delegate.ivars().vad_enabled.get() {
+                    if let Some(ref vad_cell) = silero_vad {
+                        // 1. Drain new samples from accumulated_samples
+                        let new_samples = if let Ok(all) = samples_ref.try_lock() {
+                            let cursor = vad_cursor.get();
+                            if all.len() > cursor {
+                                let chunk = all[cursor..].to_vec();
+                                vad_cursor.set(all.len());
+                                Some(chunk)
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+
+                        if let Some(raw) = new_samples {
+                            // 2. Resample to 16kHz
+                            let sr = native_sample_rate.get();
+                            let resampled = resample_linear(&raw, sr, 16000);
+                            let mut buf = vad_resampled_buf.borrow_mut();
+                            buf.extend_from_slice(&resampled);
+
+                            // 3. Feed VAD in 512-sample windows
+                            let mut vad = vad_cell.borrow_mut();
+                            let window = 512;
+                            let mut consumed = 0;
+                            while consumed + window <= buf.len() {
+                                let chunk = buf[consumed..consumed + window].to_vec();
+                                vad.accept_waveform(chunk);
+                                consumed += window;
+                            }
+                            // Keep unconsumed tail
+                            if consumed > 0 {
+                                buf.drain(..consumed);
+                            }
+
+                            // 4. Extract completed speech segments
+                            while !vad.is_empty() {
+                                let segment = vad.front();
+                                vad.pop();
+                                let seg_samples = segment.samples;
+                                if seg_samples.is_empty() {
+                                    continue;
+                                }
+                                let seg_duration = seg_samples.len() as f64 / 16000.0;
+                                info!(
+                                    duration_s = format_args!("{:.1}", seg_duration),
+                                    pending = pending_asr_ref.load(Ordering::Relaxed) + 1,
+                                    "VAD segment → background ASR"
+                                );
+                                // 5. Dispatch to background ASR thread
+                                let results = partial_results_ref.clone();
+                                let pending = pending_asr_ref.clone();
+                                pending.fetch_add(1, Ordering::Relaxed);
+                                let idx = results.lock().unwrap().len();
+                                // Reserve a slot so ordering is preserved
+                                results.lock().unwrap().push(String::new());
+
+                                if use_sensevoice {
+                                    let rec = sv_recognizer_ref.clone();
+                                    std::thread::spawn(move || {
+                                        let text = if let Ok(mut guard) = rec.lock() {
+                                            if let Some(ref mut r) = *guard {
+                                                let t0 = std::time::Instant::now();
+                                                let result = r.transcribe(16000, &seg_samples);
+                                                let ms = t0.elapsed().as_secs_f64() * 1000.0;
+                                                info!(
+                                                    text = %result.text,
+                                                    elapsed_ms = format_args!("{:.0}", ms),
+                                                    "VAD segment ASR done"
+                                                );
+                                                result.text.clone()
+                                            } else { String::new() }
+                                        } else { String::new() };
+                                        if let Ok(mut r) = results.lock() {
+                                            if idx < r.len() { r[idx] = text; }
+                                        }
+                                        pending.fetch_sub(1, Ordering::Relaxed);
+                                    });
+                                } else if use_parakeet_de {
+                                    let rec = parakeet_recognizer_ref.clone();
+                                    std::thread::spawn(move || {
+                                        let text = if let Ok(mut guard) = rec.lock() {
+                                            if let Some(ref mut r) = *guard {
+                                                let t0 = std::time::Instant::now();
+                                                let result = r.transcribe(16000, &seg_samples);
+                                                let ms = t0.elapsed().as_secs_f64() * 1000.0;
+                                                info!(
+                                                    text = %result,
+                                                    elapsed_ms = format_args!("{:.0}", ms),
+                                                    "VAD segment ASR done"
+                                                );
+                                                result
+                                            } else { String::new() }
+                                        } else { String::new() };
+                                        if let Ok(mut r) = results.lock() {
+                                            if idx < r.len() { r[idx] = text; }
+                                        }
+                                        pending.fetch_sub(1, Ordering::Relaxed);
+                                    });
+                                }
+                            }
+                        }
+
+                        // 6. Update capsule with partial results
+                        if let Ok(results) = partial_results_ref.try_lock() {
+                            let joined: String = results.iter()
+                                .filter(|s| !s.is_empty())
+                                .cloned()
+                                .collect::<Vec<_>>()
+                                .join("");
+                            if !joined.is_empty() {
+                                update_capsule_text(&capsule, &joined, mtm);
+                            }
                         }
                     }
                 }
@@ -1213,6 +1411,15 @@ fn main() {
                     if let Ok(mut s) = samples_ref.lock() {
                         s.clear();
                     }
+                    // Clear VAD state
+                    #[cfg(feature = "sensevoice")]
+                    if let Some(ref vad_cell) = silero_vad {
+                        vad_cell.borrow_mut().clear();
+                    }
+                    vad_cursor.set(0);
+                    vad_resampled_buf.borrow_mut().clear();
+                    if let Ok(mut r) = partial_results_ref.lock() { r.clear(); }
+                    pending_asr_ref.store(0, Ordering::Relaxed);
                     debug!("TIMER → CANCEL: engine stopped");
                 } else {
                     audio_engine.stop_and_reset();
@@ -1252,6 +1459,17 @@ fn main() {
                 play_start_sound();
                 AUDIO_RMS.store(0, Ordering::Relaxed);
                 show_capsule(&capsule, mode, mtm);
+
+                // Reset VAD state for new session
+                vad_cursor.set(0);
+                vad_resampled_buf.borrow_mut().clear();
+                if let Ok(mut r) = partial_results_ref.lock() { r.clear(); }
+                pending_asr_ref.store(0, Ordering::Relaxed);
+                #[cfg(feature = "sensevoice")]
+                if let Some(ref vad_cell) = silero_vad {
+                    vad_cell.borrow_mut().clear();
+                }
+
                 debug!("TIMER → START [1]: icon set, sound played, capsule shown");
 
                 if use_offline_asr {
@@ -1400,7 +1618,7 @@ fn main() {
                     update_capsule_text(&capsule, "Correcting...", mtm);
                 }
 
-                let spoken: String;
+                let mut spoken: String;
 
                 if use_offline_asr {
                     COLLECTING.store(false, Ordering::Relaxed);
@@ -1410,65 +1628,158 @@ fn main() {
 
                     #[cfg(feature = "sensevoice")]
                     {
-                        let raw_samples = loop {
-                            match samples_ref.try_lock() {
-                                Ok(guard) => break guard,
-                                Err(_) => std::thread::sleep(Duration::from_millis(1)),
+                        let vad_active = delegate.ivars().vad_enabled.get();
+
+                        // Helper: whole-buffer recognition (used when VAD is off,
+                        // or as fallback when VAD produces no segments).
+                        let whole_buffer_recognize = |sr: u32| -> String {
+                            let raw_samples = loop {
+                                match samples_ref.try_lock() {
+                                    Ok(guard) => break guard,
+                                    Err(_) => std::thread::sleep(Duration::from_millis(1)),
+                                }
+                            };
+                            if raw_samples.is_empty() {
+                                return String::new();
                             }
+                            let samples_16k = resample_linear(&raw_samples, sr, 16000);
+                            drop(raw_samples);
+                            info!(
+                                duration_s = format_args!("{:.1}", samples_16k.len() as f64 / 16000.0),
+                                "whole-buffer ASR"
+                            );
+                            if use_sensevoice {
+                                if let Ok(mut guard) = sv_recognizer_ref.lock() {
+                                    if let Some(ref mut r) = *guard {
+                                        let t0 = std::time::Instant::now();
+                                        let result = r.transcribe(16000, &samples_16k);
+                                        let ms = t0.elapsed().as_secs_f64() * 1000.0;
+                                        info!(text = %result.text, elapsed_ms = format_args!("{:.0}", ms), "ASR result");
+                                        return result.text.clone();
+                                    }
+                                }
+                            } else if use_parakeet_de {
+                                if let Ok(mut guard) = parakeet_recognizer_ref.lock() {
+                                    if let Some(ref mut r) = *guard {
+                                        let t0 = std::time::Instant::now();
+                                        let result = r.transcribe(16000, &samples_16k);
+                                        let ms = t0.elapsed().as_secs_f64() * 1000.0;
+                                        info!(text = %result, elapsed_ms = format_args!("{:.0}", ms), "ASR result");
+                                        return result;
+                                    }
+                                }
+                            }
+                            String::new()
                         };
-                        if raw_samples.is_empty() {
-                            warn!("no audio captured");
-                            set_status_icon(&status_item, AppState::Idle, mtm);
-                            return;
-                        }
-                        let sr = native_sample_rate.get();
-                        let samples_16k = resample_linear(&raw_samples, sr, 16000);
-                        drop(raw_samples);
-                        info!(
-                            duration_s = format_args!("{:.1}", samples_16k.len() as f64 / 16000.0),
-                            "transcribing audio"
-                        );
-                        if use_sensevoice {
-                            if let Some(mut recognizer) = sv_recognizer.take() {
-                                let t0 = std::time::Instant::now();
-                                let result = recognizer.transcribe(16000, &samples_16k);
-                                let ms = t0.elapsed().as_secs_f64() * 1000.0;
-                                info!(
-                                    text = %result.text,
-                                    lang = %result.lang,
-                                    token_count = result.tokens.len(),
-                                    timestamp_count = result.timestamps.len(),
-                                    elapsed_ms = format_args!("{:.0}", ms),
-                                    "ASR result"
-                                );
-                                debug!(
-                                    tokens = ?result.tokens,
-                                    timestamps = ?result.timestamps,
-                                    "ASR metadata"
-                                );
-                                spoken = result.text.clone();
-                                sv_recognizer.set(Some(recognizer));
+
+                        if vad_active {
+                            // --- VAD path: flush remaining + combine partial results ---
+                            let remaining_text = if let Some(ref vad_cell) = silero_vad {
+                                let raw_tail = {
+                                    let all = loop {
+                                        match samples_ref.try_lock() {
+                                            Ok(guard) => break guard,
+                                            Err(_) => std::thread::sleep(Duration::from_millis(1)),
+                                        }
+                                    };
+                                    let cursor = vad_cursor.get();
+                                    if all.len() > cursor {
+                                        Some(all[cursor..].to_vec())
+                                    } else {
+                                        None
+                                    }
+                                };
+
+                                let mut vad = vad_cell.borrow_mut();
+
+                                if let Some(raw) = raw_tail {
+                                    let sr = native_sample_rate.get();
+                                    let resampled = resample_linear(&raw, sr, 16000);
+                                    let mut buf = vad_resampled_buf.borrow_mut();
+                                    buf.extend_from_slice(&resampled);
+
+                                    let window = 512;
+                                    let mut consumed = 0;
+                                    while consumed + window <= buf.len() {
+                                        let chunk = buf[consumed..consumed + window].to_vec();
+                                        vad.accept_waveform(chunk);
+                                        consumed += window;
+                                    }
+                                    buf.clear();
+                                }
+
+                                vad.flush();
+
+                                let mut tail_texts = Vec::new();
+                                while !vad.is_empty() {
+                                    let segment = vad.front();
+                                    vad.pop();
+                                    if segment.samples.is_empty() {
+                                        continue;
+                                    }
+                                    let seg_duration = segment.samples.len() as f64 / 16000.0;
+                                    info!(
+                                        duration_s = format_args!("{:.1}", seg_duration),
+                                        "VAD flush segment → sync ASR"
+                                    );
+                                    if use_sensevoice {
+                                        if let Ok(mut guard) = sv_recognizer_ref.lock() {
+                                            if let Some(ref mut r) = *guard {
+                                                let t0 = std::time::Instant::now();
+                                                let result = r.transcribe(16000, &segment.samples);
+                                                let ms = t0.elapsed().as_secs_f64() * 1000.0;
+                                                info!(text = %result.text, elapsed_ms = format_args!("{:.0}", ms), "flush ASR done");
+                                                tail_texts.push(result.text.clone());
+                                            }
+                                        }
+                                    } else if use_parakeet_de {
+                                        if let Ok(mut guard) = parakeet_recognizer_ref.lock() {
+                                            if let Some(ref mut r) = *guard {
+                                                let t0 = std::time::Instant::now();
+                                                let result = r.transcribe(16000, &segment.samples);
+                                                let ms = t0.elapsed().as_secs_f64() * 1000.0;
+                                                info!(text = %result, elapsed_ms = format_args!("{:.0}", ms), "flush ASR done");
+                                                tail_texts.push(result);
+                                            }
+                                        }
+                                    }
+                                }
+                                tail_texts.join("")
                             } else {
-                                spoken = String::new();
+                                String::new()
+                            };
+
+                            // Wait for background ASR threads (timeout 10s)
+                            let wait_start = std::time::Instant::now();
+                            while pending_asr_ref.load(Ordering::Relaxed) > 0 {
+                                if wait_start.elapsed() > Duration::from_secs(10) {
+                                    warn!("timed out waiting for background ASR threads");
+                                    break;
+                                }
+                                std::thread::sleep(Duration::from_millis(10));
                             }
-                        } else if use_parakeet_de {
-                            if let Some(mut recognizer) = parakeet_recognizer.take() {
-                                let t0 = std::time::Instant::now();
-                                let result = recognizer.transcribe(16000, &samples_16k);
-                                let ms = t0.elapsed().as_secs_f64() * 1000.0;
-                                info!(
-                                    text = %result,
-                                    elapsed_ms = format_args!("{:.0}", ms),
-                                    "ASR result"
-                                );
-                                spoken = result;
-                                parakeet_recognizer.set(Some(recognizer));
-                            } else {
-                                spoken = String::new();
+
+                            // Combine partial results + remaining text
+                            let mut all_parts: Vec<String> = partial_results_ref
+                                .lock()
+                                .map(|r| r.iter().filter(|s| !s.is_empty()).cloned().collect())
+                                .unwrap_or_default();
+                            if !remaining_text.is_empty() {
+                                all_parts.push(remaining_text);
+                            }
+                            spoken = all_parts.join("");
+
+                            // Fallback if VAD produced nothing
+                            if spoken.is_empty() {
+                                info!("VAD produced no segments, fallback to whole-buffer ASR");
+                                spoken = whole_buffer_recognize(native_sample_rate.get());
                             }
                         } else {
-                            spoken = String::new();
+                            // --- Non-VAD path: whole-buffer recognition ---
+                            spoken = whole_buffer_recognize(native_sample_rate.get());
                         }
+
+                        info!(text = %spoken, vad = vad_active, "final ASR result");
                     }
                     #[cfg(not(feature = "sensevoice"))]
                     {

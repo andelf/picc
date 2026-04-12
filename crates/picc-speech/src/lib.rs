@@ -23,7 +23,7 @@ pub use hotkey::{
 };
 pub use models::{
     ensure_tar_bz2_model, resolve_repo_parakeet_de_paths, resolve_repo_sensevoice_paths,
-    ModelArchiveSpec, ModelPaths, TransducerModelPaths,
+    resolve_silero_vad_model_path, ModelArchiveSpec, ModelPaths, TransducerModelPaths,
 };
 pub use postprocess::{apply_dictation_transforms, auto_insert_spaces, DictationOptions};
 pub use session::{
