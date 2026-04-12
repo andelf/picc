@@ -18,11 +18,12 @@ use block2::RcBlock;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject, NSObject};
 use objc2::{define_class, msg_send, sel, MainThreadMarker, MainThreadOnly};
-use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSImage, NSMenu, NSMenuItem, NSStatusBar,
-    NSStatusItem,
-};
+use objc2_app_kit::{NSApplication, NSMenu, NSMenuItem, NSStatusItem};
 use objc2_foundation::{NSString, NSTimer};
+use picc_macos_app::{
+    configure_accessory_app, new_menu_item as shared_new_menu_item, new_status_item,
+    set_status_button_symbol,
+};
 use serde::{Deserialize, Serialize};
 
 // -- 常量 --
@@ -137,24 +138,11 @@ fn new_menu_item(
     action: Option<objc2::runtime::Sel>,
     key: &str,
 ) -> Retained<NSMenuItem> {
-    unsafe {
-        NSMenuItem::initWithTitle_action_keyEquivalent(
-            NSMenuItem::alloc(mtm),
-            &NSString::from_str(title),
-            action,
-            &NSString::from_str(key),
-        )
-    }
+    shared_new_menu_item(mtm, title, action, key)
 }
 
 fn set_button_icon(button: &objc2_app_kit::NSStatusBarButton, name: &str) {
-    if let Some(image) = NSImage::imageWithSystemSymbolName_accessibilityDescription(
-        &NSString::from_str(name),
-        Some(&NSString::from_str("Claude Status")),
-    ) {
-        image.setTemplate(true);
-        button.setImage(Some(&image));
-    }
+    set_status_button_symbol(button, name, "Claude Status");
 }
 
 unsafe fn set_button_monospaced_title(button: &NSObject, title: &str) {
@@ -542,8 +530,7 @@ fn update_menubar() {
 // -- Menubar 初始化 --
 
 fn setup_menubar(mtm: MainThreadMarker) {
-    let status_bar = NSStatusBar::systemStatusBar();
-    let item = status_bar.statusItemWithLength(-1.0);
+    let item: Retained<NSStatusItem> = new_status_item(-1.0);
 
     if let Some(button) = item.button(mtm) {
         set_button_icon(&button, "brain");
@@ -656,8 +643,7 @@ fn run_menubar() {
     write_pid_file();
 
     let mtm = MainThreadMarker::new().expect("must be on the main thread");
-    let app = NSApplication::sharedApplication(mtm);
-    app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+    let app: Retained<NSApplication> = configure_accessory_app(mtm);
 
     setup_menubar(mtm);
     poll_and_update();

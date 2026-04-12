@@ -12,11 +12,11 @@ use objc2::runtime::{AnyObject, NSObject};
 use objc2::sel;
 use objc2::{define_class, msg_send, MainThreadMarker, MainThreadOnly};
 
-use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSEventMask, NSImage, NSMenu, NSMenuItem,
-    NSStatusBar, NSStatusItem,
-};
+use objc2_app_kit::{NSApplication, NSEventMask, NSMenu, NSStatusItem};
 use objc2_foundation::NSString;
+use picc_macos_app::{
+    configure_accessory_app, new_menu_item, new_status_item, set_status_button_symbol,
+};
 
 static COLLAPSED: AtomicBool = AtomicBool::new(false);
 
@@ -67,15 +67,7 @@ define_class!(
                         } else {
                             "chevron.compact.left"
                         };
-                        if let Some(image) =
-                            NSImage::imageWithSystemSymbolName_accessibilityDescription(
-                                &NSString::from_str(icon_name),
-                                None,
-                            )
-                        {
-                            image.setTemplate(true);
-                            button.setImage(Some(&image));
-                        }
+                        set_status_button_symbol(&button, icon_name, "Toggle");
                     }
                 }
             });
@@ -100,21 +92,12 @@ define_class!(
 fn main() {
     let mtm = MainThreadMarker::new().expect("must be on the main thread");
 
-    let app = NSApplication::sharedApplication(mtm);
-    app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
-
-    let status_bar = NSStatusBar::systemStatusBar();
+    let app: Retained<NSApplication> = configure_accessory_app(mtm);
 
     // -- 1. Toggle 按钮（最右侧）--
-    let toggle_item = status_bar.statusItemWithLength(-1.0);
+    let toggle_item: Retained<NSStatusItem> = new_status_item(-1.0);
     if let Some(button) = toggle_item.button(mtm) {
-        if let Some(image) = NSImage::imageWithSystemSymbolName_accessibilityDescription(
-            &NSString::from_str("chevron.compact.left"),
-            Some(&NSString::from_str("Toggle")),
-        ) {
-            image.setTemplate(true);
-            button.setImage(Some(&image));
-        }
+        set_status_button_symbol(&button, "chevron.compact.left", "Toggle");
 
         let target: Retained<ToggleTarget> = unsafe { msg_send![ToggleTarget::alloc(mtm), init] };
         unsafe {
@@ -126,14 +109,7 @@ fn main() {
 
         // 右键菜单
         let menu = NSMenu::new(mtm);
-        let quit_item = unsafe {
-            NSMenuItem::initWithTitle_action_keyEquivalent(
-                NSMenuItem::alloc(mtm),
-                &NSString::from_str("Quit"),
-                Some(sel!(quit:)),
-                &NSString::from_str("q"),
-            )
-        };
+        let quit_item = new_menu_item(mtm, "Quit", Some(sel!(quit:)), "q");
         unsafe { quit_item.setTarget(Some(&target)) };
         menu.addItem(&quit_item);
 
@@ -145,7 +121,7 @@ fn main() {
     }
 
     // -- 2. Separator（分隔线，在 toggle 左边）--
-    let separator_item = status_bar.statusItemWithLength(SEPARATOR_NORMAL_LENGTH);
+    let separator_item: Retained<NSStatusItem> = new_status_item(SEPARATOR_NORMAL_LENGTH);
     if let Some(button) = separator_item.button(mtm) {
         button.setTitle(&NSString::from_str("\u{2502}")); // │ (box drawing vertical)
     }

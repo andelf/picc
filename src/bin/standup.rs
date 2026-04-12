@@ -11,14 +11,18 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyClass, AnyObject, NSObject};
 use objc2::sel;
 use objc2::{define_class, msg_send, MainThreadMarker, MainThreadOnly};
+use picc_macos_app::{
+    configure_accessory_app, new_menu_item as shared_new_menu_item, new_status_item,
+    set_status_button_symbol,
+};
 use rand::RngExt as _;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
 use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSBackingStoreType, NSBezierPath, NSColor,
-    NSEvent, NSImage, NSMenu, NSMenuItem, NSPanel, NSResponder, NSScreen, NSStatusBar,
-    NSStatusItem, NSView, NSWindow, NSWindowCollectionBehavior, NSWindowStyleMask,
+    NSApplication, NSBackingStoreType, NSBezierPath, NSColor, NSEvent, NSMenu, NSMenuItem, NSPanel,
+    NSResponder, NSScreen, NSStatusItem, NSView, NSWindow, NSWindowCollectionBehavior,
+    NSWindowStyleMask,
 };
 use objc2_foundation::{NSDate, NSPoint, NSRect, NSSize, NSString, NSTimer};
 
@@ -402,31 +406,17 @@ fn new_menu_item(
     action: Option<objc2::runtime::Sel>,
     key: &str,
 ) -> Retained<NSMenuItem> {
-    unsafe {
-        NSMenuItem::initWithTitle_action_keyEquivalent(
-            NSMenuItem::alloc(mtm),
-            &NSString::from_str(title),
-            action,
-            &NSString::from_str(key),
-        )
-    }
+    shared_new_menu_item(mtm, title, action, key)
 }
 
 fn set_button_icon(button: &objc2_app_kit::NSStatusBarButton, name: &str) {
-    if let Some(image) = NSImage::imageWithSystemSymbolName_accessibilityDescription(
-        &NSString::from_str(name),
-        Some(&NSString::from_str("Standup Timer")),
-    ) {
-        image.setTemplate(true);
-        button.setImage(Some(&image));
-    }
+    set_status_button_symbol(button, name, "Standup Timer");
 }
 
 // -- 菜单栏 --
 
 fn setup_menubar(mtm: MainThreadMarker) {
-    let status_bar = NSStatusBar::systemStatusBar();
-    let item = status_bar.statusItemWithLength(-1.0); // NSVariableStatusItemLength
+    let item = new_status_item(-1.0);
 
     if let Some(button) = item.button(mtm) {
         set_button_icon(&button, "cup.and.saucer.fill");
@@ -1210,8 +1200,7 @@ fn main() {
     let args = Args::parse();
 
     let mtm = MainThreadMarker::new().expect("must be on the main thread");
-    let app = NSApplication::sharedApplication(mtm);
-    app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+    let app: Retained<NSApplication> = configure_accessory_app(mtm);
 
     // 设置全局状态
     {
