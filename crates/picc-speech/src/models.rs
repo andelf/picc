@@ -3,11 +3,21 @@ use std::path::Path;
 
 const SENSEVOICE_MODEL_DIR: &str = "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17";
 const SENSEVOICE_URL: &str = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17.tar.bz2";
+const PARAKEET_DE_MODEL_DIR: &str = "sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8";
+const PARAKEET_DE_URL: &str = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-nemo-parakeet-tdt-0.6b-v3-int8.tar.bz2";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ModelPaths {
     pub model: String,
     pub tokens: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TransducerModelPaths {
+    pub encoder: String,
+    pub decoder: String,
+    pub joiner: String,
+    pub tokens: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -142,4 +152,58 @@ pub fn resolve_repo_sensevoice_paths(
         model: model_path.to_string_lossy().into_owned(),
         tokens: Some(tokens_path.to_string_lossy().into_owned()),
     })
+}
+
+pub fn resolve_repo_parakeet_de_paths(
+    base_dir: &Path,
+    requested_model_dir: Option<&str>,
+) -> Result<TransducerModelPaths, String> {
+    let model_dir = requested_model_dir
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| {
+            let preferred = base_dir.join(PARAKEET_DE_MODEL_DIR);
+            if preferred.join("encoder.int8.onnx").exists() {
+                preferred.to_string_lossy().into_owned()
+            } else {
+                ensure_tar_bz2_model(
+                    base_dir,
+                    ModelArchiveSpec {
+                        model_dir_name: PARAKEET_DE_MODEL_DIR,
+                        marker_filename: "encoder.int8.onnx",
+                        archive_url: PARAKEET_DE_URL,
+                        log_prefix: "voice-correct-de",
+                        display_name: "Parakeet German-English model",
+                    },
+                )
+                .expect("failed to download Parakeet model")
+            }
+        });
+
+    let model_dir = Path::new(&model_dir);
+    let encoder = pick_existing_file(model_dir, &["encoder.int8.onnx", "encoder.onnx"])?;
+    let decoder = pick_existing_file(model_dir, &["decoder.int8.onnx", "decoder.onnx"])?;
+    let joiner = pick_existing_file(model_dir, &["joiner.int8.onnx", "joiner.onnx"])?;
+    let tokens = pick_existing_file(model_dir, &["tokens.txt"])?;
+
+    Ok(TransducerModelPaths {
+        encoder,
+        decoder,
+        joiner,
+        tokens,
+    })
+}
+
+fn pick_existing_file(model_dir: &Path, names: &[&str]) -> Result<String, String> {
+    for name in names {
+        let path = model_dir.join(name);
+        if path.exists() {
+            return Ok(path.to_string_lossy().into_owned());
+        }
+    }
+
+    Err(format!(
+        "Missing required model file in {} (expected one of: {})",
+        model_dir.display(),
+        names.join(", ")
+    ))
 }

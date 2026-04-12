@@ -22,7 +22,8 @@ pub use hotkey::{
     HotkeyPolicy, HotkeyRuntime, HotkeySignal, HotkeyState, LEFT_COMMAND_MASK, RIGHT_COMMAND_MASK,
 };
 pub use models::{
-    ensure_tar_bz2_model, resolve_repo_sensevoice_paths, ModelArchiveSpec, ModelPaths,
+    ensure_tar_bz2_model, resolve_repo_parakeet_de_paths, resolve_repo_sensevoice_paths,
+    ModelArchiveSpec, ModelPaths, TransducerModelPaths,
 };
 pub use postprocess::{apply_dictation_transforms, auto_insert_spaces, DictationOptions};
 pub use session::{

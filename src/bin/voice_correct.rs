@@ -8,6 +8,7 @@
 //! Usage:
 //!   KIMI_API_KEY=sk-... cargo run --bin voice-correct
 //!   KIMI_API_KEY=sk-... cargo run --bin voice-correct --features sensevoice -- --engine sensevoice
+//!   KIMI_API_KEY=sk-... cargo run --bin voice-correct --features sensevoice -- --engine parakeet-de
 
 use std::cell::{Cell, RefCell};
 #[cfg(feature = "sensevoice")]
@@ -48,7 +49,7 @@ use picc_macos_app::{
 };
 use picc_macos_input::{parse_key_combo, press_key_combo, type_text};
 #[cfg(feature = "sensevoice")]
-use picc_speech::models::resolve_repo_sensevoice_paths;
+use picc_speech::models::{resolve_repo_parakeet_de_paths, resolve_repo_sensevoice_paths};
 use picc_speech::postprocess::{apply_dictation_transforms, DictationOptions};
 #[cfg(feature = "sensevoice")]
 use picc_speech::resample_linear;
@@ -68,19 +69,19 @@ use serde::{Deserialize, Serialize};
 #[derive(Parser)]
 #[command(about = "Voice Correct — hold right Cmd to dictate, tap+hold to correct")]
 struct Args {
-    /// Speech engine: "sensevoice" or "apple"
+    /// Speech engine: "apple", "sensevoice", or "parakeet-de"
     #[arg(long, default_value = "apple")]
     engine: String,
 
-    /// SenseVoice model directory
+    /// Offline model directory override
     #[arg(long)]
     model_dir: Option<String>,
 
-    /// SenseVoice model file name inside --model-dir
+    /// SenseVoice model file name inside --model-dir; ignored by parakeet-de
     #[arg(long, default_value = "model.int8.onnx")]
     model_file_name: String,
 
-    /// Language hint for SenseVoice: auto, zh, en, ja, ko, yue
+    /// Language hint for SenseVoice only: auto, zh, en, ja, ko, yue
     #[arg(long, default_value = "auto")]
     lang: String,
 }
@@ -861,11 +862,22 @@ fn main() {
 
     let args = Args::parse();
     let use_sensevoice = args.engine == "sensevoice";
+    let use_parakeet_de = args.engine == "parakeet-de";
+    let use_offline_asr = use_sensevoice || use_parakeet_de;
 
     #[cfg(not(feature = "sensevoice"))]
-    if use_sensevoice {
-        error!("sensevoice engine requires --features sensevoice");
-        error!("cargo run --bin voice-correct --features sensevoice -- --engine sensevoice");
+    if use_offline_asr {
+        error!("offline ASR engines require --features sensevoice");
+        error!(
+            "cargo run --bin voice-correct --features sensevoice -- --engine {}",
+            args.engine
+        );
+        std::process::exit(1);
+    }
+
+    if use_parakeet_de && args.lang != "auto" {
+        error!("--lang only applies to --engine sensevoice");
+        error!("parakeet-de uses its built-in multilingual model behavior and does not accept a language hint");
         std::process::exit(1);
     }
 
@@ -910,8 +922,43 @@ fn main() {
             Cell::new(None)
         };
 
+    #[cfg(feature = "sensevoice")]
+    let parakeet_recognizer: Cell<Option<sherpa_rs::transducer::TransducerRecognizer>> =
+        if use_parakeet_de {
+            let home = std::env::var("HOME").unwrap();
+            let base = Path::new(&home).join(".local/share/picc");
+            let paths = resolve_repo_parakeet_de_paths(&base, args.model_dir.as_deref())
+                .expect("failed to resolve Parakeet model paths");
+            let config = sherpa_rs::transducer::TransducerConfig {
+                encoder: paths.encoder.clone(),
+                decoder: paths.decoder.clone(),
+                joiner: paths.joiner.clone(),
+                tokens: paths.tokens.clone(),
+                sample_rate: 16000,
+                feature_dim: 80,
+                decoding_method: "greedy_search".to_string(),
+                model_type: "nemo_transducer".to_string(),
+                num_threads: 2,
+                provider: Some(sherpa_rs::get_default_provider()),
+                ..Default::default()
+            };
+            info!(
+                encoder = %paths.encoder,
+                decoder = %paths.decoder,
+                joiner = %paths.joiner,
+                tokens = %paths.tokens,
+                "loading Parakeet model"
+            );
+            let recognizer = sherpa_rs::transducer::TransducerRecognizer::new(config)
+                .expect("failed to init Parakeet — check --model-dir");
+            info!("Parakeet model loaded");
+            Cell::new(Some(recognizer))
+        } else {
+            Cell::new(None)
+        };
+
     // --- Apple speech recognizer (if needed) ---
-    let apple_recognizer = if !use_sensevoice {
+    let apple_recognizer = if !use_offline_asr {
         let recognizer = unsafe {
             let locale = NSLocale::initWithLocaleIdentifier(NSLocale::alloc(), ns_string!("zh-CN"));
             SFSpeechRecognizer::initWithLocale(SFSpeechRecognizer::alloc(), &locale).unwrap()
@@ -1024,6 +1071,8 @@ fn main() {
 
     let engine_name = if use_sensevoice {
         "SenseVoice"
+    } else if use_parakeet_de {
+        "Parakeet DE/EN"
     } else {
         "Apple Speech"
     };
@@ -1090,7 +1139,7 @@ fn main() {
                 capsule.waveform_view.setNeedsDisplay(true);
 
                 // Update partial transcription text (Apple Speech path)
-                if !use_sensevoice {
+                if !use_offline_asr {
                     if let Ok(text) = RECOGNIZED_TEXT.lock() {
                         if !text.is_empty() {
                             update_capsule_text(&capsule, &text, mtm);
@@ -1160,7 +1209,7 @@ fn main() {
                     is_processing = is_processing.get(),
                     "TIMER → CANCEL: stopping recording"
                 );
-                if use_sensevoice {
+                if use_offline_asr {
                     COLLECTING.store(false, Ordering::Relaxed);
                     audio_engine.stop();
                     if let Ok(mut s) = samples_ref.lock() {
@@ -1207,7 +1256,7 @@ fn main() {
                 show_capsule(&capsule, mode, mtm);
                 debug!("TIMER → START [1]: icon set, sound played, capsule shown");
 
-                if use_sensevoice {
+                if use_offline_asr {
                     if audio_engine.take_config_changed() {
                         info!("TIMER → START: audio config changed, recreating engine");
                         audio_engine.recreate_engine();
@@ -1355,7 +1404,7 @@ fn main() {
 
                 let spoken: String;
 
-                if use_sensevoice {
+                if use_offline_asr {
                     COLLECTING.store(false, Ordering::Relaxed);
                     audio_engine.stop();
                     debug!("TIMER → STOP: engine stopped");
@@ -1381,25 +1430,44 @@ fn main() {
                             duration_s = format_args!("{:.1}", samples_16k.len() as f64 / 16000.0),
                             "transcribing audio"
                         );
-                        if let Some(mut recognizer) = sv_recognizer.take() {
-                            let t0 = std::time::Instant::now();
-                            let result = recognizer.transcribe(16000, &samples_16k);
-                            let ms = t0.elapsed().as_secs_f64() * 1000.0;
-                            info!(
-                                text = %result.text,
-                                lang = %result.lang,
-                                token_count = result.tokens.len(),
-                                timestamp_count = result.timestamps.len(),
-                                elapsed_ms = format_args!("{:.0}", ms),
-                                "ASR result"
-                            );
-                            debug!(
-                                tokens = ?result.tokens,
-                                timestamps = ?result.timestamps,
-                                "ASR metadata"
-                            );
-                            spoken = result.text.clone();
-                            sv_recognizer.set(Some(recognizer));
+                        if use_sensevoice {
+                            if let Some(mut recognizer) = sv_recognizer.take() {
+                                let t0 = std::time::Instant::now();
+                                let result = recognizer.transcribe(16000, &samples_16k);
+                                let ms = t0.elapsed().as_secs_f64() * 1000.0;
+                                info!(
+                                    text = %result.text,
+                                    lang = %result.lang,
+                                    token_count = result.tokens.len(),
+                                    timestamp_count = result.timestamps.len(),
+                                    elapsed_ms = format_args!("{:.0}", ms),
+                                    "ASR result"
+                                );
+                                debug!(
+                                    tokens = ?result.tokens,
+                                    timestamps = ?result.timestamps,
+                                    "ASR metadata"
+                                );
+                                spoken = result.text.clone();
+                                sv_recognizer.set(Some(recognizer));
+                            } else {
+                                spoken = String::new();
+                            }
+                        } else if use_parakeet_de {
+                            if let Some(mut recognizer) = parakeet_recognizer.take() {
+                                let t0 = std::time::Instant::now();
+                                let result = recognizer.transcribe(16000, &samples_16k);
+                                let ms = t0.elapsed().as_secs_f64() * 1000.0;
+                                info!(
+                                    text = %result,
+                                    elapsed_ms = format_args!("{:.0}", ms),
+                                    "ASR result"
+                                );
+                                spoken = result;
+                                parakeet_recognizer.set(Some(recognizer));
+                            } else {
+                                spoken = String::new();
+                            }
                         } else {
                             spoken = String::new();
                         }
