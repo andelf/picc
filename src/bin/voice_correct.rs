@@ -24,10 +24,11 @@ use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject};
 use objc2::{define_class, sel, AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly};
 use objc2_app_kit::{
-    NSAnimationContext, NSApplication, NSBackingStoreType, NSFont, NSImage, NSLineBreakMode,
-    NSMenu, NSMenuItem, NSPanel, NSScreen, NSStatusItem, NSStatusWindowLevel, NSTextAlignment,
-    NSTextField, NSView, NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectState,
-    NSVisualEffectView, NSWindowStyleMask,
+    NSAnimationContext, NSApplication, NSBackingStoreType, NSFont,
+    NSFontDescriptorSystemDesignRounded, NSImage, NSLineBreakMode, NSMenu, NSMenuItem, NSPanel,
+    NSScreen, NSStatusItem, NSStatusWindowLevel, NSTextAlignment, NSTextField, NSView,
+    NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView,
+    NSWindowStyleMask,
 };
 use objc2_core_foundation::{kCFRunLoopCommonModes, CFMachPort, CFRunLoop, CFString, CFType};
 use objc2_core_graphics::{
@@ -585,7 +586,7 @@ const TEXT_MIN_WIDTH: f64 = 160.0;
 const TEXT_MAX_WIDTH: f64 = 560.0;
 const CAPSULE_BOTTOM_MARGIN: f64 = 48.0;
 const LABEL_HEIGHT: f64 = 26.0;
-const LABEL_Y: f64 = (CAPSULE_HEIGHT - LABEL_HEIGHT) / 2.0;
+const LABEL_Y: f64 = (CAPSULE_HEIGHT - LABEL_HEIGHT) / 2.0 - 2.0;
 
 fn create_capsule_overlay(mtm: MainThreadMarker) -> CapsuleOverlay {
     let min_width =
@@ -646,13 +647,12 @@ fn create_capsule_overlay(mtm: MainThreadMarker) -> CapsuleOverlay {
         Retained::cast_unchecked(view)
     };
 
-    // Text label — vertically centered
+    // Text label — SF Pro Rounded for a softer look matching the capsule shape.
     let label_font = unsafe {
-        // SF Pro Rounded, medium weight — softer look for the HUD capsule
-        let base = NSFont::systemFontOfSize_weight(18.0, objc2_app_kit::NSFontWeightMedium);
-        let desc = base.fontDescriptor();
-        desc.fontDescriptorWithDesign(objc2_app_kit::NSFontDescriptorSystemDesignRounded)
-            .and_then(|d| NSFont::fontWithDescriptor_size(&d, 18.0))
+        let base = NSFont::systemFontOfSize_weight(17.0, objc2_app_kit::NSFontWeightMedium);
+        base.fontDescriptor()
+            .fontDescriptorWithDesign(NSFontDescriptorSystemDesignRounded)
+            .and_then(|desc| NSFont::fontWithDescriptor_size(&desc, 17.0))
             .unwrap_or(base)
     };
     let label_x = CAPSULE_PADDING_LEFT + WAVEFORM_WIDTH + GAP;
@@ -814,6 +814,14 @@ fn update_capsule_text(overlay: &CapsuleOverlay, text: &str, mtm: MainThreadMark
 
     let fitted_w = overlay.text_label.frame().size.width;
     let text_w = fitted_w.clamp(TEXT_MIN_WIDTH, TEXT_MAX_WIDTH);
+
+    // Immediately restore correct frame — sizeToFit changes Y and height,
+    // which causes visible jumping when text updates frequently.
+    overlay.text_label.setFrame(NSRect::new(
+        NSPoint::new(CAPSULE_PADDING_LEFT + WAVEFORM_WIDTH + GAP, LABEL_Y),
+        NSSize::new(text_w, LABEL_HEIGHT),
+    ));
+
     let new_width = CAPSULE_PADDING_LEFT + WAVEFORM_WIDTH + GAP + text_w + CAPSULE_PADDING_RIGHT;
     let old_width = overlay.current_width.get();
 
@@ -840,13 +848,11 @@ fn update_capsule_text(overlay: &CapsuleOverlay, text: &str, mtm: MainThreadMark
                 }
             },
         ));
-
-        // Update label frame (not animated, just ensure correct size)
-        overlay.text_label.setFrame(NSRect::new(
-            NSPoint::new(CAPSULE_PADDING_LEFT + WAVEFORM_WIDTH + GAP, LABEL_Y),
-            NSSize::new(text_w, LABEL_HEIGHT),
-        ));
     }
+}
+
+fn correction_overlay_text(original_text: &str) -> String {
+    format!("Correcting \"{}\"", original_text.trim())
 }
 
 // --- Main ---
@@ -1157,14 +1163,6 @@ fn main() {
                 if tick % 5 == 0 {
                     let frame = (tick / 5) as usize % PROCESSING_ICONS.len();
                     set_status_icon_name(&status_item, PROCESSING_ICONS[frame], mtm);
-
-                    // Animate capsule text dots
-                    let dots = match frame % 3 {
-                        0 => "Correcting.",
-                        1 => "Correcting..",
-                        _ => "Correcting...",
-                    };
-                    update_capsule_text(&capsule, dots, mtm);
                 }
 
                 // Check if LLM result has arrived
@@ -1585,6 +1583,8 @@ fn main() {
                             info!(original = %trimmed, instruction = %spoken, "correcting");
                             // Save original for comparison when result arrives
                             correction_original.set(Some(original_text.clone()));
+                            let correction_text = correction_overlay_text(trimmed);
+                            update_capsule_text(&capsule, &correction_text, mtm);
 
                             // Start animated processing icon
                             set_status_icon(&status_item, AppState::Processing, mtm);
