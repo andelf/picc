@@ -62,13 +62,16 @@ cargo run --bin hidden
 Hold right Command key to dictate speech, recognized text is typed at the cursor. Supports SenseVoice (offline, via sherpa-onnx) and Apple Speech API engines.
 
 ```sh
-# Install
-cargo install --git https://github.com/andelf/picc --bin dictation --features sensevoice
+# Install Apple Speech-only build
+cargo install --git https://github.com/andelf/picc --bin dictation
 
 # Apple Speech API (default, no setup needed)
 dictation --engine apple
 
-# SenseVoice (offline, model auto-downloaded on first run ~250MB)
+# Build with SenseVoice support enabled
+cargo install --git https://github.com/andelf/picc --bin dictation --features sensevoice
+
+# SenseVoice (offline, model auto-downloaded on first run, ~250MB)
 dictation --engine sensevoice
 ```
 
@@ -77,11 +80,14 @@ dictation --engine sensevoice
 Alternative dictation tool using Fun-ASR-Nano (0.8B LLM-based ASR, 31 languages). Inference is significantly slower than SenseVoice due to the larger LLM-based model. Use `dictation --engine sensevoice` instead.
 
 ```sh
-# Build (requires sherpa-onnx v1.12.28 static library at ~/.local/share/picc/sherpa-onnx-v1.12.28/)
+# Build with an external sherpa bundle
+export DICTATION_NG_SHERPA_DIR=~/.local/share/picc/sherpa-onnx-v1.12.28
 cargo run -p dictation-ng
 
 # Model auto-downloaded on first run (~715MB)
 ```
+
+If `DICTATION_NG_SHERPA_DIR` is not set to a valid sherpa-onnx v1.12.28 bundle, the workspace still compiles, but `dictation-ng` falls back to a stub binary that exits with setup instructions.
 
 ### voice-correct — Voice Dictation + Correction
 
@@ -102,6 +108,11 @@ KIMI_API_KEY=sk-... cargo run --bin voice-correct
 # SenseVoice (offline)
 KIMI_API_KEY=sk-... cargo run --bin voice-correct --features sensevoice -- --engine sensevoice
 ```
+
+### voice-correct-v2 — Experimental Branch
+
+Experimental variant of `voice-correct` with term correction and alternate trigger behavior.
+Keep it for evaluation and comparison; do not treat it as the primary speech product shell yet.
 
 ### claude_menubar — Claude Code Status Hook
 

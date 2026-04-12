@@ -33,7 +33,7 @@ use objc2_core_graphics::{
 use objc2_foundation::{NSString, NSTimer};
 
 use picc::accessibility;
-use picc::input::{parse_key_combo, press_key_combo, type_text};
+use picc_macos_input::{parse_key_combo, press_key_combo, type_text};
 
 const NX_DEVICERCMDKEYMASK: u64 = 0x10;
 
@@ -288,6 +288,11 @@ fn write_text(element: &AXUIElement, text: &str) -> bool {
 }
 
 fn write_session_result(session: &FocusSession, inserted: &str) -> bool {
+    let current = accessibility::attr_string(&session.element, "AXValue").unwrap_or_default();
+    if current != session.base_text {
+        eprintln!("[dictation-pause] refusing rewrite because focused text changed externally");
+        return false;
+    }
     let full_text = compose_session_text(session, inserted);
     write_text(&session.element, &full_text)
 }

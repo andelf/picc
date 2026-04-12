@@ -1,9 +1,10 @@
-//! Voice Correct V2 — dictation + voice-triggered text correction + term correction
+//! Voice Correct V2 — experimental dictation + voice-triggered text correction + term correction
 //!
 //! - Single hold right Command: dictation (type spoken text)
 //! - Quick tap then hold right Command: correction mode
 //!   - If focused field has text: LLM corrects it using spoken instruction
 //!   - If focused field is empty: just type spoken text (no LLM call)
+//! - This binary is an experiment branch and is not the primary product shell
 //!
 //! Usage:
 //!   KIMI_API_KEY=sk-... cargo run --bin voice-correct-v2
@@ -14,7 +15,7 @@ use std::cell::{Cell, RefCell};
 use std::path::Path;
 use std::path::PathBuf;
 use std::ptr::{self, NonNull};
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -23,16 +24,11 @@ use clap::Parser;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject};
 use objc2::{define_class, sel, AnyThread, DefinedClass, MainThreadMarker, MainThreadOnly};
-use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSImage, NSMenu, NSMenuItem, NSStatusBar,
-    NSStatusItem,
-};
+use objc2_app_kit::{NSApplication, NSImage, NSMenu, NSMenuItem, NSStatusItem};
 use objc2_avf_audio::{
     AVAudioEngine, AVAudioEngineConfigurationChangeNotification, AVAudioPCMBuffer, AVAudioTime,
 };
-use objc2_core_foundation::{
-    kCFRunLoopCommonModes, CFMachPort, CFRetained, CFRunLoop, CFString, CFType,
-};
+use objc2_core_foundation::{kCFRunLoopCommonModes, CFMachPort, CFRunLoop, CFString, CFType};
 use objc2_core_graphics::{
     CGEvent, CGEventMask, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement,
     CGEventTapProxy, CGEventType,
@@ -47,7 +43,18 @@ use objc2_speech::{
 
 use objc2_application_services::AXUIElement;
 use picc::accessibility;
-use picc::input::{parse_key_combo, press_key_combo, type_text};
+use picc_macos_app::{
+    configure_accessory_app, new_menu_item, new_status_item, set_status_item_symbol,
+};
+use picc_macos_input::{parse_key_combo, press_key_combo, type_text};
+#[cfg(feature = "sensevoice")]
+use picc_speech::models::resolve_repo_sensevoice_paths;
+use picc_speech::postprocess::{apply_dictation_transforms, DictationOptions};
+use picc_speech::{
+    char_before_cursor, clipboard_replace_is_safe, frontmost_bundle_id, read_focused_text,
+    should_skip_ax_read_for_bundle, should_use_clipboard_for_bundle, FocusedText,
+    SPACE_AFTER_PUNCT,
+};
 use tracing::{debug, error, info, warn};
 
 use homophone_replacer::{pronounce_phrase, replace_text, Lexicon, ReplaceRuleSet, ReplacerConfig};
@@ -218,33 +225,6 @@ static COLLECTING: AtomicBool = AtomicBool::new(false);
 /// loop to reset engine and tap before next start.
 static AUDIO_CONFIG_CHANGED: AtomicBool = AtomicBool::new(false);
 
-/// Audio engine state machine (sensevoice path, managed by background thread).
-static AUDIO_STATE: AtomicU8 = AtomicU8::new(0);
-const AUDIO_IDLE: u8 = 0;
-const AUDIO_STARTING: u8 = 1;
-const AUDIO_RUNNING: u8 = 2;
-const AUDIO_STOPPING: u8 = 3;
-const AUDIO_STOPPED: u8 = 4;
-const AUDIO_ERROR: u8 = 5;
-
-/// Sample rate discovered by the audio thread — read by main thread for resampling.
-static NATIVE_SAMPLE_RATE: AtomicU32 = AtomicU32::new(16000);
-
-/// Commands sent to the audio management thread.
-const CMD_START: u8 = 1;
-const CMD_STOP: u8 = 2;
-const CMD_CANCEL: u8 = 3;
-
-// --- Dictation post-processing options ---
-
-#[derive(Debug, Clone, Copy, Default)]
-struct DictationOptions {
-    fullwidth_to_halfwidth: bool,
-    space_around_punct: bool,
-    space_between_cjk: bool,
-    strip_trailing_punct: bool,
-}
-
 struct MenuDelegateIvars {
     options: Cell<DictationOptions>,
     punct_spaces_item: RefCell<Option<Retained<NSMenuItem>>>,
@@ -405,289 +385,6 @@ unsafe extern "C-unwind" fn event_tap_callback(
     event.as_ptr()
 }
 
-// --- SenseVoice model download (same as dictation.rs) ---
-
-#[cfg(feature = "sensevoice")]
-const SENSEVOICE_MODEL_DIR: &str = "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17";
-#[cfg(feature = "sensevoice")]
-const SENSEVOICE_URL: &str = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17.tar.bz2";
-
-#[cfg(feature = "sensevoice")]
-fn ensure_sensevoice_model(base_dir: &Path) -> String {
-    use std::io::{Read as _, Write as _};
-
-    let model_dir = base_dir.join(SENSEVOICE_MODEL_DIR);
-    let model_file = model_dir.join("model.int8.onnx");
-    if model_file.exists() {
-        return model_dir.to_string_lossy().into_owned();
-    }
-
-    info!(path = %model_dir.display(), "SenseVoice model not found, downloading (~250 MB)...");
-    std::fs::create_dir_all(base_dir).expect("failed to create model directory");
-
-    let archive = base_dir.join("sensevoice.tar.bz2");
-    let resp = reqwest::blocking::Client::new()
-        .get(SENSEVOICE_URL)
-        .send()
-        .expect("failed to download model — check your network connection");
-    let total = resp.content_length().unwrap_or(0);
-    let total_mb = total as f64 / 1_048_576.0;
-    let mut downloaded: u64 = 0;
-    let mut file = std::fs::File::create(&archive).expect("failed to create archive file");
-    let mut reader = resp;
-    let mut buf = [0u8; 65536];
-    let start = std::time::Instant::now();
-    loop {
-        let n = reader
-            .read(&mut buf)
-            .expect("download error — check your network connection");
-        if n == 0 {
-            break;
-        }
-        file.write_all(&buf[..n]).expect("write error");
-        downloaded += n as u64;
-        if total > 0 {
-            let pct = (downloaded as f64 / total as f64 * 100.0) as u32;
-            let mb = downloaded as f64 / 1_048_576.0;
-            let elapsed = start.elapsed().as_secs_f64();
-            let speed = if elapsed > 0.0 { mb / elapsed } else { 0.0 };
-            let bar_len = 30;
-            let filled = (bar_len as f64 * downloaded as f64 / total as f64) as usize;
-            let bar: String = "█".repeat(filled) + &"░".repeat(bar_len - filled);
-            eprint!("\r[voice-correct] {bar} {mb:.1}/{total_mb:.1} MB ({pct}%) {speed:.1} MB/s");
-        }
-    }
-    eprintln!();
-    drop(file);
-
-    eprint!("[voice-correct] extracting...");
-    let status = std::process::Command::new("tar")
-        .args([
-            "xjf",
-            &archive.to_string_lossy(),
-            "-C",
-            &base_dir.to_string_lossy(),
-        ])
-        .status()
-        .expect("failed to run tar");
-    assert!(status.success(), "tar extraction failed");
-    std::fs::remove_file(&archive).ok();
-    eprintln!(" done");
-
-    model_dir.to_string_lossy().into_owned()
-}
-
-#[cfg(feature = "sensevoice")]
-fn resolve_sensevoice_paths(base_dir: &Path, args: &Args) -> (String, String) {
-    let model_dir = args.model_dir.clone().unwrap_or_else(|| {
-        let preferred = base_dir.join(SENSEVOICE_MODEL_DIR);
-        if preferred.join(&args.model_file_name).exists() {
-            preferred.to_string_lossy().into_owned()
-        } else {
-            ensure_sensevoice_model(base_dir)
-        }
-    });
-
-    let model_path = Path::new(&model_dir).join(&args.model_file_name);
-    assert!(
-        model_path.exists(),
-        "SenseVoice model file not found: {}",
-        model_path.display()
-    );
-
-    let tokens_path = Path::new(&model_dir).join("tokens.txt");
-    assert!(
-        tokens_path.exists(),
-        "SenseVoice tokens not found: {}",
-        tokens_path.display()
-    );
-
-    (
-        model_path.to_string_lossy().into_owned(),
-        tokens_path.to_string_lossy().into_owned(),
-    )
-}
-
-// --- Dictation post-processing ---
-
-/// Apply user-configured text transforms before text goes on screen.
-///
-/// Used in both paths:
-/// - **Dictation mode**: transform speech recognition output before typing
-/// - **Correction mode**: transform LLM output before writing back to text field
-///
-/// Transforms (each gated by its toggle):
-/// 1. `fullwidth_to_halfwidth` — convert CJK fullwidth punctuation to ASCII halfwidth
-/// 2. `space_around_punct` — insert spaces around half-width punctuation
-///    (requires fullwidth_to_halfwidth to be on)
-/// 3. `space_between_cjk` — insert spaces at CJK↔Latin/Digit boundaries (independent)
-/// 4. `strip_trailing_punct` — remove trailing punctuation (speech engines often add "。")
-fn apply_dictation_transforms(text: &str, opts: DictationOptions) -> String {
-    let mut result = text.to_string();
-
-    if opts.fullwidth_to_halfwidth {
-        result = fullwidth_to_halfwidth(&result);
-    }
-    if opts.space_around_punct || opts.space_between_cjk {
-        result = auto_insert_spaces(&result, opts.space_around_punct, opts.space_between_cjk);
-    }
-    if opts.strip_trailing_punct {
-        result = strip_trailing_punctuation(&result);
-    }
-
-    result
-}
-
-fn fullwidth_to_halfwidth(s: &str) -> String {
-    s.chars()
-        .map(|c| match c {
-            // Fullwidth ASCII variants (Ａ→A, ，→, etc.)
-            '\u{FF01}'..='\u{FF5E}' => char::from_u32(c as u32 - 0xFEE0).unwrap_or(c),
-            '\u{3000}' => ' ',  // ideographic space
-            '。' => '.',        // U+3002
-            '、' => ',',        // U+3001
-            '【' => '[',        // U+3010
-            '】' => ']',        // U+3011
-            '「' => '"',        // U+300C
-            '」' => '"',        // U+300D
-            '《' => '<',        // U+300A
-            '》' => '>',        // U+300B
-            '\u{201C}' => '"',  // left double quote
-            '\u{201D}' => '"',  // right double quote
-            '\u{2018}' => '\'', // left single quote
-            '\u{2019}' => '\'', // right single quote
-            _ => c,
-        })
-        .collect()
-}
-
-/// Character category for spacing decisions.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum CharKind {
-    Cjk,
-    Latin,
-    Digit,
-    OpenBracket,
-    CloseBracket,
-    /// Delimiter punctuation: , . ! ? : ;
-    Delimiter,
-    Space,
-    Other,
-}
-
-fn classify(c: char) -> CharKind {
-    match c {
-        'A'..='Z' | 'a'..='z' => CharKind::Latin,
-        '0'..='9' => CharKind::Digit,
-        '(' | '[' | '<' => CharKind::OpenBracket,
-        ')' | ']' | '>' => CharKind::CloseBracket,
-        ',' | '.' | '!' | '?' | ':' | ';' => CharKind::Delimiter,
-        ' ' => CharKind::Space,
-        c if is_cjk(c) => CharKind::Cjk,
-        _ => CharKind::Other,
-    }
-}
-
-fn is_cjk(c: char) -> bool {
-    matches!(c,
-        '\u{2E80}'..='\u{2EFF}'   // CJK Radicals Supplement
-        | '\u{2F00}'..='\u{2FDF}' // Kangxi Radicals
-        | '\u{3040}'..='\u{309F}' // Hiragana
-        | '\u{30A0}'..='\u{30FF}' // Katakana
-        | '\u{3100}'..='\u{312F}' // Bopomofo
-        | '\u{3200}'..='\u{32FF}' // Enclosed CJK Letters
-        | '\u{3400}'..='\u{4DBF}' // CJK Extension A
-        | '\u{4E00}'..='\u{9FFF}' // CJK Unified Ideographs
-        | '\u{F900}'..='\u{FAFF}' // CJK Compatibility Ideographs
-    )
-}
-
-/// Does this pair require a CJK↔Latin/Digit boundary space?
-fn is_cjk_boundary(left: CharKind, right: CharKind) -> bool {
-    use CharKind::*;
-    matches!(
-        (left, right),
-        (Cjk, Latin) | (Latin, Cjk) | (Cjk, Digit) | (Digit, Cjk)
-    )
-}
-
-/// Does this pair require a punctuation-related space?
-fn is_punct_space(left: CharKind, right: CharKind) -> bool {
-    use CharKind::*;
-    matches!(
-        (left, right),
-        // Delimiter/CloseBracket → content
-        (Delimiter | CloseBracket, Cjk | Latin | Digit | Other) |
-        // content → OpenBracket
-        (Cjk | Latin | Digit | Other, OpenBracket)
-    )
-}
-
-/// Auto-insert spaces based on character classification.
-///
-/// - `punct`: insert spaces around half-width punctuation (delimiters, brackets)
-/// - `cjk`: insert spaces at CJK↔Latin/Digit boundaries
-///
-/// Single-pass: each character is classified into a [`CharKind`], and a space is
-/// inserted between adjacent pairs where the rules apply.
-fn auto_insert_spaces(s: &str, punct: bool, cjk: bool) -> String {
-    let chars: Vec<char> = s.chars().collect();
-    let mut out = String::with_capacity(s.len() + 32);
-
-    for (i, &c) in chars.iter().enumerate() {
-        let kind = classify(c);
-
-        // Insert space *before* this character if needed.
-        if i > 0 {
-            let prev = chars[i - 1];
-            let prev_kind = classify(prev);
-
-            if prev_kind != CharKind::Space && kind != CharKind::Space {
-                let want_cjk = cjk && is_cjk_boundary(prev_kind, kind);
-                let want_punct = punct && is_punct_space(prev_kind, kind);
-
-                if want_cjk || want_punct {
-                    // Exception: decimal point — don't space after '.' when digit.digit
-                    let is_decimal_dot = prev == '.'
-                        && prev_kind == CharKind::Delimiter
-                        && classify(chars.get(i.wrapping_sub(2)).copied().unwrap_or(' '))
-                            == CharKind::Digit
-                        && kind == CharKind::Digit;
-                    if !is_decimal_dot {
-                        out.push(' ');
-                    }
-                }
-            }
-        }
-
-        out.push(c);
-    }
-
-    out
-}
-
-fn strip_trailing_punctuation(s: &str) -> String {
-    s.trim_end_matches(|c: char| {
-        matches!(
-            c,
-            '.' | ','
-                | '!'
-                | '?'
-                | ';'
-                | ':'
-                | '。'
-                | '，'
-                | '！'
-                | '？'
-                | '；'
-                | '：'
-                | '、'
-                | '…'
-        )
-    })
-    .to_string()
-}
-
 // --- Menubar delegate ---
 
 define_class!(
@@ -797,15 +494,7 @@ fn set_status_icon(item: &NSStatusItem, state: AppState, mtm: MainThreadMarker) 
         AppState::Correcting => "mic.badge.plus",
         AppState::Processing => "ellipsis.circle", // initial, animated by timer
     };
-    if let Some(button) = item.button(mtm) {
-        if let Some(image) = NSImage::imageWithSystemSymbolName_accessibilityDescription(
-            &NSString::from_str(name),
-            Some(&NSString::from_str("Voice Correct")),
-        ) {
-            image.setTemplate(true);
-            button.setImage(Some(&image));
-        }
-    }
+    set_status_item_symbol(item, mtm, name, "Voice Correct");
 }
 
 fn set_status_icon_name(item: &NSStatusItem, name: &str, mtm: MainThreadMarker) {
@@ -820,151 +509,20 @@ fn set_status_icon_name(item: &NSStatusItem, name: &str, mtm: MainThreadMarker) 
     }
 }
 
-// --- AX: read focused element + text ---
-
-/// Punctuation characters after which a space should be inserted before new text.
-const SPACE_AFTER_PUNCT: &[char] = &[',', '.', ';', ':', '!', '?', ')', ']', '}', '"', '\''];
-
-/// Get the focused AX UI element.
-fn focused_ax_element() -> Option<CFRetained<AXUIElement>> {
-    let system = unsafe { AXUIElement::new_system_wide() };
-    let cf = accessibility::attr_value(&system, "AXFocusedUIElement")?;
-    Some(unsafe { CFRetained::cast_unchecked(cf) })
-}
-
-/// Extract a CFRange from an AXValue attribute.
-fn ax_value_as_cfrange(value: &CFRetained<CFType>) -> Option<objc2_core_foundation::CFRange> {
-    let ax_value: &objc2_application_services::AXValue = unsafe {
-        &*(value.as_ref() as *const CFType as *const objc2_application_services::AXValue)
-    };
-    let mut range = objc2_core_foundation::CFRange {
-        location: 0,
-        length: 0,
-    };
-    let ok = unsafe {
-        ax_value.value(
-            objc2_application_services::AXValueType::CFRange,
-            NonNull::new_unchecked(&mut range as *mut _ as *mut std::ffi::c_void),
-        )
-    };
-    ok.then_some(range)
-}
-
-/// Read the character immediately before the cursor in the focused text field.
-/// Returns None if unable to determine (no focused element, empty text, or at position 0).
-fn char_before_cursor() -> Option<char> {
-    let focused = focused_ax_element()?;
-    let text = accessibility::attr_string(&focused, "AXValue")?;
-    if text.is_empty() {
-        return None;
-    }
-    // Try to get cursor position from AXSelectedTextRange
-    let range_cf = accessibility::attr_value(&focused, "AXSelectedTextRange")?;
-    let pos = if let Some(range) = ax_value_as_cfrange(&range_cf) {
-        range.location as usize
-    } else {
-        // Fallback: assume cursor is at end (UTF-16 length)
-        text.encode_utf16().count()
-    };
-    if pos == 0 {
-        return None;
-    }
-    // CFRange.location is a UTF-16 code unit offset; decode via UTF-16 to get
-    // the correct character even when text contains emoji or supplementary CJK.
-    let utf16: Vec<u16> = text.encode_utf16().collect();
-    if pos > utf16.len() {
-        return text.chars().last();
-    }
-    let unit = utf16[pos - 1];
-    if (0xDC00..=0xDFFF).contains(&unit) && pos >= 2 {
-        // Low surrogate — pair with the preceding high surrogate
-        char::decode_utf16([utf16[pos - 2], unit]).next()?.ok()
-    } else {
-        char::decode_utf16([unit]).next()?.ok()
-    }
-}
-
-fn read_focused_text() -> Option<(CFRetained<AXUIElement>, String)> {
-    let focused = focused_ax_element()?;
-    let text = accessibility::attr_string(&focused, "AXValue")?;
-    if text.is_empty() {
-        return None;
-    }
-    // Skip if text matches placeholder
-    if let Some(placeholder) = accessibility::attr_string(&focused, "AXPlaceholderValue") {
-        if text == placeholder {
-            return None;
-        }
-    }
-    Some((focused, text))
-}
-
 // --- AX: write corrected text ---
-
-/// Bundle IDs of apps where AXValue set doesn't work (browsers, Electron apps).
-/// For these, always use clipboard paste fallback.
-/// Apps where AXValue returns the entire buffer (terminals).
-/// Correction mode skips text reading and falls back to typing.
-const SKIP_AX_READ_BUNDLES: &[&str] = &[
-    "com.apple.Terminal",
-    "com.googlecode.iterm2",
-    "io.alacritty",
-    "com.mitchellh.ghostty",
-    "dev.warp.Warp-Stable",
-    "co.zeit.hyper",
-    "net.kovidgoyal.kitty",
-];
-
-/// Apps where AXValue set doesn't work (browsers, Electron apps).
-/// Text replacement uses clipboard paste instead.
-const CLIPBOARD_ONLY_BUNDLES: &[&str] = &[
-    "com.google.Chrome",
-    "org.chromium.Chromium",
-    "com.apple.Safari",
-    "org.mozilla.firefox",
-    "com.microsoft.edgemac",
-    "com.brave.Browser",
-    "com.electron.", // prefix match for Electron apps
-    "us.zoom.xos",
-    "com.larksuite.Lark",
-    "com.larksuite.larkApp",
-    "com.bytedance.lark.Feishu",
-];
-
-/// Get the frontmost app's bundle identifier.
-fn frontmost_bundle_id() -> Option<String> {
-    use objc2_app_kit::NSRunningApplication;
-    let workspace_cls = objc2::runtime::AnyClass::get(c"NSWorkspace")?;
-    let workspace: Retained<NSObject> = unsafe { objc2::msg_send![workspace_cls, sharedWorkspace] };
-    let app: Option<Retained<NSRunningApplication>> =
-        unsafe { objc2::msg_send![&*workspace, frontmostApplication] };
-    app.and_then(|a| a.bundleIdentifier().map(|b| b.to_string()))
-}
-
-fn matches_bundle_list(bundle: &str, list: &[&str]) -> bool {
-    list.iter().any(|b| {
-        if b.ends_with('.') {
-            bundle.starts_with(b)
-        } else {
-            bundle == *b
-        }
-    })
-}
-
-/// Check if the frontmost app should use clipboard-only strategy.
-fn should_use_clipboard() -> bool {
-    frontmost_bundle_id()
-        .map(|b| matches_bundle_list(&b, CLIPBOARD_ONLY_BUNDLES))
-        .unwrap_or(false)
-}
 
 /// Replace text in the focused field.
 /// For browsers/Electron/Lark: always clipboard paste.
 /// For native apps: try AXValue set first, fall back to clipboard.
-fn write_corrected_text(element: &AXUIElement, text: &str) -> bool {
-    // Browsers & Electron: skip AX, go straight to clipboard
-    if should_use_clipboard() {
+fn write_corrected_text(element: &AXUIElement, text: &str, original_text: &str) -> bool {
+    let bundle = frontmost_bundle_id();
+    if should_use_clipboard_for_bundle(bundle.as_deref()) {
         info!("using clipboard paste for this app");
+        let current_text = read_focused_text().map(|focused| focused.text);
+        if !clipboard_replace_is_safe(original_text, current_text.as_deref()) {
+            warn!("refusing clipboard replace because focused text changed");
+            return false;
+        }
         return replace_via_clipboard(text);
     }
 
@@ -978,6 +536,12 @@ fn write_corrected_text(element: &AXUIElement, text: &str) -> bool {
             }
         }
         info!("AXValue set didn't take effect, using clipboard fallback");
+    }
+
+    let current_text = read_focused_text().map(|focused| focused.text);
+    if !clipboard_replace_is_safe(original_text, current_text.as_deref()) {
+        warn!("refusing clipboard fallback because focused text changed");
+        return false;
     }
 
     replace_via_clipboard(text)
@@ -1113,6 +677,8 @@ fn main() {
         .with_target(false)
         .init();
 
+    warn!("voice-correct-v2 is an experimental branch; prefer voice-correct for the primary product path");
+
     let args = Args::parse();
     let term_correction = match &args.terms_file {
         Some(terms_path) => match build_term_correction(terms_path, &args.terms_lexicon) {
@@ -1142,8 +708,7 @@ fn main() {
 
     let mtm = MainThreadMarker::new().expect("must run on main thread");
 
-    let app = NSApplication::sharedApplication(mtm);
-    app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+    let app: Retained<NSApplication> = configure_accessory_app(mtm);
 
     if !accessibility::is_trusted() {
         warn!("accessibility not trusted — text read/write may fail");
@@ -1158,7 +723,14 @@ fn main() {
         if use_sensevoice {
             let home = std::env::var("HOME").unwrap();
             let base = Path::new(&home).join(".local/share/picc");
-            let (model_path, tokens_path) = resolve_sensevoice_paths(&base, &args);
+            let paths = resolve_repo_sensevoice_paths(
+                &base,
+                args.model_dir.as_deref(),
+                &args.model_file_name,
+            )
+            .expect("failed to resolve SenseVoice model paths");
+            let model_path = paths.model;
+            let tokens_path = paths.tokens.expect("SenseVoice tokens path missing");
             let config = sherpa_rs::sense_voice::SenseVoiceConfig {
                 model: model_path.clone(),
                 tokens: tokens_path.clone(),
@@ -1242,8 +814,7 @@ fn main() {
     }
 
     // --- Menubar ---
-    let status_bar = NSStatusBar::systemStatusBar();
-    let status_item = status_bar.statusItemWithLength(-1.0);
+    let status_item = new_status_item(-1.0);
     set_status_icon(&status_item, AppState::Idle, mtm);
 
     let delegate: Retained<MenuDelegate> = {
@@ -1255,60 +826,45 @@ fn main() {
     };
     let menu = NSMenu::new(mtm);
     menu.setAutoenablesItems(false);
-    let quit_item = unsafe {
-        NSMenuItem::initWithTitle_action_keyEquivalent(
-            NSMenuItem::alloc(mtm),
-            &NSString::from_str("Quit"),
-            Some(sel!(quit:)),
-            &NSString::from_str("q"),
-        )
-    };
+    let quit_item = new_menu_item(mtm, "Quit", Some(sel!(quit:)), "q");
     unsafe { quit_item.setTarget(Some(&delegate)) };
 
     // Toggle: fullwidth → halfwidth
-    let fw_item = unsafe {
-        NSMenuItem::initWithTitle_action_keyEquivalent(
-            NSMenuItem::alloc(mtm),
-            &NSString::from_str("Fullwidth to Halfwidth"),
-            Some(sel!(toggleFullwidthToHalfwidth:)),
-            &NSString::from_str(""),
-        )
-    };
+    let fw_item = new_menu_item(
+        mtm,
+        "Fullwidth to Halfwidth",
+        Some(sel!(toggleFullwidthToHalfwidth:)),
+        "",
+    );
     unsafe { fw_item.setTarget(Some(&delegate)) };
 
     // Toggle: space around punctuation (sub-option of fullwidth→halfwidth)
-    let punct_spaces_item = unsafe {
-        NSMenuItem::initWithTitle_action_keyEquivalent(
-            NSMenuItem::alloc(mtm),
-            &NSString::from_str("  Space Around Punctuation"),
-            Some(sel!(toggleSpaceAroundPunct:)),
-            &NSString::from_str(""),
-        )
-    };
+    let punct_spaces_item = new_menu_item(
+        mtm,
+        "  Space Around Punctuation",
+        Some(sel!(toggleSpaceAroundPunct:)),
+        "",
+    );
     unsafe { punct_spaces_item.setTarget(Some(&delegate)) };
     punct_spaces_item.setEnabled(false); // disabled until fullwidth is turned on
     *delegate.ivars().punct_spaces_item.borrow_mut() = Some(punct_spaces_item.clone());
 
     // Toggle: space between CJK & Latin/Digit (independent)
-    let cjk_spaces_item = unsafe {
-        NSMenuItem::initWithTitle_action_keyEquivalent(
-            NSMenuItem::alloc(mtm),
-            &NSString::from_str("Space Between CJK & Latin"),
-            Some(sel!(toggleSpaceBetweenCjk:)),
-            &NSString::from_str(""),
-        )
-    };
+    let cjk_spaces_item = new_menu_item(
+        mtm,
+        "Space Between CJK & Latin",
+        Some(sel!(toggleSpaceBetweenCjk:)),
+        "",
+    );
     unsafe { cjk_spaces_item.setTarget(Some(&delegate)) };
 
     // Toggle: strip trailing punctuation
-    let strip_item = unsafe {
-        NSMenuItem::initWithTitle_action_keyEquivalent(
-            NSMenuItem::alloc(mtm),
-            &NSString::from_str("Strip Trailing Punctuation"),
-            Some(sel!(toggleStripTrailingPunct:)),
-            &NSString::from_str(""),
-        )
-    };
+    let strip_item = new_menu_item(
+        mtm,
+        "Strip Trailing Punctuation",
+        Some(sel!(toggleStripTrailingPunct:)),
+        "",
+    );
     unsafe { strip_item.setTarget(Some(&delegate)) };
 
     menu.addItem(&fw_item);
@@ -1405,11 +961,11 @@ fn main() {
                                     delegate.ivars().options.get(),
                                 );
                                 // Re-read focused element for writing
-                                if let Some((element, _)) = read_focused_text() {
-                                    write_corrected_text(&element, &corrected);
+                                if let Some(FocusedText { element, .. }) = read_focused_text() {
+                                    write_corrected_text(&element, &corrected, &original);
                                 } else {
-                                    // Field lost focus — use clipboard fallback
-                                    replace_via_clipboard(&corrected);
+                                    warn!("focused field disappeared before correction could be applied");
+                                    play_error_sound();
                                 }
                             }
                             Ok(_) => {
@@ -1868,7 +1424,7 @@ fn main() {
                     info!(app = %app_name, "correction mode");
 
                     // Terminals: AXValue returns entire buffer, skip reading
-                    if matches_bundle_list(&app_name, SKIP_AX_READ_BUNDLES) {
+                    if should_skip_ax_read_for_bundle(Some(&app_name)) {
                         info!(text = %spoken_for_typing, "terminal app, typing instead");
                         type_text(&spoken_for_typing);
                         set_status_icon(&status_item, AppState::Idle, mtm);
@@ -1876,7 +1432,10 @@ fn main() {
                     }
 
                     match read_focused_text() {
-                        Some((_element, original_text)) => {
+                        Some(FocusedText {
+                            text: original_text,
+                            ..
+                        }) => {
                             // Limit text length to avoid sending huge payloads to LLM
                             let trimmed = original_text.trim();
                             if trimmed.chars().count() > 250 {
@@ -1936,7 +1495,8 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
-    use super::{apply_dictation_transforms, auto_insert_spaces, DictationOptions};
+    use super::{apply_dictation_transforms, DictationOptions};
+    use picc_speech::postprocess::auto_insert_spaces;
 
     /// Helper: both punct and cjk spacing enabled (the common case).
     fn spaced(s: &str) -> String {

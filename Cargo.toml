@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "crates/dictation-ng", "crates/homophone-replacer"]
+members = [".", "crates/dictation-ng", "crates/homophone-replacer", "crates/picc-macos-app", "crates/picc-macos-input", "crates/picc-speech"]
 
 [package]
 name = "picc"
@@ -50,7 +50,6 @@ path = "src/bin/english_refiner.rs"
 [[bin]]
 name = "dictation"
 path = "src/bin/dictation.rs"
-required-features = ["sensevoice"]
 
 [[bin]]
 name = "dictation-streaming"
@@ -216,6 +215,9 @@ rand = "0.10"
 sherpa-rs = { version = "0.6", default-features = false, features = ["static", "sys"], optional = true }
 ctrlc = "3"
 homophone-replacer = { path = "crates/homophone-replacer" }
+picc-macos-app = { path = "crates/picc-macos-app" }
+picc-macos-input = { path = "crates/picc-macos-input" }
+picc-speech = { path = "crates/picc-speech" }
 
 [features]
 default = []

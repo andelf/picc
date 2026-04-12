@@ -8,40 +8,47 @@
 //!   dictation --engine apple
 
 use std::cell::Cell;
+#[cfg(feature = "sensevoice")]
 use std::io::{Read as _, Write as _};
+#[cfg(feature = "sensevoice")]
 use std::path::Path;
 use std::ptr::{self, NonNull};
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use block2::RcBlock;
 use clap::Parser;
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject};
 use objc2::{define_class, sel, AnyThread, MainThreadMarker, MainThreadOnly};
-use objc2_app_kit::{
-    NSApplication, NSApplicationActivationPolicy, NSImage, NSMenu, NSMenuItem, NSStatusBar,
-    NSStatusItem,
-};
-use objc2_avf_audio::{AVAudioEngine, AVAudioPCMBuffer, AVAudioTime};
+use objc2_app_kit::{NSMenu, NSStatusItem};
 use objc2_core_foundation::{kCFRunLoopCommonModes, CFMachPort, CFRunLoop};
 use objc2_core_graphics::{
     CGEvent, CGEventMask, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement,
     CGEventTapProxy, CGEventType,
 };
-use objc2_foundation::{ns_string, NSDate, NSLocale, NSRunLoop, NSString, NSTimer};
+use objc2_foundation::{ns_string, NSDate, NSLocale, NSRunLoop, NSTimer};
 use objc2_speech::{
     SFSpeechAudioBufferRecognitionRequest, SFSpeechRecognitionResult, SFSpeechRecognizer,
     SFSpeechRecognizerAuthorizationStatus,
 };
 
-use picc::input::type_text;
+use picc_macos_app::{
+    configure_accessory_app, new_menu_item, new_status_item, set_status_item_symbol,
+};
+use picc_macos_input::type_text;
+use picc_speech::{
+    begin_requested_session, clear_recording_state, resample_linear, take_stop_while_recording,
+    AudioCaptureConfig, AudioEngineManager, HotkeyPolicy, HotkeyRuntime, HotkeySignal, HotkeyState,
+    SessionSignals,
+};
 
-const NX_DEVICERCMDKEYMASK: u64 = 0x10;
-
-static SHOULD_START: AtomicBool = AtomicBool::new(false);
-static SHOULD_STOP: AtomicBool = AtomicBool::new(false);
+static SESSION_SIGNALS: SessionSignals = SessionSignals::new();
 static RECOGNIZED_TEXT: Mutex<String> = Mutex::new(String::new());
+
+fn hotkey_state() -> &'static Mutex<HotkeyState> {
+    static HOTKEY_STATE: OnceLock<Mutex<HotkeyState>> = OnceLock::new();
+    HOTKEY_STATE.get_or_init(|| Mutex::new(HotkeyState::new()))
+}
 
 #[derive(Parser)]
 #[command(about = "Push-to-Talk Dictation — hold right Command to dictate")]
@@ -68,17 +75,26 @@ unsafe extern "C-unwind" fn event_tap_callback(
     if event_type == CGEventType::FlagsChanged {
         let flags = CGEvent::flags(Some(event.as_ref()));
         let device_flags = flags.0 & 0xFFFF;
-        let right_cmd_pressed = (device_flags & NX_DEVICERCMDKEYMASK) != 0;
-
-        static WAS_DOWN: AtomicBool = AtomicBool::new(false);
-        let was_down = WAS_DOWN.load(Ordering::Relaxed);
-
-        if right_cmd_pressed && !was_down {
-            WAS_DOWN.store(true, Ordering::Relaxed);
-            SHOULD_START.store(true, Ordering::Relaxed);
-        } else if !right_cmd_pressed && was_down {
-            WAS_DOWN.store(false, Ordering::Relaxed);
-            SHOULD_STOP.store(true, Ordering::Relaxed);
+        if let Ok(mut state) = hotkey_state().lock() {
+            for signal in state.handle_flags_changed(
+                device_flags,
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64,
+                HotkeyRuntime {
+                    is_recording: SESSION_SIGNALS.is_recording(),
+                    cancel_pending: SESSION_SIGNALS.cancel_pending(),
+                },
+                HotkeyPolicy::dictation(),
+            ) {
+                match signal {
+                    HotkeySignal::Start(mode) => SESSION_SIGNALS.request_start(mode),
+                    HotkeySignal::Stop => SESSION_SIGNALS.request_stop(),
+                    HotkeySignal::ClearPendingStart => SESSION_SIGNALS.clear_pending_start(),
+                    HotkeySignal::Cancel => SESSION_SIGNALS.request_cancel(),
+                }
+            }
         }
     }
     event.as_ptr()
@@ -102,21 +118,17 @@ define_class!(
 
 fn set_status_icon(item: &NSStatusItem, recording: bool, mtm: MainThreadMarker) {
     let name = if recording { "mic.fill" } else { "mic" };
-    if let Some(button) = item.button(mtm) {
-        if let Some(image) = NSImage::imageWithSystemSymbolName_accessibilityDescription(
-            &NSString::from_str(name),
-            Some(&NSString::from_str("Dictation")),
-        ) {
-            image.setTemplate(true);
-            button.setImage(Some(&image));
-        }
-    }
+    set_status_item_symbol(item, mtm, name, "Dictation");
 }
 
+#[cfg(feature = "sensevoice")]
 const SENSEVOICE_MODEL_DIR: &str = "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17";
+#[cfg(feature = "sensevoice")]
 const SENSEVOICE_HF_BASE: &str = "https://huggingface.co/csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/resolve/main";
+#[cfg(feature = "sensevoice")]
 const SENSEVOICE_GITHUB_URL: &str = "https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17.tar.bz2";
 
+#[cfg(feature = "sensevoice")]
 fn download_with_progress(url: &str, dest: &Path, label: &str) -> Result<(), String> {
     let resp = reqwest::blocking::Client::new()
         .get(url)
@@ -157,6 +169,7 @@ fn download_with_progress(url: &str, dest: &Path, label: &str) -> Result<(), Str
     Ok(())
 }
 
+#[cfg(feature = "sensevoice")]
 fn try_download_from_hf(model_dir: &Path) -> Result<(), String> {
     std::fs::create_dir_all(model_dir).map_err(|e| format!("mkdir: {e}"))?;
     let files = ["model.int8.onnx", "tokens.txt"];
@@ -169,6 +182,7 @@ fn try_download_from_hf(model_dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(feature = "sensevoice")]
 fn try_download_from_github(base_dir: &Path) -> Result<(), String> {
     let archive = base_dir.join("sensevoice.tar.bz2");
     eprintln!("[dictation] downloading from GitHub releases...");
@@ -191,6 +205,7 @@ fn try_download_from_github(base_dir: &Path) -> Result<(), String> {
     Ok(())
 }
 
+#[cfg(feature = "sensevoice")]
 fn ensure_sensevoice_model(base_dir: &Path) -> String {
     let model_dir = base_dir.join(SENSEVOICE_MODEL_DIR);
     let model_file = model_dir.join("model.int8.onnx");
@@ -229,12 +244,18 @@ fn main() {
     let args = Args::parse();
     let use_sensevoice = args.engine == "sensevoice";
 
+    #[cfg(not(feature = "sensevoice"))]
+    if use_sensevoice {
+        eprintln!("sensevoice engine requires building dictation with --features sensevoice");
+        std::process::exit(1);
+    }
+
     let mtm = MainThreadMarker::new().expect("must run on main thread");
 
-    let app = NSApplication::sharedApplication(mtm);
-    app.setActivationPolicy(NSApplicationActivationPolicy::Accessory);
+    let app = configure_accessory_app(mtm);
 
     // --- SenseVoice recognizer (if needed) ---
+    #[cfg(feature = "sensevoice")]
     let sv_recognizer: Cell<Option<sherpa_rs::sense_voice::SenseVoiceRecognizer>> =
         if use_sensevoice {
             let model_dir = args.model_dir.unwrap_or_else(|| {
@@ -282,7 +303,7 @@ fn main() {
         None
     };
 
-    let audio_engine = unsafe { AVAudioEngine::new() };
+    let audio_engine = AudioEngineManager::new();
 
     // --- CGEventTap ---
     let event_mask: CGEventMask = 1 << CGEventType::FlagsChanged.0;
@@ -306,21 +327,13 @@ fn main() {
     }
 
     // --- Menubar ---
-    let status_bar = NSStatusBar::systemStatusBar();
-    let status_item = status_bar.statusItemWithLength(-1.0);
+    let status_item = new_status_item(-1.0);
     set_status_icon(&status_item, false, mtm);
 
     let delegate: Retained<MenuDelegate> =
         unsafe { objc2::msg_send![MenuDelegate::alloc(mtm), init] };
     let menu = NSMenu::new(mtm);
-    let quit_item = unsafe {
-        NSMenuItem::initWithTitle_action_keyEquivalent(
-            NSMenuItem::alloc(mtm),
-            &NSString::from_str("Quit"),
-            Some(sel!(quit:)),
-            &NSString::from_str("q"),
-        )
-    };
+    let quit_item = new_menu_item(mtm, "Quit", Some(sel!(quit:)), "q");
     unsafe { quit_item.setTarget(Some(&delegate)) };
     menu.addItem(&quit_item);
     status_item.setMenu(Some(&menu));
@@ -348,72 +361,53 @@ fn main() {
 
         let block = RcBlock::new(move |_timer: NonNull<NSTimer>| {
             // --- START recording ---
-            if SHOULD_START.swap(false, Ordering::Relaxed) && !is_recording.get() {
+            if let Some(_mode) = begin_requested_session(&SESSION_SIGNALS, &is_recording) {
                 eprintln!("[dictation] recording started...");
-                is_recording.set(true);
                 set_status_icon(&status_item, true, mtm);
 
                 // Defensive: remove any stale tap from a previous failed start
-                let microphone = audio_engine.inputNode();
-                microphone.removeTapOnBus(0);
-
                 if use_sensevoice {
-                    // Clear sample buffer
                     if let Ok(mut s) = samples_ref.lock() {
                         s.clear();
                     }
-
-                    // Use native format — we'll downsample to 16kHz later
-                    let format = microphone.outputFormatForBus(0);
-                    let sr = format.sampleRate() as u32;
-                    native_sample_rate.set(sr);
-                    eprintln!("[dictation] native sample rate: {sr}Hz");
-
-                    let samples_tap = samples_ref.clone();
-                    let tap_block = RcBlock::new(
-                        move |buffer: NonNull<AVAudioPCMBuffer>, _time: NonNull<AVAudioTime>| {
-                            let buf = buffer.as_ref();
-                            let float_data = buf.floatChannelData();
-                            let frame_length = buf.frameLength();
-                            if !float_data.is_null() && frame_length > 0 {
-                                // Channel 0 (mono or first channel)
-                                let channel0 = (*float_data).as_ptr();
-                                let slice =
-                                    std::slice::from_raw_parts(channel0, frame_length as usize);
-                                if let Ok(mut samples) = samples_tap.lock() {
-                                    samples.extend_from_slice(slice);
-                                }
-                            }
+                    if let Err(e) = audio_engine.start_sample_capture(
+                        samples_ref.clone(),
+                        &native_sample_rate,
+                        AudioCaptureConfig {
+                            buffer_size: 4096,
+                            use_none_format: false,
+                            collect_gate: None,
+                            rms_out: None,
                         },
-                    );
-                    microphone.installTapOnBus_bufferSize_format_block(
-                        0,
-                        4096,
-                        Some(&format),
-                        &*tap_block as *const _ as *mut _,
+                    ) {
+                        eprintln!("[dictation] audio engine start error: {e}");
+                        clear_recording_state(&SESSION_SIGNALS, &is_recording);
+                        set_status_icon(&status_item, false, mtm);
+                        return;
+                    }
+                    eprintln!(
+                        "[dictation] native sample rate: {}Hz",
+                        native_sample_rate.get()
                     );
                 } else {
-                    // Apple: clear previous text
                     if let Ok(mut text) = RECOGNIZED_TEXT.lock() {
                         text.clear();
                     }
 
                     let req = SFSpeechAudioBufferRecognitionRequest::new();
-                    let format = microphone.outputFormatForBus(0);
-                    {
-                        let req_clone = req.clone();
-                        let tap_block = RcBlock::new(
-                            move |buffer: NonNull<AVAudioPCMBuffer>,
-                                  _time: NonNull<AVAudioTime>| {
-                                req_clone.appendAudioPCMBuffer(buffer.as_ref());
-                            },
-                        );
-                        microphone.installTapOnBus_bufferSize_format_block(
-                            0,
-                            1024,
-                            Some(&format),
-                            &*tap_block as *const _ as *mut _,
-                        );
+                    if let Err(e) = audio_engine.start_request_capture(
+                        req.clone(),
+                        AudioCaptureConfig {
+                            buffer_size: 1024,
+                            use_none_format: false,
+                            collect_gate: None,
+                            rms_out: None,
+                        },
+                    ) {
+                        eprintln!("[dictation] audio engine start error: {e}");
+                        SESSION_SIGNALS.set_recording(false);
+                        set_status_icon(&status_item, false, mtm);
+                        return;
                     }
 
                     let handler = RcBlock::new(
@@ -442,72 +436,45 @@ fn main() {
                     }
                     apple_request.set(Some(req));
                 }
-
-                audio_engine.prepare();
-                if let Err(e) = audio_engine.startAndReturnError() {
-                    eprintln!("[dictation] audio engine start error: {:?}", e);
-                    // Clean up the tap we just installed
-                    let microphone = audio_engine.inputNode();
-                    microphone.removeTapOnBus(0);
-                    audio_engine.reset();
-                    is_recording.set(false);
-                    set_status_icon(&status_item, false, mtm);
-                    return;
-                }
             }
 
             // --- STOP recording ---
-            if SHOULD_STOP.swap(false, Ordering::Relaxed) && is_recording.get() {
+            if take_stop_while_recording(&SESSION_SIGNALS, &is_recording) {
+                #[cfg(feature = "sensevoice")]
                 let stop_t0 = std::time::Instant::now();
                 eprintln!("[dictation] recording stopped");
-                is_recording.set(false);
                 set_status_icon(&status_item, false, mtm);
 
-                let microphone = audio_engine.inputNode();
-                microphone.removeTapOnBus(0);
-                audio_engine.stop();
-                audio_engine.reset();
+                audio_engine.stop_and_reset();
 
                 if use_sensevoice {
                     let raw_samples = samples_ref.lock().unwrap();
                     if !raw_samples.is_empty() {
                         let sr = native_sample_rate.get();
                         // Downsample to 16kHz if needed
-                        let samples_16k = if sr == 16000 {
-                            raw_samples.clone()
-                        } else {
-                            let ratio = sr as f64 / 16000.0;
-                            let out_len = (raw_samples.len() as f64 / ratio) as usize;
-                            (0..out_len)
-                                .map(|i| {
-                                    let src = i as f64 * ratio;
-                                    let idx = src as usize;
-                                    let frac = src - idx as f64;
-                                    let a = raw_samples[idx];
-                                    let b = raw_samples.get(idx + 1).copied().unwrap_or(a);
-                                    a + (b - a) * frac as f32
-                                })
-                                .collect::<Vec<f32>>()
-                        };
+                        let samples_16k = resample_linear(&raw_samples, sr, 16000);
                         drop(raw_samples);
 
                         eprintln!(
                             "[dictation] transcribing {:.1}s of audio...",
                             samples_16k.len() as f64 / 16000.0
                         );
-                        if let Some(mut recognizer) = sv_recognizer.take() {
-                            let t0 = std::time::Instant::now();
-                            let result = recognizer.transcribe(16000, &samples_16k);
-                            let inference_ms = t0.elapsed().as_secs_f64() * 1000.0;
-                            if !result.text.is_empty() {
-                                type_text(&result.text);
-                                let total_ms = stop_t0.elapsed().as_secs_f64() * 1000.0;
-                                eprintln!(
-                                    "[dictation] result: {} (inference={:.0}ms, total={:.0}ms)",
-                                    result.text, inference_ms, total_ms
-                                );
+                        #[cfg(feature = "sensevoice")]
+                        {
+                            if let Some(mut recognizer) = sv_recognizer.take() {
+                                let t0 = std::time::Instant::now();
+                                let result = recognizer.transcribe(16000, &samples_16k);
+                                let inference_ms = t0.elapsed().as_secs_f64() * 1000.0;
+                                if !result.text.is_empty() {
+                                    type_text(&result.text);
+                                    let total_ms = stop_t0.elapsed().as_secs_f64() * 1000.0;
+                                    eprintln!(
+                                        "[dictation] result: {} (inference={:.0}ms, total={:.0}ms)",
+                                        result.text, inference_ms, total_ms
+                                    );
+                                }
+                                sv_recognizer.set(Some(recognizer));
                             }
-                            sv_recognizer.set(Some(recognizer));
                         }
                     }
                 } else {

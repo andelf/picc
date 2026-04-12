@@ -1,0 +1,35 @@
+[package]
+name = "picc-speech"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+block2 = "0.6.2"
+objc2 = "0.6.4"
+objc2-app-kit = { version = "0.3.2", features = ["NSRunningApplication"] }
+objc2-application-services = { version = "0.3.2", features = ["AXUIElement", "AXValue"] }
+objc2-avf-audio = { version = "0.3.2", features = [
+    "AVAudioEngine",
+    "AVAudioNode",
+    "AVAudioIONode",
+    "AVAudioFormat",
+    "AVAudioBuffer",
+    "AVAudioTime",
+    "AVAudioTypes",
+    "block2",
+] }
+objc2-core-foundation = { version = "0.3.2", features = ["CFRunLoop"] }
+objc2-foundation = { version = "0.3.2", features = [
+    "NSString",
+    "NSNotification",
+] }
+objc2-speech = { version = "0.3.2", features = [
+    "SFSpeechRecognitionRequest",
+    "block2",
+] }
+reqwest = { version = "0.13", features = ["blocking"] }
