@@ -21,7 +21,7 @@ use objc2_core_foundation::{CFString, CFURLPathStyle, CGPoint, CGRect, CGSize, C
 use objc2_core_graphics::CGImage;
 use objc2_image_io::CGImageDestination;
 use picc::accessibility::{self, AXNode};
-use picc::input;
+use picc_macos_input as input;
 
 const TEXT_ROLES: &[&str] = &["AXStaticText", "AXTextArea", "AXTextField"];
 

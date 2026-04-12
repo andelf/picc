@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 
 use crate::accessibility::{self, AXNode};
 use crate::error::AxError;
-use crate::input;
+use picc_macos_input as input;
 
 /// Execution context bound to a specific application.
 pub struct ExecutionContext {

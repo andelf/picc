@@ -1247,7 +1247,7 @@ fn execute_external_action(
     terminal::disable_raw_mode()?;
 
     // Activate target app
-    picc::input::activate_app(pid);
+    picc_macos_input::activate_app(pid);
     std::thread::sleep(Duration::from_millis(200));
 
     let (x, y) = match &req {
@@ -1255,12 +1255,12 @@ fn execute_external_action(
     };
 
     // Move mouse
-    picc::input::mouse_move(x, y);
+    picc_macos_input::mouse_move(x, y);
 
     // Click if requested
     if matches!(req, ActionRequest::Click { .. }) {
         std::thread::sleep(Duration::from_millis(50));
-        picc::input::mouse_click(x, y);
+        picc_macos_input::mouse_click(x, y);
     }
 
     // Let user see the effect

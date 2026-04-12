@@ -25,7 +25,8 @@ use objc2_core_graphics::CGImage;
 use picc::accessibility::{self, AXNode};
 use picc::actions::ExecutionContext;
 use picc::error::{exit_code, AxError};
-use picc::{input, screenshot, tree_fmt};
+use picc::{screenshot, tree_fmt};
+use picc_macos_input as input;
 
 #[derive(Parser)]
 #[command(
