@@ -27,8 +27,7 @@ use objc2_app_kit::{
     NSAnimationContext, NSApplication, NSBackingStoreType, NSFont,
     NSFontDescriptorSystemDesignRounded, NSImage, NSLineBreakMode, NSMenu, NSMenuItem, NSPanel,
     NSScreen, NSStatusItem, NSStatusWindowLevel, NSTextAlignment, NSTextField, NSView,
-    NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView,
-    NSWindowStyleMask,
+    NSBezierPath, NSColor, NSResponder, NSWindowStyleMask,
 };
 use objc2_core_foundation::{kCFRunLoopCommonModes, CFMachPort, CFRunLoop, CFString, CFType};
 use objc2_core_graphics::{
@@ -504,32 +503,28 @@ static BAR_LEVELS: [AtomicU32; 5] = [
     AtomicU32::new(0),
 ];
 
-/// Create a capsule-shaped mask image for NSVisualEffectView.
-/// Uses cap insets so the image stretches correctly when width changes.
-fn make_capsule_mask(width: f64, height: f64, radius: f64) -> Retained<NSImage> {
-    let size = NSSize::new(width, height);
-    let handler = block2::RcBlock::new(move |rect: NSRect| -> objc2::runtime::Bool {
-        objc2_app_kit::NSColor::whiteColor().setFill();
-        let path = objc2_app_kit::NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(
-            rect, radius, radius,
-        );
-        path.fill();
-        objc2::runtime::Bool::YES
-    });
-    let image = NSImage::imageWithSize_flipped_drawingHandler(size, false, &handler);
+// Custom NSView that draws a semi-transparent black capsule background.
+define_class!(
+    #[unsafe(super(NSView, NSResponder, NSObject))]
+    #[name = "CapsuleBackgroundView"]
+    #[derive(Debug, PartialEq)]
+    struct CapsuleBackgroundView;
 
-    // Cap insets: the rounded corners are `radius` wide/tall; the middle stretches.
-    image.setCapInsets(objc2_foundation::NSEdgeInsets {
-        top: radius,
-        left: radius,
-        bottom: radius,
-        right: radius,
-    });
-    // NSImageResizingModeStretch = 1
-    image.setResizingMode(objc2_app_kit::NSImageResizingMode(1));
-
-    image
-}
+    #[allow(non_snake_case)]
+    impl CapsuleBackgroundView {
+        #[unsafe(method(drawRect:))]
+        fn drawRect(&self, _dirty_rect: NSRect) {
+            let bounds = self.bounds();
+            NSColor::colorWithSRGBRed_green_blue_alpha(0.0, 0.0, 0.0, 0.75).setFill();
+            NSBezierPath::bezierPathWithRoundedRect_xRadius_yRadius(
+                bounds,
+                CAPSULE_CORNER_RADIUS,
+                CAPSULE_CORNER_RADIUS,
+            )
+            .fill();
+        }
+    }
+);
 
 // Custom NSView that draws 5 vertical waveform bars driven by audio RMS.
 define_class!(
@@ -627,25 +622,22 @@ fn create_capsule_overlay(mtm: MainThreadMarker) -> CapsuleOverlay {
     panel.setLevel(NSStatusWindowLevel + 1);
     panel.setOpaque(false);
     panel.setBackgroundColor(Some(&objc2_app_kit::NSColor::clearColor()));
-    panel.setHasShadow(true);
+    panel.setHasShadow(false);
     panel.setIgnoresMouseEvents(true);
     panel.setMovableByWindowBackground(false);
 
-    // NSVisualEffectView — HUD window material, rounded capsule
-    let effect_view = NSVisualEffectView::initWithFrame(
-        NSVisualEffectView::alloc(mtm),
-        NSRect::new(
-            NSPoint::new(0.0, 0.0),
-            NSSize::new(min_width, CAPSULE_HEIGHT),
-        ),
-    );
-    effect_view.setMaterial(NSVisualEffectMaterial::HUDWindow);
-    effect_view.setBlendingMode(NSVisualEffectBlendingMode::BehindWindow);
-    effect_view.setState(NSVisualEffectState::Active);
-    // Use maskImage for proper capsule clipping (CALayer cornerRadius doesn't
-    // correctly clip the blur material on all window compositing modes).
-    let mask = make_capsule_mask(min_width, CAPSULE_HEIGHT, CAPSULE_CORNER_RADIUS);
-    effect_view.setMaskImage(Some(&mask));
+    // Semi-transparent black capsule background
+    let bg_view: Retained<NSView> = unsafe {
+        let alloc = CapsuleBackgroundView::alloc(mtm);
+        let view: Retained<CapsuleBackgroundView> = objc2::msg_send![
+            alloc,
+            initWithFrame: NSRect::new(
+                NSPoint::new(0.0, 0.0),
+                NSSize::new(min_width, CAPSULE_HEIGHT),
+            )
+        ];
+        Retained::cast_unchecked(view)
+    };
 
     // Waveform view
     let wf_x = CAPSULE_PADDING_LEFT;
@@ -689,9 +681,9 @@ fn create_capsule_overlay(mtm: MainThreadMarker) -> CapsuleOverlay {
     label.setStringValue(&NSString::from_str(""));
 
     // Assemble
-    effect_view.addSubview(&waveform_view);
-    effect_view.addSubview(&label);
-    panel.setContentView(Some(&effect_view));
+    bg_view.addSubview(&waveform_view);
+    bg_view.addSubview(&label);
+    panel.setContentView(Some(&bg_view));
 
     // Position at bottom center of main screen
     position_capsule(&panel, min_width, mtm);
@@ -852,7 +844,7 @@ fn update_capsule_text(overlay: &CapsuleOverlay, text: &str, mtm: MainThreadMark
                 // Reposition panel centered
                 position_capsule(panel, new_width, mtm);
 
-                // Resize effect view
+                // Resize background view (frame change triggers redraw)
                 if let Some(cv) = panel.contentView() {
                     cv.setFrame(NSRect::new(
                         NSPoint::new(0.0, 0.0),
@@ -1605,16 +1597,20 @@ fn main() {
                     is_processing = is_processing.get(),
                     "TIMER → STOP: stopping recording"
                 );
-                // Dictation: hide capsule immediately.
-                // Correction: keep capsule visible — will show "Correcting..." during LLM processing.
-                if mode == SessionMode::Dictation {
+                // Stop waveform animation
+                for bar in &BAR_LEVELS {
+                    bar.store(0, Ordering::Relaxed);
+                }
+                capsule.waveform_view.setNeedsDisplay(true);
+
+                // Streaming (Apple Speech) or VAD: recognition already done during recording.
+                // Non-VAD offline: whole-buffer recognition happens now, show hint.
+                let needs_bulk_asr = use_offline_asr && !delegate.ivars().vad_enabled.get();
+                if needs_bulk_asr {
+                    update_capsule_text(&capsule, "Recognizing...", mtm);
+                } else if mode == SessionMode::Dictation {
                     hide_capsule(&capsule);
                 } else {
-                    // Stop waveform animation, show processing hint
-                    for bar in &BAR_LEVELS {
-                        bar.store(0, Ordering::Relaxed);
-                    }
-                    capsule.waveform_view.setNeedsDisplay(true);
                     update_capsule_text(&capsule, "Correcting...", mtm);
                 }
 
@@ -1815,6 +1811,7 @@ fn main() {
                 }
 
                 if mode == SessionMode::Dictation {
+                    hide_capsule(&capsule);
                     // --- Dictation mode: type spoken text at cursor ---
                     //
                     // Text processing pipeline:
@@ -1840,6 +1837,10 @@ fn main() {
                     type_text(&spoken);
                     set_status_icon(&status_item, AppState::Idle, mtm);
                 } else {
+                    // Bulk ASR showed "Recognizing...", now switch to "Correcting..."
+                    if needs_bulk_asr {
+                        update_capsule_text(&capsule, "Correcting...", mtm);
+                    }
                     // --- Correction mode: LLM corrects existing text ---
                     //
                     // Flow:
