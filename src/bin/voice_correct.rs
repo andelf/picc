@@ -856,8 +856,8 @@ fn update_capsule_text(overlay: &CapsuleOverlay, text: &str, mtm: MainThreadMark
     }
 }
 
-fn correction_overlay_text(original_text: &str) -> String {
-    format!("Correcting \"{}\"", original_text.trim())
+fn correction_overlay_text(instruction: &str) -> String {
+    format!("Correcting with \"{}\"...", instruction.trim())
 }
 
 // --- Main ---
@@ -1054,7 +1054,7 @@ fn main() {
         let this = MenuDelegate::alloc(mtm).set_ivars(MenuDelegateIvars {
             options: Cell::new(DictationOptions::default()),
             punct_spaces_item: RefCell::new(None),
-            vad_enabled: Cell::new(true),
+            vad_enabled: Cell::new(false),
         });
         unsafe { objc2::msg_send![super(this), init] }
     };
@@ -1110,7 +1110,7 @@ fn main() {
     );
     unsafe { vad_item.setTarget(Some(&delegate)) };
     if use_offline_asr {
-        vad_item.setState(1); // on by default for offline engines
+        vad_item.setState(0); // off by default
     } else {
         // Apple Speech is already streaming — VAD toggle not applicable
         vad_item.setEnabled(false);
@@ -1608,6 +1608,9 @@ fn main() {
                 let needs_bulk_asr = use_offline_asr && !delegate.ivars().vad_enabled.get();
                 if needs_bulk_asr {
                     update_capsule_text(&capsule, "Recognizing...", mtm);
+                    // Flush run loop so the UI updates before blocking ASR
+                    NSRunLoop::currentRunLoop()
+                        .runUntilDate(&NSDate::dateWithTimeIntervalSinceNow(0.01));
                 } else if mode == SessionMode::Dictation {
                     hide_capsule(&capsule);
                 } else {
@@ -1771,8 +1774,48 @@ fn main() {
                                 spoken = whole_buffer_recognize(native_sample_rate.get());
                             }
                         } else {
-                            // --- Non-VAD path: whole-buffer recognition ---
-                            spoken = whole_buffer_recognize(native_sample_rate.get());
+                            // --- Non-VAD path: pre-check for speech, then whole-buffer recognition ---
+                            let has_speech = if let Some(ref vad_cell) = silero_vad {
+                                let raw_samples = loop {
+                                    match samples_ref.try_lock() {
+                                        Ok(guard) => break guard,
+                                        Err(_) => std::thread::sleep(Duration::from_millis(1)),
+                                    }
+                                };
+                                if raw_samples.is_empty() {
+                                    false
+                                } else {
+                                    let sr = native_sample_rate.get();
+                                    let samples_16k = resample_linear(&raw_samples, sr, 16000);
+                                    drop(raw_samples);
+                                    let mut vad = vad_cell.borrow_mut();
+                                    vad.clear();
+                                    let window = 512;
+                                    let mut offset = 0;
+                                    while offset + window <= samples_16k.len() {
+                                        vad.accept_waveform(samples_16k[offset..offset + window].to_vec());
+                                        offset += window;
+                                    }
+                                    vad.flush();
+                                    let detected = !vad.is_empty();
+                                    // Drain segments to reset state
+                                    while !vad.is_empty() {
+                                        vad.front();
+                                        vad.pop();
+                                    }
+                                    vad.clear();
+                                    detected
+                                }
+                            } else {
+                                true // no VAD available, assume speech present
+                            };
+
+                            if has_speech {
+                                spoken = whole_buffer_recognize(native_sample_rate.get());
+                            } else {
+                                info!("VAD pre-check: no speech detected, skipping ASR");
+                                spoken = String::new();
+                            }
                         }
 
                         info!(text = %spoken, vad = vad_active, "final ASR result");
@@ -1895,7 +1938,7 @@ fn main() {
                             info!(original = %trimmed, instruction = %spoken, "correcting");
                             // Save original for comparison when result arrives
                             correction_original.set(Some(original_text.clone()));
-                            let correction_text = correction_overlay_text(trimmed);
+                            let correction_text = correction_overlay_text(&spoken);
                             update_capsule_text(&capsule, &correction_text, mtm);
 
                             // Start animated processing icon
