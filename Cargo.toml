@@ -77,6 +77,10 @@ path = "src/bin/key_test.rs"
 name = "clipcopy"
 path = "src/bin/clipcopy.rs"
 
+[[bin]]
+name = "statusline"
+path = "src/bin/statusline.rs"
+
 [dependencies]
 objc2 = "0.6.4"
 block2 = "0.6.2"
