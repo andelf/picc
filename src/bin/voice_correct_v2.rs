@@ -271,7 +271,7 @@ unsafe extern "C-unwind" fn event_tap_callback(
     if event_type == CGEventType::FlagsChanged {
         let flags = CGEvent::flags(Some(event.as_ref()));
         let device_flags = flags.0 & 0xFFFF;
-        let cmd_pressed = (device_flags & (NX_DEVICERCMDKEYMASK | NX_DEVICELCMDKEYMASK)) != 0;
+        let cmd_pressed = (device_flags & NX_DEVICERCMDKEYMASK) != 0;
 
         static WAS_DOWN: AtomicBool = AtomicBool::new(false);
         let was_down = WAS_DOWN.load(Ordering::Relaxed);
@@ -305,7 +305,7 @@ unsafe extern "C-unwind" fn event_tap_callback(
             // Allow new press if not recording, or if cancel is pending
             // (recording is about to be cancelled by timer)
             if !is_rec || cancel_pending {
-                if gap < 300 {
+                if gap < 500 {
                     SESSION_MODE.store(MODE_CORRECT, Ordering::Relaxed);
                     debug!(gap, "KEY_DOWN → CORRECT mode, set SHOULD_START");
                 } else {
